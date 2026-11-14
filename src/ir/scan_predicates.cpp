@@ -211,7 +211,7 @@ auto scan_predicates_by_occurrence(const Node& root) -> std::vector<ScanOccurren
     std::vector<ScanOccurrence> out;
     out.reserve(occurrences.size());
     for (auto& [scan, source] : occurrences) {
-        auto conjuncts = by_scan.find(scan);
+        const auto conjuncts = by_scan.find(scan);
         out.push_back(ScanOccurrence{
             .scan = scan,
             .source = source,

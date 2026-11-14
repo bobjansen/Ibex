@@ -216,11 +216,11 @@ auto table_context_for_line(std::string_view line, std::size_t cursor) -> const 
     if (active_bracket == std::string_view::npos) {
         return nullptr;
     }
-    auto table_name = identifier_before(line, active_bracket);
+    const auto table_name = identifier_before(line, active_bracket);
     if (table_name.empty()) {
         return nullptr;
     }
-    auto it = g_completion_context.tables->find(table_name);
+    const auto it = g_completion_context.tables->find(table_name);
     return it == g_completion_context.tables->end() ? nullptr : &it->second;
 }
 
@@ -267,10 +267,10 @@ void add_table_columns(std::vector<std::string>& candidates, const runtime::Tabl
 }
 
 void add_static_candidates(std::vector<std::string>& candidates) {
-    for (auto value : kCompletionBuiltins) {
+    for (const auto value : kCompletionBuiltins) {
         add_candidate(candidates, value);
     }
-    for (auto value : kMoreCompletionBuiltins) {
+    for (const auto value : kMoreCompletionBuiltins) {
         add_candidate(candidates, value);
     }
 }
@@ -398,7 +398,7 @@ void save_history_file_impl(const std::string& path, std::size_t limit) {
         return;
     }
     std::error_code ec;
-    if (auto parent = std::filesystem::path(path).parent_path(); !parent.empty()) {
+    if (const auto parent = std::filesystem::path(path).parent_path(); !parent.empty()) {
         std::filesystem::create_directories(parent, ec);
         if (ec) {
             log_failure("failed to create REPL history directory '{}': {}", parent.string(),
@@ -427,7 +427,7 @@ auto repl_completion(const char* text, int start, int end) -> char** {
     if (start == 0 && text != nullptr && text[0] == ':') {
         std::vector<std::string> commands;
         commands.reserve(std::size(kColonCommands));
-        for (auto command : kColonCommands) {
+        for (const auto command : kColonCommands) {
             commands.emplace_back(command);
         }
         return matches_from(std::move(commands), text);

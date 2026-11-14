@@ -122,7 +122,7 @@ auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter&
 
 auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::string> {
     {
-        const std::lock_guard lock(reader_pool_->mutex);
+        const std::scoped_lock lock(reader_pool_->mutex);
         if (!reader_pool_->available.empty()) {
             auto reader = std::move(reader_pool_->available.back());
             reader_pool_->available.pop_back();
@@ -140,7 +140,7 @@ auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::stri
 }
 
 void LazyTable::release_reader(LazySourceReaderPtr reader) {
-    const std::lock_guard lock(reader_pool_->mutex);
+    const std::scoped_lock lock(reader_pool_->mutex);
     reader_pool_->available.push_back(std::move(reader));
 }
 
@@ -171,7 +171,7 @@ auto LazyTable::project_uncached(const std::set<std::string>& names, const Execu
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
-        for (auto& entry : decoded->columns) {
+        for (const auto& entry : decoded->columns) {
             out.add_column_from(entry.name, entry);
         }
     }
@@ -332,7 +332,7 @@ auto membership_key_column(const Table& predicates, const std::string& key_name,
             } else if constexpr (std::is_same_v<C, Column<std::int64_t>> ||
                                  std::is_same_v<C, Column<Date>> ||
                                  std::is_same_v<C, Column<Timestamp>>) {
-                using T = typename C::value_type;
+                using T = C::value_type;
                 if constexpr (std::is_same_v<T, std::int64_t>)
                     return KeyColumn<ElementKeyAt<T>>{.at = {.data = col.integer_view()},
                                                       .validity = validity};
@@ -395,7 +395,7 @@ auto membership_ranges(const ExecutionContext& exec, std::size_t n) -> std::size
         return 1;
     }
     const std::size_t min_rows = std::max<std::size_t>(exec.parallel_min_rows, 1);
-    auto& pool = process_worker_pool();
+    const auto& pool = process_worker_pool();
     const std::size_t budget = exec.compute_budget();
     return std::min({std::clamp<std::size_t>(n / min_rows, 1, kMaxRanges), budget, pool.size()});
 }
@@ -451,9 +451,9 @@ void apply_membership_filter(const KeyColumn<KeyAt>& key, const DynamicScanFilte
                                       [&](std::size_t i) { return selected[i]; });
         return;
     }
-    auto end = std::ranges::remove_if(selected, [&](std::size_t row) {
-                   return !key_passes(key, filter, row);
-               }).begin();
+    const auto end = std::ranges::remove_if(selected, [&](std::size_t row) {
+                         return !key_passes(key, filter, row);
+                     }).begin();
     selected.erase(end, selected.end());
 }
 
@@ -1043,7 +1043,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         if (!names.contains(field.name)) {
             continue;
         }
-        auto it = selected_columns.find(field.name);
+        const auto it = selected_columns.find(field.name);
         if (it == selected_columns.end()) {
             return std::unexpected("lazy source did not produce requested column '" + field.name +
                                    "'");
@@ -1430,7 +1430,7 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
         if (!names.contains(field.name)) {
             continue;
         }
-        auto it = selected_columns.find(field.name);
+        const auto it = selected_columns.find(field.name);
         if (it == selected_columns.end()) {
             return std::unexpected("lazy source did not produce requested column '" + field.name +
                                    "'");

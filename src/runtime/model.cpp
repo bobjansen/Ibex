@@ -45,16 +45,16 @@ auto incomplete_beta_fraction(double a, double b, double x) -> double {
         const auto dm = static_cast<double>(m);
         const double m2 = 2.0 * dm;
         double aa = dm * (b - dm) * x / ((qam + m2) * (a + m2));
-        d = 1.0 + aa * d;
+        d = 1.0 + (aa * d);
         d = std::abs(d) < kTiny ? kTiny : d;
-        c = 1.0 + aa / c;
+        c = 1.0 + (aa / c);
         c = std::abs(c) < kTiny ? kTiny : c;
         d = 1.0 / d;
         h *= d * c;
         aa = -(a + dm) * (qab + dm) * x / ((a + m2) * (qap + m2));
-        d = 1.0 + aa * d;
+        d = 1.0 + (aa * d);
         d = std::abs(d) < kTiny ? kTiny : d;
-        c = 1.0 + aa / c;
+        c = 1.0 + (aa / c);
         c = std::abs(c) < kTiny ? kTiny : c;
         d = 1.0 / d;
         const double delta = d * c;
@@ -93,7 +93,7 @@ auto two_sided_t_p_value(double t, double df) -> double {
     if (t == 0.0) {
         return 1.0;
     }
-    return incomplete_beta(df / 2.0, 0.5, df / (df + t * t));
+    return incomplete_beta(df / 2.0, 0.5, df / (df + (t * t)));
 }
 
 /// Build a design matrix from a DataFrame using a model formula.
@@ -165,7 +165,7 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                     continue;
                 }
 
-                auto ok = std::visit(
+                const auto ok = std::visit(
                     [&](const auto& c) -> bool {
                         using T = std::decay_t<decltype(c)>;
                         if constexpr (std::is_same_v<T, Column<double>>) {
@@ -236,7 +236,7 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                 message += name;
                 return std::unexpected(std::move(message));
             }
-            auto ok = std::visit(
+            const auto ok = std::visit(
                 [&](const auto& c) -> bool {
                     using T = std::decay_t<decltype(c)>;
                     if constexpr (std::is_same_v<T, Column<double>>) {
@@ -438,8 +438,8 @@ auto solve_spd(const std::vector<std::vector<double>>& a, const std::vector<doub
 
 auto compute_xtx_xty(const std::vector<std::vector<double>>& x, const std::vector<double>& y)
     -> std::pair<std::vector<std::vector<double>>, std::vector<double>> {
-    auto p = x.size();
-    auto n = y.size();
+    const auto p = x.size();
+    const auto n = y.size();
     std::vector<std::vector<double>> xtx(p, std::vector<double>(p, 0.0));
     std::vector<double> xty(p, 0.0);
     for (std::size_t a = 0; a < p; ++a) {
@@ -648,7 +648,7 @@ auto eval_model_param_scalar(const ir::Expr& expr, const ScalarRegistry* scalars
             message += '\'';
             return std::unexpected(std::move(message));
         }
-        auto it = scalars->find(ref->name);
+        const auto it = scalars->find(ref->name);
         if (it == scalars->end()) {
             std::string message = "unknown scalar binding '";
             message += ref->name;

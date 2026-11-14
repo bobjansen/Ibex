@@ -12,7 +12,6 @@
 #include <ibex/runtime/operator.hpp>
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -185,7 +184,7 @@ auto eval_extern_values(const ir::CallExpr& call, const Table& input, RowRange r
         if (!result) {
             return std::unexpected(std::move(result.error()));
         }
-        if (auto* scalar = std::get_if<ScalarValue>(&*result)) {
+        if (const auto* scalar = std::get_if<ScalarValue>(&*result)) {
             values.push_back(*scalar);
         } else if (std::holds_alternative<ResourcePtr>(*result)) {
             return std::unexpected("a resource cannot be used in a query expression: " +

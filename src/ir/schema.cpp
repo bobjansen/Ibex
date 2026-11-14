@@ -375,8 +375,8 @@ auto update_schema(const std::vector<FieldSpec>& fields,
         return SchemaInfo::unknown();
     }
     std::vector<SchemaField> out = input.fields();
-    auto upsert = [&out](const std::string& name, std::optional<ColumnType> type,
-                         Nullability nulls) {
+    const auto upsert = [&out](const std::string& name, std::optional<ColumnType> type,
+                               Nullability nulls) {
         for (auto& field : out) {
             if (field.name == name) {
                 field.type = type;
@@ -502,14 +502,14 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
         }
         return renamed;
     };
-    const auto keep_left = [&]() {
+    const auto keep_left = [&] {
         for (const auto& key : left.unique_keys()) {
             if (auto renamed = left_key_in_output(key)) {
                 out.add_unique_key(std::move(*renamed));
             }
         }
     };
-    const auto keep_right = [&]() {
+    const auto keep_right = [&] {
         for (const auto& key : right.unique_keys()) {
             if (auto renamed = right_key_in_output(key)) {
                 out.add_unique_key(std::move(*renamed));
@@ -861,7 +861,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 // and types, the underlying source (when known) still fixes
                 // nullability -- fusion moved the node, not the reasoning.
                 std::vector<SchemaField> out = asc->fields;
-                if (auto it = sources.find(scan.source_name()); it != sources.end()) {
+                if (const auto it = sources.find(scan.source_name()); it != sources.end()) {
                     for (auto& field : out) {
                         if (const auto* from_input = it->second.find(field.name)) {
                             field.nulls = from_input->nulls;
@@ -870,7 +870,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 }
                 return SchemaInfo::known(std::move(out), /*open=*/false);
             }
-            if (auto it = sources.find(scan.source_name()); it != sources.end()) {
+            if (const auto it = sources.find(scan.source_name()); it != sources.end()) {
                 return it->second;
             }
             return SchemaInfo::unknown();
@@ -881,11 +881,11 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // beats the callee's declared one, which is per-function and so
             // cannot describe a generic reader like parquet::read.
             if (const auto key = extern_call_site_key(call.callee(), call.args())) {
-                if (auto it = sources.find(*key); it != sources.end()) {
+                if (const auto it = sources.find(*key); it != sources.end()) {
                     return it->second;
                 }
             }
-            if (auto it = sources.find(call.callee()); it != sources.end()) {
+            if (const auto it = sources.find(call.callee()); it != sources.end()) {
                 return it->second;
             }
             return SchemaInfo::unknown();
@@ -937,7 +937,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             const auto& update = node_cast<UpdateNode>(*node.children().front());
             std::vector<ColumnRef> keep;
             robin_hood::unordered_set<std::string> seen;
-            auto keep_col = [&](const std::string& name) {
+            const auto keep_col = [&](const std::string& name) {
                 if (seen.insert(name).second) {
                     keep.push_back(ColumnRef{.name = name});
                 }
@@ -1453,8 +1453,8 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
     };
 
     // `^name` skips column scope entirely, so it must name a lexical binding.
-    auto check_refs = [&](std::string_view clause,
-                          const std::vector<ColumnRef>& refs) -> std::optional<std::string> {
+    const auto check_refs = [&](std::string_view clause,
+                                const std::vector<ColumnRef>& refs) -> std::optional<std::string> {
         for (const auto& ref : refs) {
             if (ref.lexical) {
                 if (!lexical_names.contains(ref.name)) {

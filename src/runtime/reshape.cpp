@@ -481,12 +481,11 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
     int label_idx = -1;
     for (int i = 0; std::cmp_less(i, input.columns.size()); ++i) {
         const auto& cv = *input.columns[static_cast<std::size_t>(i)].column;
-        if (std::holds_alternative<Column<std::string>>(cv) ||
-            std::holds_alternative<Column<Categorical>>(cv)) {
-            if (label_idx == -1) {
-                label_idx = i;
-                break;
-            }
+        if ((std::holds_alternative<Column<std::string>>(cv) ||
+             std::holds_alternative<Column<Categorical>>(cv)) &&
+            (label_idx == -1)) {
+            label_idx = i;
+            break;
         }
     }
 
@@ -702,7 +701,7 @@ auto rbind_table(const std::vector<const Table*>& tables,
         col_pos[ti].reserve(ncols);
         for (std::size_t ci = 0; ci < ncols; ++ci) {
             const ColumnEntry& ref_entry = ref.columns[ci];
-            auto it = other.index.find(ref_entry.name);
+            const auto it = other.index.find(ref_entry.name);
             if (it == other.index.end()) {
                 return std::unexpected("rbind: operand " + std::to_string(ti + 1) +
                                        " is missing column '" + ref_entry.name +
@@ -887,7 +886,7 @@ auto rbind_table(const std::vector<const Table*>& tables,
                         if constexpr (std::is_same_v<Col, Column<std::int64_t>>) {
                             dst.append_integer_values(src);
                         } else if constexpr (requires { src.span(); }) {
-                            auto sp = src.span();
+                            const auto sp = src.span();
                             (void)dst.insert(dst.end(), sp.begin(), sp.end());
                         } else {
                             for (std::size_t r = 0, n = src.size(); r < n; ++r) {
@@ -920,7 +919,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
     std::vector<std::size_t> id_indices;
     id_indices.reserve(id_columns.size());
     for (const auto& name : id_columns) {
-        auto it = input.index.find(name);
+        const auto it = input.index.find(name);
         if (it == input.index.end()) {
             return std::unexpected("melt: id column not found: " + name +
                                    " (available: " + format_columns(input) + ")");
@@ -942,7 +941,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
         measure_indices.reserve(measure_columns.size());
         measure_names.reserve(measure_columns.size());
         for (const auto& name : measure_columns) {
-            auto it = input.index.find(name);
+            const auto it = input.index.find(name);
             if (it == input.index.end()) {
                 return std::unexpected("melt: measure column not found: " + name +
                                        " (available: " + format_columns(input) + ")");
@@ -1021,7 +1020,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     auto* dst_offs = out_col.offsets_data();
                     char* dst_chars = out_col.chars_data();
                     dst_offs[0] = 0;
-                    with_measure_count([&]<std::size_t M>() {
+                    with_measure_count([&]<std::size_t M> {
                         const std::size_t m = M == 0 ? n_measures : M;
                         for_rows([&](std::size_t begin, std::size_t end) {
                             for (std::size_t r = begin; r < end; ++r) {
@@ -1045,7 +1044,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     Column<Categorical> out_col = src_col.with_codes();
                     out_col.resize(out_rows);
                     auto* dst_codes = out_col.codes_data();
-                    with_measure_count([&]<std::size_t M>() {
+                    with_measure_count([&]<std::size_t M> {
                         const std::size_t m = M == 0 ? n_measures : M;
                         for_rows([&](std::size_t begin, std::size_t end) {
                             for (std::size_t r = begin; r < end; ++r) {
@@ -1060,7 +1059,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                 } else if constexpr (std::is_same_v<SrcCol, Column<bool>>) {
                     SrcCol out_col;
                     out_col.resize(out_rows);
-                    with_measure_count([&]<std::size_t M>() {
+                    with_measure_count([&]<std::size_t M> {
                         const std::size_t m = M == 0 ? n_measures : M;
                         for_rows([&](std::size_t begin, std::size_t end) {
                             for (std::size_t r = begin; r < end; ++r) {
@@ -1084,7 +1083,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     // Raw physical values: a compact Int32 id is widened as it
                     // is repeated, not tested for its width on every row.
                     with_physical_values(src_col, [&](const auto* src) {
-                        with_measure_count([&]<std::size_t M>() {
+                        with_measure_count([&]<std::size_t M> {
                             const std::size_t m = M == 0 ? n_measures : M;
                             for_rows([&](std::size_t begin, std::size_t end) {
                                 for (std::size_t r = begin; r < end; ++r) {
@@ -1265,7 +1264,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                         return out_col;
                     }
                 }
-                with_measure_count([&]<std::size_t M>() {
+                with_measure_count([&]<std::size_t M> {
                     const std::size_t m = M == 0 ? n_measures : M;
                     for_rows([&](std::size_t begin, std::size_t end) {
                         for (std::size_t r = begin; r < end; ++r) {
@@ -1309,12 +1308,12 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                  const ExecutionContext* exec) -> std::expected<Table, std::string> {
     constexpr std::size_t kMissingCell = std::numeric_limits<std::size_t>::max();
 
-    auto pivot_it = input.index.find(pivot_column);
+    const auto pivot_it = input.index.find(pivot_column);
     if (pivot_it == input.index.end()) {
         return std::unexpected("dcast: pivot column not found: " + pivot_column +
                                " (available: " + format_columns(input) + ")");
     }
-    auto value_it = input.index.find(value_column);
+    const auto value_it = input.index.find(value_column);
     if (value_it == input.index.end()) {
         return std::unexpected("dcast: value column not found: " + value_column +
                                " (available: " + format_columns(input) + ")");
@@ -1322,7 +1321,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     DcastRowKey key;
     key.columns.reserve(row_keys.size());
     for (const auto& name : row_keys) {
-        auto it = input.index.find(name);
+        const auto it = input.index.find(name);
         if (it == input.index.end()) {
             return std::unexpected("dcast: row key column not found: " + name +
                                    " (available: " + format_columns(input) + ")");

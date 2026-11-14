@@ -259,7 +259,7 @@ ExecutionProfileState::~ExecutionProfileState() noexcept {
         const double total_ms = static_cast<double>(ns_since(impl_->start)) / 1.0e6;
         std::vector<ExecutionProfileEntry*> rows;
         {
-            const std::lock_guard lock(impl_->mutex);
+            const std::scoped_lock lock(impl_->mutex);
             rows.reserve(impl_->entries.size());
             for (const auto& [_, entry] : impl_->entries) {
                 rows.push_back(entry.get());
@@ -434,8 +434,8 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
 
 auto ExecutionProfileState::entry(std::uint64_t node_id, std::string label)
     -> ExecutionProfileEntry* {
-    const std::lock_guard lock(impl_->mutex);
-    auto key = std::pair{node_id, label};
+    const std::scoped_lock lock(impl_->mutex);
+    const auto key = std::pair{node_id, label};
     auto [it, inserted] = impl_->entries.try_emplace(key);
     if (inserted) {
         it->second = std::make_unique<ExecutionProfileEntry>();
@@ -450,7 +450,7 @@ auto ExecutionProfileState::stage(std::string_view label) -> ExecutionProfileEnt
 }
 
 auto ExecutionProfileState::snapshot() const -> std::vector<ExecutionProfileSnapshotRow> {
-    const std::lock_guard lock(impl_->mutex);
+    const std::scoped_lock lock(impl_->mutex);
     std::vector<ExecutionProfileSnapshotRow> out;
     out.reserve(impl_->entries.size());
     for (const auto& [_, row] : impl_->entries) {

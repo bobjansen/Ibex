@@ -133,7 +133,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
         // without the filter's cut the probed-key restriction compared the
         // footer's 2M part keys with 2M groups and declined.
         case NodeKind::Distinct: {
-            auto input = child();
+            const auto input = child();
             return {.rows = input.rows, .heuristic = true};
         }
         // An aggregate emits one row per distinct group, so its size is the

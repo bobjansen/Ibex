@@ -186,7 +186,7 @@ void absorb(Group& group, std::size_t index, const Relation& relation,
             const std::vector<std::string>& keys) {
     const double rows = join_rows(group, relation, keys);
     for (const auto& [column, distinct] : relation.distinct) {
-        auto found = group.distinct.find(column);
+        const auto found = group.distinct.find(column);
         group.distinct[column] =
             found == group.distinct.end() ? distinct : std::min(found->second, distinct);
     }

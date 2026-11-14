@@ -205,11 +205,11 @@ void collect_filtered_non_null_refs(const Expr& predicate,
             // presence: `!is_null(x)` says what `is_not_null(x)` says. Worth
             // the case because it is not an exotic spelling -- dplyr's
             // `filter(!is.na(x))` lowers to exactly this.
-            if (const auto* inner = std::get_if<IsNullExpr>(&logical->left->node)) {
-                if (!inner->negated) {
-                    collect_null_propagating_refs(*inner->operand, out);
-                }
+            if (const auto* inner = std::get_if<IsNullExpr>(&logical->left->node);
+                inner && (!inner->negated)) {
+                collect_null_propagating_refs(*inner->operand, out);
             }
+
             return;
         }
         // `||` proves only what both branches prove, and is left unclaimed

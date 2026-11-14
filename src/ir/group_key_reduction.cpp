@@ -489,7 +489,7 @@ auto plan_lift(Node& head_node, const Node& root, const SourceSchemas& sources)
     }
 
     std::vector<Node*> chain;
-    AggregateNode* agg = aggregate_below(*head_node.mutable_children().front(), chain);
+    const AggregateNode* agg = aggregate_below(*head_node.mutable_children().front(), chain);
     if (agg == nullptr || agg->group_by().size() != 1 || agg->children().empty() ||
         agg->children().front() == nullptr) {
         return std::nullopt;

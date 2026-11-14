@@ -1693,13 +1693,15 @@ struct JoinProbe {
         // fast path hands the pre-resolved head straight through. One shape
         // means `probe_swapped` is the single scan/replay implementation for
         // both the serial and the parallel path.
-        auto do_phase1 = [&](auto&& key_at, const auto& heads) {
+        const auto do_phase1 = [&](auto&& key_at, const auto& heads) {
             probe_swapped(
                 n_right, [&](std::size_t r) { return heads.find_head(key_at(r)); }, li, ri);
         };
         // Same shape with the chain head already resolved — see
         // `resolve_categorical_heads`.
-        auto do_phase1_resolved = [&](auto&& head_at) { probe_swapped(n_right, head_at, li, ri); };
+        const auto do_phase1_resolved = [&](auto&& head_at) {
+            probe_swapped(n_right, head_at, li, ri);
+        };
 
         if (index().key_kind == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(rkey);
@@ -1925,7 +1927,7 @@ struct JoinProbe {
         // path that produces one should say so, and the claim is proved from
         // the emitted index array rather than from which mode ran. Computed
         // before the identity branch below, which renames left columns in place.
-        const auto carried_ordering = [&]() -> std::vector<ir::OrderKey> {
+        const auto carried_ordering = [&] -> std::vector<ir::OrderKey> {
             if (!left_side.properties().ordering().has_value()) {
                 return {};
             }
@@ -3330,6 +3332,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             !published.has_value()) {
             return std::move(published.error());
         }
+        // Captured by copy into a stored closure: const would make every move
+        // of the closure copy the shared_ptr (an atomic count) instead.
+        // NOLINTNEXTLINE(misc-const-correctness)
         auto shared = std::make_shared<StreamedTwoPhaseShared>();
         shared->scan = &scan;
         shared->units = units;
@@ -3346,10 +3351,16 @@ class ChunkedInnerJoinOperator final : public Operator {
         shared->scalars = deferred_scalars_;
         shared->externs = deferred_externs_;
         shared->scan_name = deferred_probe_name_;
+        // Captured by copy into a stored closure: const would make every move
+        // of the closure copy the shared_ptr (an atomic count) instead.
+        // NOLINTNEXTLINE(misc-const-correctness)
         auto prototype = std::make_shared<const JoinProbe>(probe_);
         streamed_pipeline_ = pipeline_executor_detail::build_unit_pipeline(
             std::move(units),
-            [shared, prototype]() -> pipeline_executor_detail::UnitProducer {
+            [shared, prototype] -> pipeline_executor_detail::UnitProducer {
+                // Captured by copy into a stored closure: const would make every move
+                // of the closure copy the shared_ptr (an atomic count) instead.
+                // NOLINTNEXTLINE(misc-const-correctness)
                 auto probe = std::make_shared<JoinProbe>(*prototype);
                 return [shared, probe](std::size_t unit, const ExecutionContext& exec) {
                     probe->exec_ = &exec;
@@ -3396,6 +3407,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             !published.has_value()) {
             return std::move(published.error());
         }
+        // Captured by copy into a stored closure: const would make every move
+        // of the closure copy the shared_ptr (an atomic count) instead.
+        // NOLINTNEXTLINE(misc-const-correctness)
         auto shared = std::make_shared<StreamedTwoPhaseShared>();
         shared->scan = &scan;
         shared->units = units;
@@ -3410,10 +3424,16 @@ class ChunkedInnerJoinOperator final : public Operator {
         shared->scalars = deferred_scalars_;
         shared->externs = deferred_externs_;
         shared->scan_name = deferred_probe_name_;
+        // Captured by copy into a stored closure: const would make every move
+        // of the closure copy the shared_ptr (an atomic count) instead.
+        // NOLINTNEXTLINE(misc-const-correctness)
         auto prototype = std::make_shared<const JoinProbe>(probe_);
         streamed_pipeline_ = pipeline_executor_detail::build_unit_pipeline(
             std::move(units),
-            [shared, prototype]() -> pipeline_executor_detail::UnitProducer {
+            [shared, prototype] -> pipeline_executor_detail::UnitProducer {
+                // Captured by copy into a stored closure: const would make every move
+                // of the closure copy the shared_ptr (an atomic count) instead.
+                // NOLINTNEXTLINE(misc-const-correctness)
                 auto probe = std::make_shared<JoinProbe>(*prototype);
                 return [shared, probe](std::size_t unit, const ExecutionContext& exec) {
                     probe->exec_ = &exec;
@@ -3491,8 +3511,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                     with_physical_values(col, [&](const auto* data) {
                         publish_build_filter_keys(
                             [data](std::size_t r) {
-                                return join_key_domain(
-                                    static_cast<typename C::value_type>(data[r]));
+                                return join_key_domain(static_cast<C::value_type>(data[r]));
                             },
                             col.size(), validity, slot);
                     });
@@ -3638,7 +3657,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             return false;
         }
         if (!probe_.right_emit_ready_) {
-            if (auto ready = probe_.setup_right_emit_schema(left_table); !ready.has_value()) {
+            if (const auto ready = probe_.setup_right_emit_schema(left_table); !ready.has_value()) {
                 return false;  // the join is about to fail on this anyway
             }
         }
@@ -3786,6 +3805,9 @@ auto build_hash_probe_operator(HashProbeInput input) -> std::expected<OperatorPt
         // that produced it (`ExecutionContext::stream_probes`).
         if (stream->source != nullptr && !stream->materialized_source.has_value() &&
             stream->probe.exec_ != nullptr && stream->probe.exec_->stream_probes) {
+            // Captured by copy into a stored closure: const would make every move
+            // of the closure copy the shared_ptr (an atomic count) instead.
+            // NOLINTNEXTLINE(misc-const-correctness)
             auto prototype = std::make_shared<const JoinProbe>(stream->probe);
             const bool attached = pipeline_executor_detail::try_attach_worker_step(
                 *stream->source,

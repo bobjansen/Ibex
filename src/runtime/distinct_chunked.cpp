@@ -139,15 +139,16 @@ class ChunkedDistinctOperator final : public Operator {
             // preserve, so its values seed the generic index directly. The
             // packed multi-key stores and the categorical store still fail
             // explicitly -- see `migrate_single_column_dedup_to_generic`.
-            if (fast_dedup_seen_ && std::ranges::any_of(t.columns, [](const ColumnEntry& entry) {
-                    return entry.validity.has_value();
-                })) {
-                if (t.columns.size() != 1 ||
-                    !migrate_single_column_dedup_to_generic(*t.columns.front().column)) {
-                    return std::unexpected(
-                        "ChunkedDistinctOperator: key column gained nulls across chunks");
-                }
+            if ((fast_dedup_seen_ && std::ranges::any_of(t.columns,
+                                                         [](const ColumnEntry& entry) {
+                                                             return entry.validity.has_value();
+                                                         })) &&
+                (t.columns.size() != 1 ||
+                 !migrate_single_column_dedup_to_generic(*t.columns.front().column))) {
+                return std::unexpected(
+                    "ChunkedDistinctOperator: key column gained nulls across chunks");
             }
+
             generic_dedup_seen_ = true;
 
             const std::size_t rows = t.rows();

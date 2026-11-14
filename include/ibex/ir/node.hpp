@@ -70,7 +70,8 @@ struct Expr;
 class ExprPtr {
    public:
     ExprPtr();
-    ExprPtr(std::nullptr_t) noexcept;
+    ExprPtr(std::nullptr_t) noexcept;  // NOLINT(*-explicit-constructor):
+                                       // pointer-like, `return nullptr;`
     ~ExprPtr();
     explicit ExprPtr(std::unique_ptr<Expr> ptr) noexcept;
     explicit ExprPtr(Expr expr);
@@ -432,8 +433,12 @@ struct JoinKey {
     std::string output_name_override;
 
     JoinKey() = default;
-    JoinKey(const char* name) : left(name), right(name) {}
-    JoinKey(std::string name) : left(name), right(std::move(name)) {}
+    // A key list is written as names (`{"id", "date"}`), so a name converts
+    // to a same-named key implicitly.
+    JoinKey(const char* name)  // NOLINT(*-explicit-constructor)
+        : left(name), right(name) {}
+    JoinKey(std::string name)  // NOLINT(*-explicit-constructor)
+        : left(name), right(std::move(name)) {}
     JoinKey(std::string left_name, std::string right_name)
         : left(std::move(left_name)), right(std::move(right_name)) {}
     JoinKey(std::string left_name, std::string right_name, bool fold)
@@ -993,6 +998,9 @@ class JoinNode final : public Node {
           expect_(expect),
           take_(take) {}
 
+    // The join's kind (inner, left, ...), not the node kind: Node::kind() stays
+    // reachable as `node.Node::kind()` and through a `const Node&`.
+    // NOLINTNEXTLINE(bugprone-derived-method-shadowing-base-method)
     [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
     [[nodiscard]] auto keys() const noexcept -> const std::vector<JoinKey>& { return keys_; }
     [[nodiscard]] auto predicate() const noexcept -> const std::optional<Expr>& {

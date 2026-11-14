@@ -32,7 +32,7 @@ auto is_constant_null_flag(const Node& node, const std::string& name, const Sour
             if (node.children().empty() || node.children().front() == nullptr) {
                 return false;
             }
-            const auto* field = [&]() -> const FieldSpec* {
+            const auto* field = [&] -> const FieldSpec* {
                 for (const auto& f : update.fields()) {
                     if (f.alias == name) {
                         return &f;

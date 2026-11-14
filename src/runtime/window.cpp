@@ -16,6 +16,9 @@
 #include <bit>
 // `std::chrono::time_zone` is used under `IBEX_HAS_STD_CHRONO_TIME_ZONES`, which
 // an include-what-you-use pass run with that macro off cannot see.
+#include <ibex/core/time_zone.hpp>
+#include <ibex/runtime/table_properties.hpp>
+
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -35,8 +38,6 @@
 #include <variant>
 #include <vector>
 
-#include "ibex/core/time_zone.hpp"
-#include "ibex/runtime/table_properties.hpp"
 #include "runtime_internal.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -559,7 +560,7 @@ auto window_bound_column(const Table& table, ir::Duration duration, bool aligned
     // Nominal bound of the window containing time `t`, in `unit` steps. aligned:
     // start = floor(t/unit)*unit (grid boundary), end = start + unit. trailing:
     // start = t - unit, end = t (the row's own timestamp).
-    auto bound = [&](std::int64_t t, std::int64_t unit) -> std::int64_t {
+    const auto bound = [&](std::int64_t t, std::int64_t unit) -> std::int64_t {
         if (aligned) {
             const std::int64_t start = window_bucket_index(t, unit) * unit;
             return want_end ? start + unit : start;
@@ -748,8 +749,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         double sum = 0.0;
                         std::size_t val_cnt = 0;
                         std::size_t nan_cnt = 0;
-                        auto add = [&](std::size_t j) {
-                            auto v = static_cast<double>(values[j]);
+                        const auto add = [&](std::size_t j) {
+                            const auto v = static_cast<double>(values[j]);
                             if (std::isnan(v)) {
                                 ++nan_cnt;
                             } else {
@@ -757,8 +758,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 ++val_cnt;
                             }
                         };
-                        auto drop = [&](std::size_t j) {
-                            auto v = static_cast<double>(values[j]);
+                        const auto drop = [&](std::size_t j) {
+                            const auto v = static_cast<double>(values[j]);
                             if (std::isnan(v)) {
                                 --nan_cnt;
                             } else {
@@ -785,10 +786,10 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     double sum = 0.0;
                     std::size_t val_cnt = 0;  // finite, non-null elements in the window
                     std::size_t nan_cnt = 0;  // valid-but-NaN elements in the window
-                    auto add = [&](std::size_t j) {
+                    const auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;  // NULL: skip, payload undefined
-                        auto v = static_cast<double>(values[j]);
+                        const auto v = static_cast<double>(values[j]);
                         if (std::isnan(v)) {
                             ++nan_cnt;
                         } else {
@@ -796,10 +797,10 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             ++val_cnt;
                         }
                     };
-                    auto drop = [&](std::size_t j) {
+                    const auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(values[j]);
+                        const auto v = static_cast<double>(values[j]);
                         if (std::isnan(v)) {
                             --nan_cnt;
                         } else {
@@ -904,7 +905,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // the window is never empty, so the count is not needed at
                     // all. Fewer values have to survive the row loop, which is
                     // what was spilling the running sum to the stack.
-                    auto run_rows = [&](auto drop_pred, auto has_nulls_tag) {
+                    const auto run_rows = [&](auto drop_pred, auto has_nulls_tag) {
                         constexpr bool kHasNulls = decltype(has_nulls_tag)::value;
                         T sum{};
                         // NOLINTNEXTLINE(misc-const-correctness) // constexpr lint bug
@@ -980,7 +981,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     if (!is_count && !aligned_dur) {
                         const std::int64_t dur = dur_val;
                         const std::int64_t* times = time_vals;
-                        auto pred = [times, dur](std::size_t l, std::size_t r) {
+                        const auto pred = [times, dur](std::size_t l, std::size_t r) {
                             return times[l] <= times[r] - dur;
                         };
                         if (has_nulls) {
@@ -1031,19 +1032,19 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // the same rows, so the values that do enter still leave in
                     // the order they arrived — which is what lets pop() work
                     // without being told what it is evicting.
-                    auto add = [&](std::size_t j) {
+                    const auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col_values[j]);
+                        const auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             ++nan_cnt;
                         else
                             med.push(v);
                     };
-                    auto drop = [&](std::size_t j) {
+                    const auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col_values[j]);
+                        const auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             --nan_cnt;
                         else
@@ -1099,7 +1100,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // loop, so keeping the validity test and its two captures
                     // out of the null-free instantiation matters more here, not
                     // less.
-                    auto run_rows = [&](auto drop_pred, auto has_nulls_tag) {
+                    const auto run_rows = [&](auto drop_pred, auto has_nulls_tag) {
                         constexpr bool kHasNulls = decltype(has_nulls_tag)::value;
                         double mean = 0.0;
                         double m2 = 0.0;
@@ -1158,7 +1159,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     if (!is_count && !aligned_dur) {
                         const std::int64_t dur = dur_val;
                         const std::int64_t* times = time_vals;
-                        auto pred = [times, dur](std::size_t l, std::size_t r) {
+                        const auto pred = [times, dur](std::size_t l, std::size_t r) {
                             return times[l] <= times[r] - dur;
                         };
                         if (has_nulls) {
@@ -1214,7 +1215,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // beta_pow caches beta^k (k bounded by the window width).
                     const double beta = 1.0 - alpha;
                     const auto col_values = value_reader(col);
-                    auto val = [&](std::size_t j) -> double {
+                    const auto val = [&](std::size_t j) -> double {
                         return valid_at(j) ? static_cast<double>(col_values[j]) : 0.0;
                     };
                     Column<double> result;
@@ -1222,7 +1223,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto* result_values = result.data();
                     std::vector<double> beta_pow{1.0};  // beta_pow[k] == beta^k
                     beta_pow.reserve(64);
-                    auto bpow = [&](std::size_t k) -> double {
+                    const auto bpow = [&](std::size_t k) -> double {
                         while (beta_pow.size() <= k)
                             beta_pow.push_back(beta_pow.back() * beta);
                         return beta_pow[k];
@@ -1230,7 +1231,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     const bool has_nan = [&] {
                         if constexpr (std::is_same_v<T, double>) {
                             if (sv == nullptr && rows > 0) {
-#if defined(__AVX2__)
+#ifdef __AVX2__
                                 std::size_t i = 0;
                                 for (; i + 4 <= rows; i += 4) {
                                     const __m256d block = _mm256_loadu_pd(col_values + i);
@@ -1376,19 +1377,19 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // As in rolling_median: only finite, non-null values enter
                     // the heaps, and add/drop skip the same rows so what does
                     // enter still leaves in arrival order.
-                    auto add = [&](std::size_t j) {
+                    const auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col_values[j]);
+                        const auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             ++nan_cnt;
                         else
                             q.push(v);
                     };
-                    auto drop = [&](std::size_t j) {
+                    const auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col_values[j]);
+                        const auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             --nan_cnt;
                         else
@@ -1441,19 +1442,19 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     WindowSum ws;
                     std::size_t nan_cnt = 0;
                     std::size_t lo_ptr = 0;
-                    auto add = [&](std::size_t j) {
+                    const auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col_values[j]);
+                        const auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             ++nan_cnt;
                         else
                             ws.add(v);
                     };
-                    auto drop = [&](std::size_t j) {
+                    const auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col_values[j]);
+                        const auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             --nan_cnt;
                         else
@@ -1494,7 +1495,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         if (m2 == 0.0) {
                             result_values[i] = 0.0;
                         } else {
-                            auto dn = static_cast<double>(n);
+                            const auto dn = static_cast<double>(n);
                             result_values[i] =
                                 (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) * (m3 / std::pow(m2, 1.5));
                         }
@@ -1527,19 +1528,19 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     WindowSum ws;
                     std::size_t nan_cnt = 0;
                     std::size_t lo_ptr = 0;
-                    auto add = [&](std::size_t j) {
+                    const auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col_values[j]);
+                        const auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             ++nan_cnt;
                         else
                             ws.add(v);
                     };
-                    auto drop = [&](std::size_t j) {
+                    const auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col_values[j]);
+                        const auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             --nan_cnt;
                         else
@@ -1581,7 +1582,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         if (m2 == 0.0) {
                             result_values[i] = 0.0;
                         } else {
-                            auto dn = static_cast<double>(n);
+                            const auto dn = static_cast<double>(n);
                             // Fisher excess kurtosis (unbiased, matches scipy/pandas):
                             result_values[i] =
                                 (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
@@ -1672,7 +1673,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 if constexpr (is_dense_column_v<ColT>) {
                     result_values = result.data();
                 }
-                auto set_at = [&](std::size_t idx, T value) {
+                const auto set_at = [&](std::size_t idx, T value) {
                     if constexpr (is_dense_column_v<ColT>) {
                         result_values[idx] = value;
                     } else {
@@ -1865,7 +1866,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
     // reduce with tight (auto-vectorising) loops — far cheaper than the generic
     // row-wise aggregate. Falls through for extra group-by, complex aggregates
     // (median/stddev/...), nullable inputs, or non-numeric columns.
-    auto simple_resample = [&] -> std::optional<std::expected<Table, std::string>> {
+    const auto simple_resample = [&] -> std::optional<std::expected<Table, std::string>> {
         if (!extra_group_by.empty() || rows == 0) {
             return std::nullopt;
         }
@@ -2079,7 +2080,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
     // bar holds many rows. On a degenerate feed (~1 row per bar) there is
     // nothing to vectorise over and this saves nothing -- see
     // benchmarking/window_ohlc/README.md on tick density.
-    auto grouped_simple_resample = [&] -> std::optional<std::expected<Table, std::string>> {
+    const auto grouped_simple_resample = [&] -> std::optional<std::expected<Table, std::string>> {
         // One key only. Multi-key is not the common shape and a composite code
         // would reintroduce exactly the per-row hashing this exists to avoid.
         if (extra_group_by.size() != 1 || rows == 0) {
@@ -2364,7 +2365,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
 
     // Convert _bucket (int64) → Timestamp, rename to ts_name
     Table& out = result.value();
-    auto it = out.index.find("_bucket");
+    const auto it = out.index.find("_bucket");
     if (it == out.index.end())
         return std::unexpected("resample: internal error — _bucket missing from output");
     const std::size_t pos = it->second;
@@ -2372,7 +2373,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
     const auto& i64_col = std::get<Column<std::int64_t>>(*out.columns[pos].column);
     Column<Timestamp> ts_out;
     ts_out.reserve(i64_col.size());
-    for (auto v : i64_col)
+    for (const auto v : i64_col)
         ts_out.push_back(Timestamp{v});
     // Bucket starts are instants in the same zone as the index they came from.
     ts_out.set_meta(ts_col->meta());

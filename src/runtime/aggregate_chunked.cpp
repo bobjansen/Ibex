@@ -19,7 +19,6 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -2216,7 +2215,7 @@ class HashAggregateState final {
             } else {
                 // Probed with a view of the row; a novel key's bytes are
                 // copied once, into `str_arena_`.
-                auto it = str_index_.find(key);
+                const auto it = str_index_.find(key);
                 if (it == str_index_.end()) {
                     gid = static_cast<std::uint32_t>(n_groups_);
                     const std::string_view owned = str_arena_.intern(key);
@@ -2399,7 +2398,7 @@ class HashAggregateState final {
                     if (int_index_deferred_) {
                         materialize_int_index();
                     }
-                    auto it = int_index_.find(key);
+                    const auto it = int_index_.find(key);
                     if (it == int_index_.end()) {
                         gid = static_cast<std::uint32_t>(n_groups_);
                         int_index_.emplace(key, gid);
@@ -2639,7 +2638,7 @@ class HashAggregateState final {
             for (std::size_t p = 0; p < job.part_count; ++p) {
                 job.records_by_partition[p].reserve(counts[p]);
             }
-            for (auto& record : records) {
+            for (const auto& record : records) {
                 const std::size_t p = partition_hash(record.key) & mask;
                 job.records_by_partition[p].push_back(record);
             }
@@ -3112,7 +3111,7 @@ class HashAggregateState final {
                     for (std::size_t i = part_begin[p]; i < part_begin[p + 1]; ++i) {
                         const std::size_t row = scatter_rows_[i];
                         const Key key = key_at(row);
-                        auto it = partition.index.find(key);
+                        const auto it = partition.index.find(key);
                         std::uint32_t local{};
                         if (it == partition.index.end()) {
                             local = static_cast<std::uint32_t>(partition.keys.size());
@@ -3393,7 +3392,7 @@ class HashAggregateState final {
                                                         static_cast<std::uint32_t>(g));
                             }
                         }
-                        auto it = partition.index.find(record.key);
+                        const auto it = partition.index.find(record.key);
                         std::uint32_t local{};
                         if (it == partition.index.end()) {
                             local = static_cast<std::uint32_t>(partition.keys.size());
@@ -3475,7 +3474,7 @@ class HashAggregateState final {
                     partition.slots.reserve(records);
                     for (const auto& job : owned_async_pair_jobs_) {
                         for (const auto& record : job->records_by_partition[p]) {
-                            auto it = partition.index.find(record.key);
+                            const auto it = partition.index.find(record.key);
                             if (it == partition.index.end()) {
                                 const auto local =
                                     static_cast<std::uint32_t>(partition.keys.size());
@@ -3653,7 +3652,7 @@ class HashAggregateState final {
         std::vector<std::int64_t> counts;
         for (std::size_t i = 0; i < owned_ordered_run_keys_.size(); ++i) {
             const std::int64_t key = owned_ordered_run_keys_[i];
-            auto it = index.find(key);
+            const auto it = index.find(key);
             std::uint32_t group{};
             if (it == index.end()) {
                 group = static_cast<std::uint32_t>(int_order_.size());
@@ -3812,7 +3811,7 @@ class HashAggregateState final {
                 if (have_prev_u64 && key == prev_packed) {
                     gid = prev_gid_u64;
                 } else {
-                    auto it = int_index_.find(key);
+                    const auto it = int_index_.find(key);
                     if (it == int_index_.end()) {
                         gid = static_cast<std::uint32_t>(n_groups_);
                         int_index_.emplace(key, gid);
@@ -3895,7 +3894,7 @@ class HashAggregateState final {
             if (have_prev && key == prev_key) {
                 gid = prev_gid;
             } else {
-                auto it = pair_index_.find(key);
+                const auto it = pair_index_.find(key);
                 if (it == pair_index_.end()) {
                     gid = static_cast<std::uint32_t>(n_groups_);
                     pair_index_.emplace(key, gid);
@@ -4671,7 +4670,7 @@ class HashAggregateState final {
             if (!partitioned_active_ && n_groups_ > 0) {
                 Hash hasher;
                 for (std::uint32_t gid = 0; gid < static_cast<std::uint32_t>(n_groups_); ++gid) {
-                    auto key = key_of_group(gid);
+                    const auto key = key_of_group(gid);
                     auto& partition = partitions[static_cast<std::size_t>(hasher(key) & part_mask)];
                     partition.index.emplace(Key(key),
                                             static_cast<std::uint32_t>(partition.gids.size()));
@@ -4848,7 +4847,7 @@ class HashAggregateState final {
                                 return key_at(row);
                             }
                         }();
-                        auto it = partition.index.find(key);
+                        const auto it = partition.index.find(key);
                         std::uint32_t local{};
                         if (it == partition.index.end()) {
                             local = static_cast<std::uint32_t>(partition.gids.size());
@@ -5022,7 +5021,7 @@ class HashAggregateState final {
 
     /// Grow every per-group array (slots and scratch) to `n_groups_`.
     void size_group_arrays() {
-        auto tail = flat_slots_.grow_uninitialized(n_groups_ * n_aggs_);
+        const auto tail = flat_slots_.grow_uninitialized(n_groups_ * n_aggs_);
         if (!fill_slots_parallel(tail)) {
             SlotArray<AggSlotCore>::fill_default(tail);
         }
@@ -5955,7 +5954,7 @@ class HashAggregateState final {
             if (have_prev && key == prev_key) {
                 gid = prev_gid;
             } else {
-                auto it = state.index.find(key);
+                const auto it = state.index.find(key);
                 if (it == state.index.end()) {
                     group_keys_.push_row(group_entries, row);
                     gid = alloc_group();
@@ -8257,8 +8256,9 @@ class HashAggregateState final {
                     } else if (plan_[i].categorical) {
                         // A coded aggregate's codes resolve against the input's
                         // dictionary, which the template shares.
-                        column = cat_agg_coded(i) && cat_agg_template_[i].has_value()
-                                     ? ColumnValue{*cat_agg_template_[i]}
+                        const auto& coded_template = cat_agg_template_[i];
+                        column = cat_agg_coded(i) && coded_template.has_value()
+                                     ? ColumnValue{*coded_template}
                                      : ColumnValue{Column<Categorical>{}};
                     } else {
                         column = Column<std::string>{};
@@ -8785,7 +8785,7 @@ class HashAggregateState final {
     struct CatKeyHash {
         auto operator()(const CatKey& k) const noexcept -> std::size_t {
             std::size_t h = 0;
-            for (auto c : k.codes) {
+            for (const auto c : k.codes) {
                 h ^= robin_hood::hash<Column<Categorical>::code_type>{}(c) + 0x9e3779b9 +
                      (h << 6U) + (h >> 2U);
             }

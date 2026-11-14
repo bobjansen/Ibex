@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <__msvc_int128.hpp>
@@ -187,7 +188,7 @@ inline constexpr Int128 kMaxUnits = detail::kPow10[kMaxPrecision] - 1;
 /// Exact three-way comparison of `a·10^-sa` against `b·10^-sb`.
 [[nodiscard]] constexpr auto compare(Int128 a, int sa, Int128 b, int sb) noexcept
     -> std::strong_ordering {
-    auto cmp = [](Int128 x, Int128 y) {
+    const auto cmp = [](Int128 x, Int128 y) {
         if (x == y) {
             return std::strong_ordering::equal;
         }
@@ -299,7 +300,7 @@ struct ParsedText {
 /// ignored. Leading zeros do not count toward precision.
 [[nodiscard]] inline auto parse_text(std::string_view text)
     -> std::expected<ParsedText, std::string> {
-    auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    const auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
     while (!text.empty() && is_space(text.front())) {
         text.remove_prefix(1);
     }

@@ -107,19 +107,10 @@ PY
 TIDY_COMMAND="$REPO_ROOT/scripts/clang-tidy.sh"
 "$TIDY_COMMAND" --version
 
-CLANG_FORMAT_BIN="${CLANG_FORMAT_BIN:-}"
-if [[ -z "$CLANG_FORMAT_BIN" ]]; then
-    for candidate in clang-format-20 clang-format-19 clang-format-18 clang-format; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-            CLANG_FORMAT_BIN="$candidate"
-            break
-        fi
-    done
-fi
-if [[ -z "$CLANG_FORMAT_BIN" ]]; then
-    echo "error: clang-format not found" >&2
-    exit 1
-fi
+# Share the pinned clang-format with every other formatting path; the wrapper
+# fails with an install hint when that version is missing.
+FORMAT_COMMAND="$REPO_ROOT/scripts/clang-format.sh"
+"$FORMAT_COMMAND" --version
 
 # clang-tidy accepts files, not directory operands. Expand directories here so
 # the whole implementation and public-header trees can be tidied together.
@@ -238,7 +229,7 @@ for f in "${files[@]}"; do
     # IncludeCategories). Narrow to exactly that prefix so other quoted
     # same-directory includes (e.g. "interpreter_internal.hpp") are untouched.
     sed -i -E 's/#include "(ibex\/[^"]+)"/#include <\1>/' "$f"
-    "$CLANG_FORMAT_BIN" -style="file:$STYLE_FILE" -i "$f"
+    "$FORMAT_COMMAND" -style="file:$STYLE_FILE" -i "$f"
 done
 
 # Verify each file still compiles, and put back the ones that do not. This is

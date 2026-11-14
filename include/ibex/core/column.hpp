@@ -49,6 +49,8 @@ class NoInitAllocator {
     NoInitAllocator() noexcept = default;
 
     template <typename U>
+    // Allocator rebinding converts implicitly, as std::allocator does.
+    // NOLINTNEXTLINE(*-explicit-constructor)
     constexpr NoInitAllocator(const NoInitAllocator<U>& /*_*/) noexcept {}
 
     [[nodiscard]] auto allocate(std::size_t n) -> T* { return std::allocator<T>{}.allocate(n); }
@@ -130,7 +132,10 @@ class IntegerView {
     using pointer = void;
     using iterator_category = std::random_access_iterator_tag;
     IntegerView() = default;
-    IntegerView(std::nullptr_t) noexcept {}
+    // Converts from a pointer the way the `const std::int64_t*` it replaces
+    // did, so call sites that pass a raw pointer or nullptr keep working.
+    IntegerView(std::nullptr_t) noexcept {}  // NOLINT(*-explicit-constructor)
+    // NOLINTNEXTLINE(*-explicit-constructor)
     IntegerView(const std::int64_t* data) noexcept : wide_(data) {}
     explicit IntegerView(const std::int32_t* data) noexcept : compact_(data) {}
     template <std::integral Index>
@@ -807,7 +812,7 @@ class Column {
             const auto* first = source.compact_int32_data();
             const auto count = source.size();
             if (!is_compact_int32()) {
-                auto meta = meta_;
+                const auto meta = meta_;
                 *this = from_compact_int32({});
                 meta_ = meta;
             }
@@ -1210,7 +1215,7 @@ class Column<Categorical> {
     void push_back(value_type value) {
         detach_dictionary();
         detach_codes();
-        auto code = find_or_insert(value);
+        const auto code = find_or_insert(value);
         codes_.push_back(code);
     }
 
@@ -1267,7 +1272,7 @@ class Column<Categorical> {
 
     [[nodiscard]] auto find_code(value_type value) const -> std::optional<code_type> {
         ensure_index();
-        auto it = index_->find(value);
+        const auto it = index_->find(value);
         if (it == index_->end()) {
             return std::nullopt;
         }
@@ -1286,11 +1291,11 @@ class Column<Categorical> {
 
     auto find_or_insert(value_type value) -> code_type {
         ensure_index();
-        auto it = index_->find(value);
+        const auto it = index_->find(value);
         if (it != index_->end()) {
             return it->second;
         }
-        auto code = static_cast<code_type>(dict_->size());
+        const auto code = static_cast<code_type>(dict_->size());
         dict_->emplace_back(value);
         index_->emplace(dict_->back(), code);
         return code;
@@ -1464,7 +1469,7 @@ class Column<std::string> {
 
     // Initializer list (used in REPL, tests); const char* → string_view is implicit.
     Column(std::initializer_list<std::string_view> init) : Column() {
-        for (auto sv : init)
+        for (const auto sv : init)
             push_back(sv);
     }
 
@@ -1902,6 +1907,8 @@ class Column<bool> {
             return *this = static_cast<bool>(other);
         }
 
+        // A bit proxy reads as bool implicitly, like std::vector<bool>::reference.
+        // NOLINTNEXTLINE(*-explicit-constructor)
         [[nodiscard]] operator bool() const { return (*word_ & mask_) != 0; }
     };
 
@@ -1909,6 +1916,9 @@ class Column<bool> {
 
     explicit Column(size_type count, bool value = false) { assign(count, value); }
 
+    // Implicit on purpose: `add_column(name, std::vector<bool>{...})` is public
+    // API (plugins use it).
+    // NOLINTNEXTLINE(*-explicit-constructor)
     Column(const std::vector<bool>& bools) {
         reserve(bools.size());
         for (const bool v : bools)

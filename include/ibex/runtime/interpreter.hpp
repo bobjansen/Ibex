@@ -39,7 +39,7 @@ class ExternRegistry;
 
 /// The kind of a scalar value; lives in core so the null alternative of every
 /// ScalarValue alias can record it.
-using ScalarKind = ibex::ScalarKind;
+using ibex::ScalarKind;
 
 // Column<Decimal> is last so no alternative index that predates it moves.
 using ColumnValue =
@@ -48,7 +48,7 @@ using ColumnValue =
 // A scalar value, or a null of a recorded type (core/scalar_value.hpp): the one
 // value type of every evaluator. Extern arguments remain null-free -- a null
 // is rejected before the call, it never reaches an extern.
-using ScalarValue = ibex::ScalarValue;
+using ibex::ScalarValue;
 
 /// The precision and scale of a Decimal column. Absent metadata on a Decimal
 /// column is a producer bug; reading it as scale 0 is the least surprising
@@ -240,6 +240,9 @@ class ValidityBitmap {
 
     explicit ValidityBitmap(size_type count, bool value = false) { assign(count, value); }
 
+    // Implicit on purpose: a std::vector<bool> is accepted wherever a
+    // validity bitmap is (`add_column` with a validity argument).
+    // NOLINTNEXTLINE(*-explicit-constructor)
     ValidityBitmap(const std::vector<bool>& values) {
         reserve(values.size());
         for (const bool v : values) {

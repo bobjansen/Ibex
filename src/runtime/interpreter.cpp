@@ -17,7 +17,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -500,7 +499,7 @@ auto merge_validity_bitmaps(const ValidityBitmap* a, const ValidityBitmap* b, st
 }
 
 void Table::add_column(std::string name, ColumnValue column) {
-    if (auto it = index.find(name); it != index.end()) {
+    if (const auto it = index.find(name); it != index.end()) {
         // Reseat the shared_ptr rather than mutating shared data (copy-on-write).
         columns[it->second].column = std::make_shared<ColumnValue>(std::move(column));
         columns[it->second].validity.reset();
@@ -518,7 +517,7 @@ void Table::add_column(std::string name, ColumnValue column) {
 }
 
 void Table::add_column(std::string name, ColumnValue column, ValidityBitmap validity) {
-    if (auto it = index.find(name); it != index.end()) {
+    if (const auto it = index.find(name); it != index.end()) {
         columns[it->second].column = std::make_shared<ColumnValue>(std::move(column));
         columns[it->second].validity = std::move(validity);
         return;
@@ -546,7 +545,7 @@ void Table::replace_column(std::size_t pos, ColumnValue column,
 
 void Table::rename_column(std::size_t pos, std::string name) {
     auto& entry = columns.at(pos);
-    if (auto it = index.find(entry.name); it != index.end() && it->second == pos) {
+    if (const auto it = index.find(entry.name); it != index.end() && it->second == pos) {
         index.erase(it);
     }
     entry.name = std::move(name);
@@ -567,7 +566,7 @@ void Table::add_column_from(std::string name, const ColumnEntry& source) {
 
 void Table::add_column_shared(std::string name, std::shared_ptr<ColumnValue> column,
                               std::optional<ValidityBitmap> validity) {
-    if (auto it = index.find(name); it != index.end()) {
+    if (const auto it = index.find(name); it != index.end()) {
         columns[it->second].column = std::move(column);
         columns[it->second].validity = std::move(validity);
         return;
@@ -582,21 +581,21 @@ void Table::add_column_shared(std::string name, std::shared_ptr<ColumnValue> col
 }
 
 auto Table::find_entry(const std::string& name) const -> const ColumnEntry* {
-    if (auto it = index.find(name); it != index.end()) {
+    if (const auto it = index.find(name); it != index.end()) {
         return &columns[it->second];
     }
     return nullptr;
 }
 
 auto Table::find(const std::string& name) -> ColumnValue* {
-    if (auto it = index.find(name); it != index.end()) {
+    if (const auto it = index.find(name); it != index.end()) {
         return columns[it->second].column.get();
     }
     return nullptr;
 }
 
 auto Table::find(const std::string& name) const -> const ColumnValue* {
-    if (auto it = index.find(name); it != index.end()) {
+    if (const auto it = index.find(name); it != index.end()) {
         return columns[it->second].column.get();
     }
     return nullptr;

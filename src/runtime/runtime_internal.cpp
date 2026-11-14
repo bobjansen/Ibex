@@ -29,14 +29,14 @@ auto is_simple_identifier(std::string_view name) -> bool {
     if (name.empty()) {
         return false;
     }
-    auto is_alpha = [](unsigned char ch) -> bool { return std::isalpha(ch) != 0; };
-    auto is_alnum = [](unsigned char ch) -> bool { return std::isalnum(ch) != 0; };
-    auto first = static_cast<unsigned char>(name.front());
+    const auto is_alpha = [](unsigned char ch) -> bool { return std::isalpha(ch) != 0; };
+    const auto is_alnum = [](unsigned char ch) -> bool { return std::isalnum(ch) != 0; };
+    const auto first = static_cast<unsigned char>(name.front());
     if (!is_alpha(first) && first != '_') {
         return false;
     }
     for (std::size_t i = 1; i < name.size(); ++i) {
-        auto ch = static_cast<unsigned char>(name[i]);
+        const auto ch = static_cast<unsigned char>(name[i]);
         if (!is_alnum(ch) && ch != '_') {
             return false;
         }

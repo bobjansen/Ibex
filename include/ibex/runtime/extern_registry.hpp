@@ -310,7 +310,7 @@ class ExternRegistry {
 
     /// Runs the shutdown hooks, most recently registered first.
     ~ExternRegistry() {
-        for (auto& hook : std::ranges::reverse_view(shutdown_hooks_)) {
+        for (const auto& hook : std::ranges::reverse_view(shutdown_hooks_)) {
             try {
                 hook();
             } catch (...) {  // NOLINT(bugprone-empty-catch): teardown must not abort the host
@@ -381,7 +381,7 @@ class ExternRegistry {
     /// both are stored; the interpreter prefers the chunked path.
     void register_chunked_table(std::string name, ExternChunkedTableFn func) {
         use_host_runtime_state();
-        auto it = registry_.find(name);
+        const auto it = registry_.find(name);
         if (it != registry_.end()) {
             it->second.chunked_table_func = std::move(func);
             it->second.kind = ExternReturnKind::Table;
@@ -400,7 +400,7 @@ class ExternRegistry {
     /// table at once.
     void register_lazy_table(std::string name, ExternLazyTableFn func) {
         use_host_runtime_state();
-        auto it = registry_.find(name);
+        const auto it = registry_.find(name);
         if (it != registry_.end()) {
             it->second.lazy_table_func = std::move(func);
             it->second.kind = ExternReturnKind::Table;
@@ -429,7 +429,7 @@ class ExternRegistry {
 
     /// Look up a registered function by name.
     [[nodiscard]] auto find(const std::string& name) const -> const ExternFunction* {
-        if (auto it = registry_.find(name); it != registry_.end()) {
+        if (const auto it = registry_.find(name); it != registry_.end()) {
             return &it->second;
         }
         return nullptr;
@@ -461,7 +461,7 @@ class ExternRegistry {
 
     /// Look up a registered model method by name.
     [[nodiscard]] auto find_model(const std::string& name) const -> const ModelOps* {
-        if (auto it = models_.find(name); it != models_.end()) {
+        if (const auto it = models_.find(name); it != models_.end()) {
             return &it->second;
         }
         return nullptr;

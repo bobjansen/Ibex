@@ -312,7 +312,7 @@ struct DeferredWrap {
         // order with the others. Later table lets may filter/compute against
         // it; a bare name there must resolve as a binding, not a missing column.
         // `let x: Int64 = NULL;`: the declaration types the NULL, as a literal.
-        auto value = [&]() -> std::expected<ir::Expr, LowerError> {
+        auto value = [&] -> std::expected<ir::Expr, LowerError> {
             const auto* null_call = std::get_if<CallExpr>(&let_stmt->value->node);
             const auto* declared =
                 let_stmt->type.has_value() && let_stmt->type->kind == Type::Kind::Scalar

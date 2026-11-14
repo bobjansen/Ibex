@@ -50,7 +50,7 @@ namespace {
 
 auto map_column_from_scalars(const std::vector<ScalarValue>& values)
     -> std::expected<ComputedColumn, std::string> {
-    const auto build = [&]<class T>() -> std::expected<ComputedColumn, std::string> {
+    const auto build = [&]<class T> -> std::expected<ComputedColumn, std::string> {
         Column<T> column;
         column.reserve(values.size());
         ValidityBitmap validity;
@@ -124,7 +124,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
     switch (node.kind()) {
         case ir::NodeKind::Scan: {
             const auto& scan = ir::node_cast<ir::ScanNode>(node);
-            auto it = registry.find(scan.source_name());
+            const auto it = registry.find(scan.source_name());
             if (it == registry.end()) {
                 // A deferred lazy source has no registry entry; decode it here
                 // with whatever bounds its join has published so far.
@@ -343,7 +343,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             // the ordinary input path below.
             if (child_node.kind() == ir::NodeKind::Scan) {
                 const auto& scan = ir::node_cast<ir::ScanNode>(child_node);
-                if (auto it = registry.find(scan.source_name()); it != registry.end()) {
+                if (const auto it = registry.find(scan.source_name()); it != registry.end()) {
                     return one_group_if_ungrouped(
                         aggregate_table(it->second, agg.group_by(), agg.aggregations(), &exec));
                 }
@@ -407,7 +407,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             // stays a TimeFrame; a set dedupes fields that name a key or the index.
             std::vector<ir::ColumnRef> keep;
             robin_hood::unordered_set<std::string> seen;
-            auto keep_col = [&](const std::string& name) {
+            const auto keep_col = [&](const std::string& name) {
                 if (seen.insert(name).second) {
                     keep.push_back(ir::ColumnRef{.name = name});
                 }
@@ -446,9 +446,9 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             if (const auto* int_col = std::get_if<Column<std::int64_t>>(col)) {
                 Column<Timestamp> ts_col;
                 ts_col.reserve(int_col->size());
-                for (auto v : *int_col)
+                for (const auto v : *int_col)
                     ts_col.push_back(Timestamp{v});
-                auto idx_it = t.index.find(atf.column());
+                const auto idx_it = t.index.find(atf.column());
                 if (idx_it != t.index.end()) {
                     t.replace_column(idx_it->second, ColumnValue{std::move(ts_col)});
                     col = t.find(atf.column());
@@ -491,7 +491,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                 return child;
             }
             const Table& t = child.value();
-            auto type_matches = [](const ColumnValue& col, ir::ColumnType type) -> bool {
+            const auto type_matches = [](const ColumnValue& col, ir::ColumnType type) -> bool {
                 switch (type) {
                     case ir::ColumnType::Int32:
                     case ir::ColumnType::Int64:
@@ -743,7 +743,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
 
             // Pre-evaluate scalar args (literals — no row context needed).
             // Externs take null-free ScalarValue arguments.
-            auto eval_scalar_args =
+            const auto eval_scalar_args =
                 [&](const std::vector<ir::Expr>& exprs) -> std::expected<ExternArgs, std::string> {
                 ExternArgs out;
                 out.reserve(exprs.size());
@@ -769,8 +769,8 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             const ir::Node& transform_ir = sn.transform_ir();
 
             // Append every row of `src` into `dst`, initialising dst schema on first call.
-            auto append_table = [&](Table& dst,
-                                    const Table& src) -> std::expected<void, std::string> {
+            const auto append_table = [&](Table& dst,
+                                          const Table& src) -> std::expected<void, std::string> {
                 if (src.rows() == 0)
                     return {};
                 if (dst.columns.empty()) {
@@ -802,7 +802,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             };
 
             // Slice a single row out of `src` into a new one-row Table.
-            auto slice_row = [&](const Table& src, std::size_t r) -> Table {
+            const auto slice_row = [&](const Table& src, std::size_t r) -> Table {
                 Table out;
                 for (const auto& entry : src.columns) {
                     out.add_column(entry.name, make_empty_like(*entry.column));
@@ -822,7 +822,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             };
 
             // Get the nanosecond timestamp of the last row (for bucket detection).
-            auto get_last_ts_ns = [&](const Table& t) -> std::optional<std::int64_t> {
+            const auto get_last_ts_ns = [&](const Table& t) -> std::optional<std::int64_t> {
                 if (t.rows() == 0 || !t.time_index().has_value())
                     return std::nullopt;
                 const auto* col = t.find(*t.time_index());
@@ -843,7 +843,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
             };
 
             // Run the transform over `buf` and emit the result to the sink.
-            auto emit_buffer = [&](const Table& buf) -> std::expected<void, std::string> {
+            const auto emit_buffer = [&](const Table& buf) -> std::expected<void, std::string> {
                 if (buf.rows() == 0)
                     return {};
                 TableRegistry stream_reg = registry;
@@ -869,9 +869,9 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                     : 0;
 
             // Returns current wall-clock time in nanoseconds.
-            auto wall_now_ns = []() -> std::int64_t {
-                auto now = std::chrono::system_clock::now();
-                auto ns =
+            const auto wall_now_ns = [] -> std::int64_t {
+                const auto now = std::chrono::system_clock::now();
+                const auto ns =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch());
                 return static_cast<std::int64_t>(ns.count());
             };
@@ -976,7 +976,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                         entry.name = col.name;
                         result.index[col.name] = result.columns.size();
                         result.columns.push_back(std::move(entry));
-                    } else if (auto it = sub->index.find(col.name); it != sub->index.end()) {
+                    } else if (const auto it = sub->index.find(col.name); it != sub->index.end()) {
                         // Multi-column result: extract the column matching col.name.
                         ColumnEntry entry = sub->columns[it->second];
                         entry.name = col.name;

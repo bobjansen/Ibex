@@ -329,9 +329,10 @@ auto gather_entries(std::span<const GatherJob> jobs, std::size_t total,
     std::vector<ColumnGatherJob> column_jobs;
     column_jobs.reserve(jobs.size());
     for (const auto& job : jobs) {
+        const auto& validity = job.entry->validity;
         column_jobs.push_back({
             .column = job.entry->column.get(),
-            .validity = job.entry->validity.has_value() ? &*job.entry->validity : nullptr,
+            .validity = validity.has_value() ? &*validity : nullptr,
             .idx = job.idx,
             .null_index = job.has_sentinel ? std::optional<std::size_t>{kNull} : std::nullopt,
         });
@@ -412,7 +413,7 @@ auto asof_not_timeframe_error(const Table& left, const Table& right) -> std::str
                    "')");
     }
 
-    auto add_side_hint = [&](const Table& side, const char* label) {
+    const auto add_side_hint = [&](const Table& side, const char* label) {
         if (side.time_index().has_value()) {
             return;
         }
@@ -907,14 +908,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // Either check may have failed by the time a path returns; both are raised
     // through here so no exit forgets one.
     std::string take_error;
-    if (take == ir::MatchSelection::First || take == ir::MatchSelection::Last) {
-        if (!right.ordering().has_value() || right.ordering()->empty()) {
-            take_error =
-                "`take " + std::string(take == ir::MatchSelection::First ? "first" : "last") +
-                "` needs the right input to state an order, and this one carries none; add "
-                "`order` to it, or use `take any` if the choice does not matter";
-        }
+    if ((take == ir::MatchSelection::First || take == ir::MatchSelection::Last) &&
+        (!right.ordering().has_value() || right.ordering()->empty())) {
+        take_error = "`take " + std::string(take == ir::MatchSelection::First ? "first" : "last") +
+                     "` needs the right input to state an order, and this one carries none; add "
+                     "`order` to it, or use `take any` if the choice does not matter";
     }
+
     const auto keep_lowest_index =
         take == ir::MatchSelection::First || take == ir::MatchSelection::Any;
 
@@ -1148,7 +1148,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                     // rather than visiting and appending for every row.
                                     values.resize_for_overwrite(total);
                                     auto* dst = values.data();
-                                    using V = typename Col::value_type;
+                                    using V = Col::value_type;
                                     with_physical_values(*lc, [&](const auto* ld) {
                                         with_physical_values(*rc, [&](const auto* rd) {
                                             for_row_ranges(
@@ -1337,11 +1337,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
             }
 
-            if (!left_had_match) {
-                if (anti_join || preserve_left_rows) {
-                    left_idx.push_back(l);
-                    right_idx.push_back(kNull);
-                }
+            if ((!left_had_match) && (anti_join || preserve_left_rows)) {
+                left_idx.push_back(l);
+                right_idx.push_back(kNull);
             }
         }
 
@@ -1380,7 +1378,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             on_worker_pool_thread() || n < kMinProbeRows) {
             return 0;
         }
-        auto& pool = process_worker_pool();
+        const auto& pool = process_worker_pool();
         const std::size_t budget = exec->compute_budget();
         const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
         return workers < 2 ? 0 : workers;
@@ -1629,7 +1627,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         key_gid.reserve(n_build);
         std::vector<std::uint32_t> row_gid(n_build);
         std::uint32_t n_groups = 0;
-        auto assign_gids = [&](const auto& col) {
+        const auto assign_gids = [&](const auto& col) {
             for (std::size_t i = 0; i < n_build; ++i) {
                 auto [it, inserted] = key_gid.try_emplace(col[i], n_groups);
                 n_groups += inserted ? 1U : 0U;
@@ -1649,7 +1647,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             const auto* rc = std::get_if<Column<Categorical>>(right_keys[0]);
             auto lookup = [&](std::size_t r) -> std::span<const std::size_t> {
                 const std::string_view sv = rs != nullptr ? (*rs)[r] : (*rc)[r];
-                auto it = key_gid.find(sv);
+                const auto it = key_gid.find(sv);
                 return it == key_gid.end() ? std::span<const std::size_t>{}
                                            : grouped.matches(it->second);
             };
@@ -1664,7 +1662,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             const auto& dict = *lc->dictionary_ptr();
             std::vector<std::uint32_t> code_gid(dict.size(), kNoGroup);
             for (std::size_t code = 0; code < dict.size(); ++code) {
-                auto it = key_gid.find(std::string_view{dict[code]});
+                const auto it = key_gid.find(std::string_view{dict[code]});
                 if (it != key_gid.end()) {
                     code_gid[code] = it->second;
                 }
@@ -1687,13 +1685,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             const auto& ls = std::get<Column<std::string>>(*left_keys[0]);
             if (preserve_left_only && grouped.unique()) {
                 probe_left_identity([&](std::size_t l) {
-                    auto it = key_gid.find(ls[l]);
+                    const auto it = key_gid.find(ls[l]);
                     return it == key_gid.end() ? kNull : grouped.rows[grouped.offsets[it->second]];
                 });
                 return join_failure(output);
             }
             auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
-                auto it = key_gid.find(ls[l]);
+                const auto it = key_gid.find(ls[l]);
                 return it == key_gid.end() ? std::span<const std::size_t>{}
                                            : grouped.matches(it->second);
             };
@@ -1888,9 +1886,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         std::vector<std::int64_t> left_times_buf;
         std::vector<std::int64_t> right_times_buf;
         using TimeStorage = std::variant<const Timestamp*, const std::int64_t*>;
-        auto as_time_storage = [&](const ColumnValue& col, std::size_t n,
-                                   std::vector<std::int64_t>& buf,
-                                   const char* label) -> std::expected<TimeStorage, std::string> {
+        const auto as_time_storage =
+            [&](const ColumnValue& col, std::size_t n, std::vector<std::int64_t>& buf,
+                const char* label) -> std::expected<TimeStorage, std::string> {
             if (const auto* ts = std::get_if<Column<Timestamp>>(&col)) {
                 return ts->data();
             }
@@ -2085,7 +2083,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                     // NOLINTNEXTLINE(misc-const-correctness)
                                     std::vector<std::size_t> cursor(buckets.size(), 0);
                                     for (std::size_t l = 0; l < n_left; ++l) {
-                                        auto it = dict.find(lc[l]);
+                                        const auto it = dict.find(lc[l]);
                                         if (it == dict.end()) {
                                             right_idx[l] = kNull;
                                             continue;
@@ -2150,7 +2148,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                     asof_range_count(exec, n_left), n_left,
                                     [&](std::size_t, std::size_t b, std::size_t e) {
                                         for (std::size_t l = b; l < e; ++l) {
-                                            auto it = dict.find(lc[l]);
+                                            const auto it = dict.find(lc[l]);
                                             lcode[l] = it == dict.end() ? kNoGroup : it->second;
                                             if (lcode[l] == kNoGroup) {
                                                 right_idx[l] = kNull;  // no such key on the right
@@ -2247,7 +2245,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                         }
                         mark_nulls(group, left_eq_validity, l);
 
-                        auto it = right_groups.find(group);
+                        const auto it = right_groups.find(group);
                         if (it == right_groups.end()) {
                             right_idx[l] = kNull;
                             continue;

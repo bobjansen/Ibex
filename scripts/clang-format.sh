@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
-# clang-format wrapper: choose the newest available clang-format.
+# clang-format wrapper: run the pinned clang-format (scripts/clang-format-version).
 
 set -euo pipefail
 
@@ -52,18 +52,28 @@ if [[ "$recursive" -eq 0 && "${#args[@]}" -eq 0 && -t 0 ]]; then
     exit 64
 fi
 
+# Run the clang-format version CI checks with: scripts/clang-format-version
+# holds it, and CI's format-check job installs that same version. Versions
+# format differently, so any other version reformats code CI accepts.
+# CLANG_FORMAT_BIN overrides the executable.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CLANG_FORMAT_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/scripts/clang-format-version")"
 CLANG_FORMAT_BIN="${CLANG_FORMAT_BIN:-}"
 if [[ -z "$CLANG_FORMAT_BIN" ]]; then
-    for candidate in clang-format-20 clang-format-19 clang-format-18 clang-format; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-            CLANG_FORMAT_BIN="$candidate"
-            break
-        fi
-    done
+    if command -v "clang-format-$CLANG_FORMAT_VERSION" >/dev/null 2>&1; then
+        CLANG_FORMAT_BIN="clang-format-$CLANG_FORMAT_VERSION"
+    elif command -v clang-format >/dev/null 2>&1 &&
+        clang-format --version | grep -q "version $CLANG_FORMAT_VERSION\."; then
+        CLANG_FORMAT_BIN="clang-format"
+    fi
 fi
 
 if [[ -z "$CLANG_FORMAT_BIN" ]]; then
-    echo "error: clang-format not found" >&2
+    echo "error: clang-format $CLANG_FORMAT_VERSION not found (the version CI checks with," >&2
+    echo "       from scripts/clang-format-version). Install it from apt.llvm.org:" >&2
+    echo "         wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh" >&2
+    echo "         sudo bash /tmp/llvm.sh $CLANG_FORMAT_VERSION && sudo apt-get install -y clang-format-$CLANG_FORMAT_VERSION" >&2
+    echo "       or set CLANG_FORMAT_BIN to run another version deliberately." >&2
     exit 1
 fi
 

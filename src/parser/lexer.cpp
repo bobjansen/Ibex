@@ -98,14 +98,14 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
     std::size_t line = 1;
     std::size_t column = 1;
 
-    const auto at_end = [&]() -> bool { return i >= source.size(); };
+    const auto at_end = [&] -> bool { return i >= source.size(); };
     const auto peek = [&](std::size_t offset = 0) -> char {
         if (i + offset >= source.size()) {
             return '\0';
         }
         return source[i + offset];
     };
-    const auto advance = [&]() -> char {
+    const auto advance = [&] -> char {
         if (at_end()) {
             return '\0';
         }
@@ -127,7 +127,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         return true;
     };
 
-    const auto skip_whitespace_and_comments = [&]() {
+    const auto skip_whitespace_and_comments = [&] {
         while (!at_end()) {
             const char ch = peek();
             if (ch == ' ' || ch == '\r' || ch == '\t' || ch == '\n') {
@@ -183,7 +183,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
                           token_column);
                 continue;
             }
-            if (auto it = keywords.find(text); it != keywords.end()) {
+            if (const auto it = keywords.find(text); it != keywords.end()) {
                 add_token(it->second, token_start, i - token_start, token_line, token_column);
                 continue;
             }

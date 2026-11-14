@@ -77,7 +77,9 @@ struct ScalarArg {
     runtime::ScalarValue value;
 
     template <class T>
-    operator T() const {  // NOLINT(google-explicit-constructor): mirrors a literal argument
+    // Converts implicitly to mirror a literal argument.
+    // NOLINTNEXTLINE(*-explicit-constructor)
+    operator T() const {
         // `std::get_if<T>` is only well-formed for a variant alternative, so
         // dispatch on the target C++ type rather than probing the variant with
         // an arbitrary `T` (e.g. a call site wanting `std::size_t`).
@@ -126,7 +128,8 @@ struct ScalarArg {
 /// which reads them from `IBEX_ARGS` (one entry per line) — the compiled
 /// equivalent of `ibex script.ibex -- <args>`. A no-op when `argc <= 1`, so an
 /// `IBEX_ARGS` already in the environment still applies to an argument-less run.
-void forward_cli_args(int argc, char** argv);
+// `main`'s own argv type, so generated code passes it unchanged.
+void forward_cli_args(int argc, char** argv);  // NOLINT(misc-const-correctness)
 
 // ─── Core table operations ────────────────────────────────────────────────────
 //  These are the functions emitted by ibex_compile into the generated C++ file.

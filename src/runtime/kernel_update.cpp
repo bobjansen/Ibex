@@ -972,7 +972,7 @@ auto write_string_case(const Chunk& input, const ir::FieldSpec& field, const Dir
     literals.reserve(plan.values.size());
     for (const auto& value : plan.values) {
         if (value.literal != nullptr) {
-            auto literal = direct_literal_value<std::string_view>(*value.literal);
+            const auto literal = direct_literal_value<std::string_view>(*value.literal);
             if (!literal.has_value()) {
                 return std::nullopt;
             }
@@ -1044,7 +1044,7 @@ auto write_categorical_case(const Chunk& input, const ir::FieldSpec& field,
     literals.reserve(plan.values.size());
     for (const auto& value : plan.values) {
         if (value.literal != nullptr) {
-            auto literal = direct_literal_value<std::string_view>(*value.literal);
+            const auto literal = direct_literal_value<std::string_view>(*value.literal);
             if (!literal.has_value()) {
                 return std::nullopt;
             }
@@ -2249,9 +2249,9 @@ auto resolve_validity_operands(const DirectValidityPlan& plan, std::size_t range
                 return std::nullopt;
             }
             operand.data = value_reader(*column) + range_begin;
-            if (value.column->validity.has_value()) {
-                operand.bits = value.column->validity->buffer_data();
-                operand.bit_base = value.column->validity->buffer_offset() + range_begin;
+            if (const auto& validity = value.column->validity; validity.has_value()) {
+                operand.bits = validity->buffer_data();
+                operand.bit_base = validity->buffer_offset() + range_begin;
             }
         }
         operands.push_back(operand);
@@ -2627,7 +2627,7 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
             const double* p = std::get<Column<double>>(*operand.column).data() + begin;
             return body([p](std::size_t i) { return p[i]; });
         };
-        auto write = [&](auto op) {
+        const auto write = [&](auto op) {
             if (!left.is_column && !right.is_column) {
                 std::fill_n(output.doubles, rows,
                             op(numeric_double_value(left), numeric_double_value(right)));
@@ -2668,7 +2668,7 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
                             : nullptr;
         const std::int64_t ls = left.is_column ? 0 : numeric_int_value(left);
         const std::int64_t rs = right.is_column ? 0 : numeric_int_value(right);
-        auto write = [&](auto op) {
+        const auto write = [&](auto op) {
             // Locals, not captures: write is not inlined, and an int64_t store may
             // alias the closure's size_t/int64_t fields, so a captured trip count
             // or scalar is reloaded every row and the loop never vectorizes.
@@ -2971,7 +2971,7 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
     // one, else the selected plan's own output kind. They agree wherever both
     // exist — a plan is only selected for an expression whose result it can
     // name — and the plan is the only answer a chunk caller has.
-    const auto plan_kind = [&]() -> std::optional<ExprType> {
+    const auto plan_kind = [&] -> std::optional<ExprType> {
         if (route.predicate.has_value()) {
             return ExprType::Bool;
         }

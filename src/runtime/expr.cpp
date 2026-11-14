@@ -197,7 +197,7 @@ auto eval_date_part(std::string_view name, const ScalarValue& v)
     }
     if (const auto* tv = std::get_if<Timestamp>(&v)) {
         const sys_time<nanoseconds> tp{nanoseconds{tv->nanos}};
-        auto day_pt = floor<days>(tp);
+        const auto day_pt = floor<days>(tp);
         const year_month_day ymd{day_pt};
         const hh_mm_ss<nanoseconds> hms{tp - day_pt};
         if (name == "year") {
@@ -469,7 +469,7 @@ auto resolve_like_arg(const ir::Expr& expr, const Table& input, const ScalarRegi
         return std::unexpected("like: column '" + ref->name + "' is not a String column");
     }
     if (scalars != nullptr) {
-        if (auto it = scalars->find(ref->name); it != scalars->end()) {
+        if (const auto it = scalars->find(ref->name); it != scalars->end()) {
             const auto* text = std::get_if<std::string>(&it->second);
             if (text == nullptr) {
                 return std::unexpected("like: arguments must be String");
@@ -609,7 +609,7 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
             // A lexical scalar: convert once through the per-row eval (the
             // semantic reference), then broadcast.
             if (ctx.scalars != nullptr) {
-                if (auto it = ctx.scalars->find(ref->name); it != ctx.scalars->end()) {
+                if (const auto it = ctx.scalars->find(ref->name); it != ctx.scalars->end()) {
                     // The raw eval skips the registry's null propagation, so a
                     // null binding is handled here: a cast of null is null.
                     if (is_null_scalar(it->second)) {
@@ -1463,9 +1463,10 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             .exec = ScalarExec{.eval = [](std::string_view name,
                                           const std::vector<ScalarValue>& a) -> IV {
                 const bool want_min = (name == "pmin");
-                auto better = [&](const ScalarValue& cand,
-                                  const ScalarValue& best) -> std::expected<bool, std::string> {
-                    auto num = [](const ScalarValue& v) -> std::optional<double> {
+                const auto better =
+                    [&](const ScalarValue& cand,
+                        const ScalarValue& best) -> std::expected<bool, std::string> {
+                    const auto num = [](const ScalarValue& v) -> std::optional<double> {
                         return expr_value_to_double(v);
                     };
                     if (auto c = num(cand)) {
@@ -1979,7 +1980,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
 
 auto find_builtin(std::string_view name) -> const BuiltinFn* {
     const auto& m = builtins();
-    auto it = m.find(name);
+    const auto it = m.find(name);
     return it == m.end() ? nullptr : &it->second;
 }
 
@@ -2057,7 +2058,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         const auto* source = col->lexical ? nullptr : input.find(col->name);
         if (source == nullptr) {
             if (scalars != nullptr) {
-                if (auto it = scalars->find(col->name); it != scalars->end()) {
+                if (const auto it = scalars->find(col->name); it != scalars->end()) {
                     // A binding's type, null or not (a null records its kind).
                     return expr_type_of_kind(scalar_kind(it->second));
                 }
@@ -2228,7 +2229,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         }
         // Pure row-wise scalar builtins: single source of truth (see
         // builtins()). Both this pass and eval_call_columns dispatch here.
-        if (auto it = builtins().find(call->callee); it != builtins().end()) {
+        if (const auto it = builtins().find(call->callee); it != builtins().end()) {
             const auto& fn = it->second;
             const auto argc = static_cast<int>(call->args.size());
             if (argc < fn.min_args || (fn.max_args >= 0 && argc > fn.max_args)) {
@@ -2323,7 +2324,7 @@ auto infer_decimal_type(const ir::Expr& expr, const Table& input, const ScalarRe
             return std::unexpected("column '" + col->name + "' is not Decimal");
         }
         if (scalars != nullptr) {
-            if (auto it = scalars->find(col->name); it != scalars->end()) {
+            if (const auto it = scalars->find(col->name); it != scalars->end()) {
                 if (const auto* d = std::get_if<DecimalValue>(&it->second)) {
                     return d->type;
                 }
@@ -3181,7 +3182,7 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
                           std::is_same_v<ColT, Column<std::string>>) {
                 // Categorical/string: element-wise fallback (no plain memcpy).
                 out.reserve(rows);
-                auto push_default = [&] {
+                const auto push_default = [&] {
                     if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                         out.push_back(std::string_view{});
                     } else {
@@ -4136,7 +4137,7 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
             continue;  // already consumed above
         }
         const auto* lit = std::get_if<ir::Literal>(&narg.value->node);
-        auto as_int = [&] -> std::expected<std::int64_t, std::string> {
+        const auto as_int = [&] -> std::expected<std::int64_t, std::string> {
             if (lit == nullptr) {
                 return std::unexpected("rep: named argument '" + narg.name + "' must be a literal");
             }

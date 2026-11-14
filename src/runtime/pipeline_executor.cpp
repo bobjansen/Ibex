@@ -1612,7 +1612,7 @@ class DeferredScanSourceOperator final : public Operator {
         if (!exec.can_fan_out() || on_worker_pool_thread()) {
             return 1;
         }
-        auto& pool = process_worker_pool();
+        const auto& pool = process_worker_pool();
         const std::size_t budget = exec.compute_budget();
         return std::max<std::size_t>(1, std::min(budget, pool.size()));
     }
@@ -1747,7 +1747,7 @@ class DeferredScanSourceOperator final : public Operator {
     void unify_categorical_dictionaries(Table& table) {
         using code_type = Column<Categorical>::code_type;
         for (std::size_t i = 0; i < table.columns.size(); ++i) {
-            auto* local = std::get_if<Column<Categorical>>(table.columns[i].column.get());
+            const auto* local = std::get_if<Column<Categorical>>(table.columns[i].column.get());
             if (local == nullptr) {
                 continue;
             }
@@ -2111,6 +2111,9 @@ class PipelinedScanOperator final : public Operator {
     /// window carries that extra round. A claimed sequence is inside the window
     /// the consumer holds open itself, so its `acquire` cannot park.
     [[nodiscard]] auto run_consumer_unit() -> bool {
+        if (!consumer_worker_.has_value()) {
+            return false;  // only a pipeline with a consumer worker runs units here
+        }
         std::size_t sequence = cursor_.load(std::memory_order_relaxed);
         do {
             if (sequence >= units_.size() ||
@@ -2215,7 +2218,7 @@ class PipelinedScanOperator final : public Operator {
             cat_states_.resize(chunk.columns.size());
         }
         for (std::size_t i = 0; i < chunk.columns.size(); ++i) {
-            auto* local = std::get_if<Column<Categorical>>(chunk.columns[i].column.get());
+            const auto* local = std::get_if<Column<Categorical>>(chunk.columns[i].column.get());
             if (local == nullptr) {
                 continue;
             }
@@ -2542,7 +2545,7 @@ class PipelinedStageOperator final : public Operator {
 }
 
 [[nodiscard]] auto scan_pipeline_worker_count(std::size_t unit_count) -> std::size_t {
-    auto& pool = process_worker_pool();
+    const auto& pool = process_worker_pool();
     if (pool.size() < 2) {
         // With one pool thread there is no worker to reserve for a downstream
         // operator batch. Running the producer there can deadlock as soon as a
@@ -2618,7 +2621,7 @@ auto build_unit_pipeline(std::vector<SourceUnit> units, const UnitProducerFactor
     // in the same order and with the same boundaries. Anything downstream that
     // reduces per chunk then reduces identically at every core count.
     const std::size_t worker_count = scan_pipeline_worker_count(units.size());
-    const auto make_worker = [&]() {
+    const auto make_worker = [&] {
         auto source = std::make_unique<ScanPipelineSource>();
         ScanPipelineWorker worker{
             .source = source.get(), .chain = std::move(source), .produce = {}};

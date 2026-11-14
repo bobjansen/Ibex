@@ -3756,7 +3756,9 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
     std::string last_error;
     std::string last_candidate;
     for (const auto& dir : search_paths) {
-        const auto full_path = std::filesystem::path(dir) / filename;
+        // Reassigned on macOS below, which a Linux clang-tidy run cannot see.
+        // NOLINTNEXTLINE(misc-const-correctness)
+        auto full_path = std::filesystem::path(dir) / filename;
 #ifdef __APPLE__
         if (const auto dylib_path = std::filesystem::path(dir) / dylib_filename;
             std::filesystem::exists(dylib_path)) {

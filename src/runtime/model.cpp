@@ -45,16 +45,16 @@ auto incomplete_beta_fraction(double a, double b, double x) -> double {
         const auto dm = static_cast<double>(m);
         const double m2 = 2.0 * dm;
         double aa = dm * (b - dm) * x / ((qam + m2) * (a + m2));
-        d = 1.0 + aa * d;
+        d = 1.0 + (aa * d);
         d = std::abs(d) < kTiny ? kTiny : d;
-        c = 1.0 + aa / c;
+        c = 1.0 + (aa / c);
         c = std::abs(c) < kTiny ? kTiny : c;
         d = 1.0 / d;
         h *= d * c;
         aa = -(a + dm) * (qab + dm) * x / ((a + m2) * (qap + m2));
-        d = 1.0 + aa * d;
+        d = 1.0 + (aa * d);
         d = std::abs(d) < kTiny ? kTiny : d;
-        c = 1.0 + aa / c;
+        c = 1.0 + (aa / c);
         c = std::abs(c) < kTiny ? kTiny : c;
         d = 1.0 / d;
         const double delta = d * c;
@@ -93,7 +93,7 @@ auto two_sided_t_p_value(double t, double df) -> double {
     if (t == 0.0) {
         return 1.0;
     }
-    return incomplete_beta(df / 2.0, 0.5, df / (df + t * t));
+    return incomplete_beta(df / 2.0, 0.5, df / (df + (t * t)));
 }
 
 /// Build a design matrix from a DataFrame using a model formula.

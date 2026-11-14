@@ -27,7 +27,7 @@
 
 #include "execution_profile_internal.hpp"
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <sched.h>
 #endif
 
@@ -182,7 +182,7 @@ void run_task(const Task& task) {
     }
     std::atomic<std::int32_t>* debit_to_settle = nullptr;
     {
-        const std::lock_guard lock(state.mutex);
+        const std::scoped_lock lock(state.mutex);
         if (caught != nullptr && (state.error == nullptr || task.worker_id < state.error_worker)) {
             state.error = caught;
             state.error_worker = task.worker_id;
@@ -493,7 +493,7 @@ WorkerPool::~WorkerPool() {
         return;  // no worker threads to stop or join
     }
     {
-        const std::lock_guard lock(impl_->mutex);
+        const std::scoped_lock lock(impl_->mutex);
         impl_->stopping = true;
     }
     impl_->work.notify_all();
@@ -511,7 +511,7 @@ WorkerPool::~WorkerPool() {
 auto WorkerPool::try_run_one_pending() noexcept -> bool {
     Task task;
     {
-        const std::lock_guard lock(impl_->mutex);
+        const std::scoped_lock lock(impl_->mutex);
         // Only run *strictly nested* work — a task submitted after the one this
         // thread is running. An older or same-generation task is a sibling or an
         // unrelated pipeline worker; running one here can park on a resource
@@ -573,7 +573,7 @@ auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t
         return Batch{std::move(state)};
     }
     {
-        const std::lock_guard lock(impl_->mutex);
+        const std::scoped_lock lock(impl_->mutex);
         for (std::size_t i = 0; i < count; ++i) {
             impl_->queue.push_back(Task{.state = state, .worker_id = i, .gen = gen});
         }
@@ -756,7 +756,7 @@ auto WorkerPool::submit_unbarriered(std::function<void()> body) -> Batch {
         return Batch{std::move(state)};
     }
     {
-        const std::lock_guard lock(impl_->mutex);
+        const std::scoped_lock lock(impl_->mutex);
         impl_->queue.push_back(Task{.state = state, .worker_id = 0, .gen = gen});
     }
     impl_->work.notify_one();
@@ -793,7 +793,7 @@ auto compute_thread_count() -> std::size_t {
 }
 
 auto available_cpu_count() -> std::size_t {
-#if defined(__linux__)
+#ifdef __linux__
     // The CPUs this thread may run on, not the machine's: under `taskset`, a
     // cpuset cgroup or a container `--cpuset-cpus`, `hardware_concurrency()`
     // still reports every CPU on the box. Sized from that, an 8-CPU `taskset`
@@ -898,7 +898,7 @@ auto process_worker_pool_state() -> ProcessWorkerPool& {
 
 auto own_process_worker_pool() -> WorkerPool& {
     auto& state = process_worker_pool_state();
-    const std::lock_guard lock(state.mutex);
+    const std::scoped_lock lock(state.mutex);
     if (state.pool == nullptr) {
         state.pool = std::make_unique<WorkerPool>(decode_thread_count());
     }
@@ -931,7 +931,7 @@ auto worker_pool_accessor() noexcept -> WorkerPoolAccessor {
 
 auto existing_worker_pool_size() -> std::size_t {
     auto& state = process_worker_pool_state();
-    const std::lock_guard lock(state.mutex);
+    const std::scoped_lock lock(state.mutex);
     return state.pool == nullptr ? 0 : state.pool->size();
 }
 
@@ -939,7 +939,7 @@ void shutdown_process_worker_pool() {
     auto& state = process_worker_pool_state();
     std::unique_ptr<WorkerPool> pool;
     {
-        const std::lock_guard lock(state.mutex);
+        const std::scoped_lock lock(state.mutex);
         pool = std::move(state.pool);
     }
     // Destroy outside the singleton mutex: joining a worker can take arbitrary

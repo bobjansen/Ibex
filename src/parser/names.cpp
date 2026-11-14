@@ -502,7 +502,7 @@ void collect_declared_names(const Program& program, robin_hood::unordered_set<st
 auto declared_names_of(const robin_hood::unordered_set<std::string>& names) -> DeclaredNames {
     return DeclaredNames{
         .contains = [&names](std::string_view name) { return names.contains(std::string(name)); },
-        .list = [&names]() { return std::vector<std::string>(names.begin(), names.end()); },
+        .list = [&names] { return std::vector<std::string>(names.begin(), names.end()); },
     };
 }
 

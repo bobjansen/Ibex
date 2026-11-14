@@ -1927,7 +1927,7 @@ struct JoinProbe {
         // path that produces one should say so, and the claim is proved from
         // the emitted index array rather than from which mode ran. Computed
         // before the identity branch below, which renames left columns in place.
-        const auto carried_ordering = [&]() -> std::vector<ir::OrderKey> {
+        const auto carried_ordering = [&] -> std::vector<ir::OrderKey> {
             if (!left_side.properties().ordering().has_value()) {
                 return {};
             }
@@ -3357,7 +3357,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         auto prototype = std::make_shared<const JoinProbe>(probe_);
         streamed_pipeline_ = pipeline_executor_detail::build_unit_pipeline(
             std::move(units),
-            [shared, prototype]() -> pipeline_executor_detail::UnitProducer {
+            [shared, prototype] -> pipeline_executor_detail::UnitProducer {
                 // Captured by copy into a stored closure: const would make every move
                 // of the closure copy the shared_ptr (an atomic count) instead.
                 // NOLINTNEXTLINE(misc-const-correctness)
@@ -3430,7 +3430,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         auto prototype = std::make_shared<const JoinProbe>(probe_);
         streamed_pipeline_ = pipeline_executor_detail::build_unit_pipeline(
             std::move(units),
-            [shared, prototype]() -> pipeline_executor_detail::UnitProducer {
+            [shared, prototype] -> pipeline_executor_detail::UnitProducer {
                 // Captured by copy into a stored closure: const would make every move
                 // of the closure copy the shared_ptr (an atomic count) instead.
                 // NOLINTNEXTLINE(misc-const-correctness)
@@ -3511,8 +3511,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                     with_physical_values(col, [&](const auto* data) {
                         publish_build_filter_keys(
                             [data](std::size_t r) {
-                                return join_key_domain(
-                                    static_cast<typename C::value_type>(data[r]));
+                                return join_key_domain(static_cast<C::value_type>(data[r]));
                             },
                             col.size(), validity, slot);
                     });

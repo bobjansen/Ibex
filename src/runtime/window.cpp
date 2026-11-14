@@ -1231,7 +1231,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     const bool has_nan = [&] {
                         if constexpr (std::is_same_v<T, double>) {
                             if (sv == nullptr && rows > 0) {
-#if defined(__AVX2__)
+#ifdef __AVX2__
                                 std::size_t i = 0;
                                 for (; i + 4 <= rows; i += 4) {
                                     const __m256d block = _mm256_loadu_pd(col_values + i);

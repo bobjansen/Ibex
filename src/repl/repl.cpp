@@ -1535,7 +1535,7 @@ auto eval_series_literal(const parser::ArrayLiteralExpr& array,
     std::optional<NullScalar> null_type;
 
     for (const auto& element : array.elements) {
-        const auto* typed_null = [&]() -> const NullScalar* {
+        const auto* typed_null = [&] -> const NullScalar* {
             const auto* lit = std::get_if<parser::LiteralExpr>(&element->node);
             return lit != nullptr ? std::get_if<NullScalar>(&lit->value) : nullptr;
         }();
@@ -1573,7 +1573,7 @@ auto eval_series_literal(const parser::ArrayLiteralExpr& array,
         // can read `values` without a per-element null check.
         LiteralValue placeholder{std::int64_t{0}};
         if (!type_index.has_value() && null_type.has_value()) {
-            placeholder = [&]() -> LiteralValue {
+            placeholder = [&] -> LiteralValue {
                 switch (null_type->kind) {
                     case runtime::ScalarKind::Int:
                         return std::int64_t{0};
@@ -1945,7 +1945,7 @@ void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& exte
             for (const auto& ns : namespaces) {
                 label += " " + ns;
             }
-            label += "]";
+            label += ']';
         }
         ibex::formatting::print("  {}:", label);
         for (const auto& name : names) {
@@ -2172,7 +2172,7 @@ void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
         }
     }
 
-    const auto print_sep = [&]() {
+    const auto print_sep = [&] {
         ibex::formatting::print("+");
         for (std::size_t c = 0; c < col_count; ++c) {
             ibex::formatting::print("{:-<{}}+", "", widths[c] + 2);
@@ -2909,7 +2909,7 @@ auto eval_on_runtime(parser::Expr& expr, bool allow_series, runtime::TableRegist
             },
             e.node);
     };
-    const auto evaluate = [&]() -> std::expected<EvalValue, std::string> {
+    const auto evaluate = [&] -> std::expected<EvalValue, std::string> {
         if (!bind(expr)) {
             return std::unexpected(error);
         }
@@ -2994,7 +2994,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         // A NULL arm has no type of its own; the case's type is its other
         // arms' (`case { c => 1, else => NULL }` is an Int64 null, and so is
         // `Int64(NULL)`, which the parser spells that way).
-        auto case_null = [&]() -> std::expected<runtime::ScalarValue, std::string> {
+        auto case_null = [&] -> std::expected<runtime::ScalarValue, std::string> {
             parser::LowerContext context;
             auto lowered = parser::lower_value_expr(expr, context);
             if (!lowered) {
@@ -3006,7 +3006,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             return runtime::ScalarValue{*null};
         };
-        auto chosen = [&]() -> std::expected<runtime::ScalarValue, std::string> {
+        auto chosen = [&] -> std::expected<runtime::ScalarValue, std::string> {
             // Arms are tried in order and only the chosen value is evaluated, as in
             // a cell; a null condition does not match.
             std::optional<runtime::ScalarValue> selector;
@@ -4500,7 +4500,7 @@ class ResourceCalls {
                 return mismatch("'" + ident->name + "'", "not a resource binding");
             }
             if (it->second->type_name() != expected_type) {
-                return mismatch("'" + ident->name + "'", std::string(it->second->type_name()));
+                return mismatch("'" + ident->name + "'", it->second->type_name());
             }
             return it->second;
         }
@@ -4514,8 +4514,7 @@ class ResourceCalls {
             }
             auto resource = std::get<runtime::ResourcePtr>(std::move(*value));
             if (resource->type_name() != expected_type) {
-                return mismatch(resource_call->callee + "(...)",
-                                std::string(resource->type_name()));
+                return mismatch(resource_call->callee + "(...)", resource->type_name());
             }
             return resource;
         }
@@ -5011,7 +5010,7 @@ auto repl_declared_names(const FunctionRegistry& functions, const ExternDeclRegi
                        pending.contains(key) || externs.contains(key);
             },
         .list =
-            [&]() {
+            [&] {
                 std::vector<std::string> names;
                 names.reserve(functions.size() + extern_decls.size() + pending.size());
                 for (const auto& [name, _] : functions) {
@@ -6825,7 +6824,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (should_time) {
             timing_start = std::chrono::steady_clock::now();
         }
-        const auto report_timing = [&]() {
+        const auto report_timing = [&] {
             if (timing_start.has_value()) {
                 print_elapsed(std::chrono::steady_clock::now() - *timing_start);
             }

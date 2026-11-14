@@ -502,14 +502,14 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
         }
         return renamed;
     };
-    const auto keep_left = [&]() {
+    const auto keep_left = [&] {
         for (const auto& key : left.unique_keys()) {
             if (auto renamed = left_key_in_output(key)) {
                 out.add_unique_key(std::move(*renamed));
             }
         }
     };
-    const auto keep_right = [&]() {
+    const auto keep_right = [&] {
         for (const auto& key : right.unique_keys()) {
             if (auto renamed = right_key_in_output(key)) {
                 out.add_unique_key(std::move(*renamed));

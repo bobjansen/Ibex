@@ -2971,7 +2971,7 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
     // one, else the selected plan's own output kind. They agree wherever both
     // exist — a plan is only selected for an expression whose result it can
     // name — and the plan is the only answer a chunk caller has.
-    const auto plan_kind = [&]() -> std::optional<ExprType> {
+    const auto plan_kind = [&] -> std::optional<ExprType> {
         if (route.predicate.has_value()) {
             return ExprType::Bool;
         }

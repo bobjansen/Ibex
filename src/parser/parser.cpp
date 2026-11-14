@@ -1274,7 +1274,7 @@ class Parser {
     /// colon. `1` arrives as an integer literal and `n` as an identifier, so
     /// each side is read on its own rather than lexed as one token.
     auto parse_join_expect() -> std::optional<JoinExpect> {
-        const auto side = [this]() -> std::optional<JoinMultiplicity> {
+        const auto side = [this] -> std::optional<JoinMultiplicity> {
             if (match(TokenKind::IntLiteral)) {
                 if (previous().lexeme == "1") {
                     return JoinMultiplicity::One;
@@ -3188,7 +3188,7 @@ class Parser {
     auto build_interpolation(const std::string& content) -> ExprPtr {
         std::vector<ExprPtr> args;
         std::string literal;
-        const auto flush_literal = [&]() {
+        const auto flush_literal = [&] {
             auto lit = std::make_unique<Expr>();
             lit->node = LiteralExpr{.value = literal};
             args.push_back(std::move(lit));

@@ -150,7 +150,7 @@ auto format_cell(const ColumnEntry& entry, std::size_t row) -> std::string {
     const auto& column = *entry.column;
     return std::visit(
         [row](const auto& col) -> std::string {
-            using T = typename std::decay_t<decltype(col)>::value_type;
+            using T = std::decay_t<decltype(col)>::value_type;
             if constexpr (std::is_same_v<T, Date>) {
                 return format_date(col[row]);
             } else if constexpr (std::is_same_v<T, Timestamp>) {
@@ -198,7 +198,7 @@ void render_table(const Table& table, std::ostream& out, std::size_t max_rows) {
         }
     }
 
-    const auto print_sep = [&]() {
+    const auto print_sep = [&] {
         ibex::formatting::print(out, "+");
         for (std::size_t c = 0; c < col_count; ++c) {
             ibex::formatting::print(out, "{:-<{}}+", "", widths[c] + 2);

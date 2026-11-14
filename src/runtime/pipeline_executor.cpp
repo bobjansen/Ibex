@@ -2618,7 +2618,7 @@ auto build_unit_pipeline(std::vector<SourceUnit> units, const UnitProducerFactor
     // in the same order and with the same boundaries. Anything downstream that
     // reduces per chunk then reduces identically at every core count.
     const std::size_t worker_count = scan_pipeline_worker_count(units.size());
-    const auto make_worker = [&]() {
+    const auto make_worker = [&] {
         auto source = std::make_unique<ScanPipelineSource>();
         ScanPipelineWorker worker{
             .source = source.get(), .chain = std::move(source), .produce = {}};

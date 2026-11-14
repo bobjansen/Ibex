@@ -74,12 +74,12 @@ auto huge_pages_tunables(const char* tunables, const char* opt_out, const char* 
         return std::nullopt;
     }
     // No transparent huge pages to ask for (unreadable, or switched off).
-    if (thp_enabled.empty() || thp_enabled.find("[never]") != std::string_view::npos) {
+    if (thp_enabled.empty() || thp_enabled.contains("[never]")) {
         return std::nullopt;
     }
     const std::string_view current = tunables == nullptr ? std::string_view{} : tunables;
     // The caller chose a value, on or off: theirs wins.
-    if (current.find(kTunable) != std::string_view::npos) {
+    if (current.contains(kTunable)) {
         return std::nullopt;
     }
     std::string out{current};
@@ -97,7 +97,7 @@ auto huge_pages_tunables(const char* tunables, const char* opt_out, const char* 
     // Untouched pages still cost nothing; peak RSS +5.8% summed over PDS-H.
     // A top pad the caller chose is left alone.
     constexpr std::string_view kTopPad = "glibc.malloc.top_pad";
-    if (current.find(kTopPad) == std::string_view::npos) {
+    if (!current.contains(kTopPad)) {
         out += ':';
         out += kTopPad;
         out += "=67108864";

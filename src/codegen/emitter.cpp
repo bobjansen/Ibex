@@ -1357,7 +1357,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 std::visit(
                     [&](const auto& first_val) {
                         using T = std::decay_t<decltype(first_val)>;
-                        const std::string type_str = []() -> std::string {
+                        const std::string type_str = [] -> std::string {
                             if constexpr (std::is_same_v<T, std::int64_t>) {
                                 return "std::int64_t";
                             } else if constexpr (std::is_same_v<T, double>) {

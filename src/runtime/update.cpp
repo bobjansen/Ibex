@@ -651,26 +651,25 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
 
     // round(x, mode) → Int: compile the value child and wrap in a UnaryToInt
     // node whose kernel is fixed by the (compile-time) mode.
-    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
-        if (call->callee == "round" && call->args.size() == 2 && call->named_args.empty()) {
-            const auto mode = round_mode_arg(*call->args[1]);
-            if (!mode.has_value()) {
-                return std::nullopt;
-            }
-
-            auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes,
-                                                         temps, range);
-            if (!child.has_value()) {
-                return std::nullopt;
-            }
-            NumericUpdateNode node;
-            node.kind = NumericUpdateNode::Kind::UnaryToInt;
-            node.type = ExprType::Int;
-            node.left = *child;
-            node.round_mode = *mode;
-            nodes.push_back(node);
-            return static_cast<std::uint32_t>(nodes.size() - 1);
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+        call && (call->callee == "round" && call->args.size() == 2 && call->named_args.empty())) {
+        const auto mode = round_mode_arg(*call->args[1]);
+        if (!mode.has_value()) {
+            return std::nullopt;
         }
+
+        auto child =
+            try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes, temps, range);
+        if (!child.has_value()) {
+            return std::nullopt;
+        }
+        NumericUpdateNode node;
+        node.kind = NumericUpdateNode::Kind::UnaryToInt;
+        node.type = ExprType::Int;
+        node.left = *child;
+        node.round_mode = *mode;
+        nodes.push_back(node);
+        return static_cast<std::uint32_t>(nodes.size() - 1);
     }
 
     // pmin / pmax over numeric args: fold the (variadic) argument list into a
@@ -4247,7 +4246,7 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     // memcpy beat the tree's block copies 7.2 vs 11.2 ms at 16M rows.
     const auto* bare = std::get_if<ir::CallExpr>(&expr.node);
     const bool bare_shift = bare != nullptr && (bare->callee == "lag" || bare->callee == "lead");
-    const auto whole = [&]() -> std::expected<ComputedColumn, std::string> {
+    const auto whole = [&] -> std::expected<ComputedColumn, std::string> {
         if (!bare_shift && has_shift_call(expr)) {
             if (const auto plan = kernel::try_plan_direct_numeric_tree(
                     expr, direct_input, ctx.scalars, kernel::ShiftedReads::Allow);
@@ -4281,7 +4280,7 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     // to be split.
     kernel::DirectFieldRoute route;
     route.categorical = kernel::try_plan_direct_categorical_field(expr, direct_input, ctx.scalars);
-    const auto whole_categorical = [&]() -> std::expected<ComputedColumn, std::string> {
+    const auto whole_categorical = [&] -> std::expected<ComputedColumn, std::string> {
         if (!route.categorical.has_value()) {
             return whole();
         }
@@ -5226,7 +5225,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
     // the parallel blend below reads the mask bytes instead.
     std::vector<std::size_t> matched_idx;
     bool have_matched_idx = false;
-    const auto need_matched_idx = [&]() -> const std::vector<std::size_t>& {
+    const auto need_matched_idx = [&] -> const std::vector<std::size_t>& {
         if (!have_matched_idx) {
             matched_idx.reserve(n / 8);
             for (std::size_t i = 0; i < n; ++i) {

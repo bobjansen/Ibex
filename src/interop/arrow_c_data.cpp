@@ -1686,10 +1686,9 @@ auto import_table_impl(const ArrowArray& array, const ArrowSchema& schema,
     if (schema.n_children != array.n_children) {
         return std::unexpected("Arrow table import requires matching child counts");
     }
-    if (schema.children == nullptr || array.children == nullptr) {
-        if (schema.n_children != 0 || array.n_children != 0) {
-            return std::unexpected("Arrow table import is missing child arrays or schemas");
-        }
+    if ((schema.children == nullptr || array.children == nullptr) &&
+        (schema.n_children != 0 || array.n_children != 0)) {
+        return std::unexpected("Arrow table import is missing child arrays or schemas");
     }
 
     runtime::Table table;

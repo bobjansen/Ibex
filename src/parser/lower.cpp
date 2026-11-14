@@ -2229,7 +2229,7 @@ class Lowerer {
                     // A scalar `let` of a function body would be dropped, not
                     // evaluated: scalar bindings are collected for the program,
                     // not for a function.
-                    const auto scalar_let_in_function = [&]() {
+                    const auto scalar_let_in_function = [&] {
                         return std::unexpected(LowerError{
                             .message = "`let " + let_stmt.name +
                                        "` is a scalar binding inside a function, which compiled "
@@ -2457,7 +2457,7 @@ class Lowerer {
             .shared_bindings = std::move(shared_bindings_),
             .sinks = std::move(sinks),
             .result = std::move(last_expr),
-            .result_binding = [&]() -> std::optional<std::string> {
+            .result_binding = [&] -> std::optional<std::string> {
                 const auto* last = std::get_if<ExprStmt>(&statements.back());
                 if (last == nullptr) {
                     return std::nullopt;
@@ -2721,7 +2721,7 @@ class Lowerer {
             // Determine the type from the first element and validate uniformity.
             int type_tag = -1;  // 0=int, 1=double, 2=bool, 3=string, 4=Date, 5=Timestamp
             for (const auto& elem_ptr : arr->elements) {
-                const auto* typed_null = [&]() -> const NullScalar* {
+                const auto* typed_null = [&] -> const NullScalar* {
                     const auto* lit = std::get_if<LiteralExpr>(&elem_ptr->node);
                     return lit != nullptr ? std::get_if<NullScalar>(&lit->value) : nullptr;
                 }();
@@ -4805,7 +4805,7 @@ class Lowerer {
         -> std::expected<ir::Expr, LowerError> {
         // Nothing inside the subquery may mark onto the enclosing query.
         ir::NodePtr* const enclosing = std::exchange(exists_marks_, nullptr);
-        auto marked = [&]() -> std::expected<ir::Expr, LowerError> {
+        auto marked = [&] -> std::expected<ir::Expr, LowerError> {
             auto subquery = parse_exists(call, *input);
             if (!subquery.has_value()) {
                 return std::unexpected(subquery.error());
@@ -5714,7 +5714,7 @@ class Lowerer {
         robin_hood::unordered_map<std::string, bool> temp_columns;
         std::size_t temp_counter = 0;
 
-        auto make_temp = [&]() -> std::string { return "_agg" + std::to_string(temp_counter++); };
+        auto make_temp = [&] -> std::string { return "_agg" + std::to_string(temp_counter++); };
 
         std::function<const IdentifierExpr*(const Expr&)> extract_column_ident;
         extract_column_ident = [&](const Expr& expr) -> const IdentifierExpr* {
@@ -6352,7 +6352,7 @@ class Lowerer {
         LoweredAggList lowered;
         std::size_t temp_counter = 0;
 
-        auto make_temp = [&]() -> std::string { return "_agg" + std::to_string(temp_counter++); };
+        auto make_temp = [&] -> std::string { return "_agg" + std::to_string(temp_counter++); };
 
         std::function<const IdentifierExpr*(const Expr&)> extract_column_ident;
         extract_column_ident = [&](const Expr& expr) -> const IdentifierExpr* {

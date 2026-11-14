@@ -140,7 +140,7 @@ auto group_rows(const Table& input, const std::vector<ir::ColumnRef>& group_by)
     std::vector<Key> keys;
     KeyRowIndex index;
     for (std::size_t row = 0; row < rows; ++row) {
-        out.gids[row] = index.find_or_insert(keys, cols, row, [&]() -> std::uint32_t {
+        out.gids[row] = index.find_or_insert(keys, cols, row, [&] -> std::uint32_t {
             Key key;
             key.values.reserve(cols.size());
             for (std::size_t i = 0; i < cols.size(); ++i) {

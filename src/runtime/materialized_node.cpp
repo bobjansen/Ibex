@@ -50,7 +50,7 @@ namespace {
 
 auto map_column_from_scalars(const std::vector<ScalarValue>& values)
     -> std::expected<ComputedColumn, std::string> {
-    const auto build = [&]<class T>() -> std::expected<ComputedColumn, std::string> {
+    const auto build = [&]<class T> -> std::expected<ComputedColumn, std::string> {
         Column<T> column;
         column.reserve(values.size());
         ValidityBitmap validity;
@@ -869,7 +869,7 @@ auto run_materialized_node(const ir::Node& node, const TableRegistry& registry,
                     : 0;
 
             // Returns current wall-clock time in nanoseconds.
-            const auto wall_now_ns = []() -> std::int64_t {
+            const auto wall_now_ns = [] -> std::int64_t {
                 const auto now = std::chrono::system_clock::now();
                 const auto ns =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch());

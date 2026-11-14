@@ -1993,13 +1993,13 @@ auto split_col_cmp_lit(const ir::Expr& expr, bool allow_nan_high = false)
 // Flatten an OR tree into its leaves. `a || b || c` parses left-deep, and an
 // IN-list is exactly the case where every leaf is `<same column> == <literal>`.
 void flatten_or(const ir::Expr& expr, std::vector<const ir::Expr*>& out) {
-    if (const auto* logical = std::get_if<ir::LogicalExpr>(&expr.node)) {
-        if (logical->op == ir::LogicalOp::Or) {
-            flatten_or(*logical->left, out);
-            flatten_or(*logical->right, out);
-            return;
-        }
+    if (const auto* logical = std::get_if<ir::LogicalExpr>(&expr.node);
+        logical && (logical->op == ir::LogicalOp::Or)) {
+        flatten_or(*logical->left, out);
+        flatten_or(*logical->right, out);
+        return;
     }
+
     out.push_back(&expr);
 }
 

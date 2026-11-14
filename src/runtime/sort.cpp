@@ -999,7 +999,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                     total += counts[b];
                 }
             }
-            const auto build = [&]<typename Idx>() -> SortIdx {
+            const auto build = [&]<typename Idx> -> SortIdx {
                 std::vector<Idx> idx(rows);
                 for (std::size_t i = 0; i < rows; ++i) {
                     idx[position[static_cast<std::size_t>(keys[i] ^ kSignFlip)]++] =

@@ -122,7 +122,7 @@ auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter&
 
 auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::string> {
     {
-        const std::lock_guard lock(reader_pool_->mutex);
+        const std::scoped_lock lock(reader_pool_->mutex);
         if (!reader_pool_->available.empty()) {
             auto reader = std::move(reader_pool_->available.back());
             reader_pool_->available.pop_back();
@@ -140,7 +140,7 @@ auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::stri
 }
 
 void LazyTable::release_reader(LazySourceReaderPtr reader) {
-    const std::lock_guard lock(reader_pool_->mutex);
+    const std::scoped_lock lock(reader_pool_->mutex);
     reader_pool_->available.push_back(std::move(reader));
 }
 
@@ -332,7 +332,7 @@ auto membership_key_column(const Table& predicates, const std::string& key_name,
             } else if constexpr (std::is_same_v<C, Column<std::int64_t>> ||
                                  std::is_same_v<C, Column<Date>> ||
                                  std::is_same_v<C, Column<Timestamp>>) {
-                using T = typename C::value_type;
+                using T = C::value_type;
                 if constexpr (std::is_same_v<T, std::int64_t>)
                     return KeyColumn<ElementKeyAt<T>>{.at = {.data = col.integer_view()},
                                                       .validity = validity};

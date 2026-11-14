@@ -907,14 +907,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // Either check may have failed by the time a path returns; both are raised
     // through here so no exit forgets one.
     std::string take_error;
-    if (take == ir::MatchSelection::First || take == ir::MatchSelection::Last) {
-        if (!right.ordering().has_value() || right.ordering()->empty()) {
-            take_error =
-                "`take " + std::string(take == ir::MatchSelection::First ? "first" : "last") +
-                "` needs the right input to state an order, and this one carries none; add "
-                "`order` to it, or use `take any` if the choice does not matter";
-        }
+    if ((take == ir::MatchSelection::First || take == ir::MatchSelection::Last) &&
+        (!right.ordering().has_value() || right.ordering()->empty())) {
+        take_error = "`take " + std::string(take == ir::MatchSelection::First ? "first" : "last") +
+                     "` needs the right input to state an order, and this one carries none; add "
+                     "`order` to it, or use `take any` if the choice does not matter";
     }
+
     const auto keep_lowest_index =
         take == ir::MatchSelection::First || take == ir::MatchSelection::Any;
 
@@ -1148,7 +1147,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                     // rather than visiting and appending for every row.
                                     values.resize_for_overwrite(total);
                                     auto* dst = values.data();
-                                    using V = typename Col::value_type;
+                                    using V = Col::value_type;
                                     with_physical_values(*lc, [&](const auto* ld) {
                                         with_physical_values(*rc, [&](const auto* rd) {
                                             for_row_ranges(
@@ -1337,11 +1336,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
             }
 
-            if (!left_had_match) {
-                if (anti_join || preserve_left_rows) {
-                    left_idx.push_back(l);
-                    right_idx.push_back(kNull);
-                }
+            if ((!left_had_match) && (anti_join || preserve_left_rows)) {
+                left_idx.push_back(l);
+                right_idx.push_back(kNull);
             }
         }
 

@@ -357,13 +357,20 @@ system.
 resolved ones are in the retired plan). Undocumented divergence rather than
 bugs: each new operator copies whichever neighbour it was written next to.
 
-- **I2** — String/Categorical are excluded from several fan-out decisions,
-  each for its own reason (`stageable_conjunct_columns` width;
-  `evaluate_field_maybe_parallel` Int/Double only; parallel partial aggregates
-  Int/Double only), with no shared "is this type parallel-capable in role X"
-  predicate.
-- **I3** — multi-key Categorical group discovery has no partitioned path
-  (`multi_cat_find_or_insert` is serial).
+- **I2** — String/Categorical are excluded from two fan-out decisions, each
+  for its own reason and in a different role: `stageable_conjunct_columns`
+  declines to stage a variable-width predicate column through a selection, and
+  `aggs_are_slot_combinable` admits only Int/Double aggregate inputs to
+  private-slot partials. (Update fields are no longer on this list:
+  `evaluate_field_maybe_parallel` splits Bool, Categorical and interpolated
+  String results through their direct routes.) These are capability limits of
+  two unrelated kernels, not one missing predicate.
+- **I3** — multi-key Categorical grouping is parallel only while its Cartesian
+  cell space is dense (`try_process_rows_cat_multi_parallel`, up to
+  `kDenseCellLimit` = 4M cells, slot-combinable aggregates). Past that, or when
+  a later chunk grows the dictionaries past it, the groups migrate to a serial
+  hash index (`multi_cat_find_or_insert`), although the pair and packed-key
+  paths already carry Categorical codes and partition their discovery.
 - **I6** — private row thresholds (`parallel_min_rows`, `kMinProbeRows`,
   `kMinParallelPredicateRows`, `kDefaultPartitionMinRows`, …) beside the two
   `ExecutionContext` knobs. Break-evens differ per operator; the
@@ -375,7 +382,10 @@ bugs: each new operator copies whichever neighbour it was written next to.
 - **I9** — worker-count caps differ: the plan-owned phases and the join /
   semi-anti probes cap at 64, every other site is bounded only by budget and
   pool, undocumented.
-- **I10** — aggregate emission gates a group count against a _row_ threshold.
+- **I10** — aggregate emission compares its _group_ count to a floor named
+  `row_floor` that inherits `parallel_min_rows`. Plan-owned and printed since
+  the Emission node landed; the shared knob is what lets a test force the
+  fan-out on a small table, so the unit mismatch is naming only.
 - **I12** — two thread species: the long-lived stage thread of
   `PipelinedStageOperator` (parks on consumer backpressure; hosting it on the
   pool would deadlock) is named and counted (`on_stage_thread()`,

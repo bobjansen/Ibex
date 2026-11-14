@@ -9,6 +9,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/pipeline.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -1839,6 +1840,69 @@ TEST_CASE("The aggregate reads the plan: parallel output equals serial and the f
         REQUIRE(capped_g[i] == sg[i]);
         REQUIRE(capped_v[i] == sv[i]);
     }
+}
+
+TEST_CASE("The hot Int64 sum splits one big chunk into row-range jobs and stays exact",
+          "[physical][breaker][execute]") {
+    // A registry table reaches the aggregate as ONE chunk. The async hot sum
+    // path ran one job per chunk, so that chunk ran on one worker; it is now
+    // cut into ~1M-row jobs. The keys are clustered -- runs of 3 that straddle
+    // every job boundary -- with nulls in the summed column, and the last
+    // rows revisit early keys so the cold merge leaves its in-order fast path.
+    // Group order (first occurrence) and every sum must match a serial run.
+    constexpr std::int64_t kRows = 4'200'000;
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        Column<std::int64_t> k;
+        Column<double> v;
+        std::vector<bool> valid;
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            // Spaced 4 apart: a span over rows/2 keeps the dense-int path out.
+            k.push_back(r < kRows - 1000 ? (r / 3) * 4 : (r % 977) * 4);
+            v.push_back(static_cast<double>(r % 101) * 0.25);
+            valid.push_back(r % 17 != 0);
+        }
+        t.add_column("k", std::move(k));
+        t.add_column("v", std::move(v), runtime::ValidityBitmap(valid));
+        registry.emplace("t", t);
+    }
+    auto ir = require_ir("t[select { s = sum(v) }, by k];");
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+    parallel.parallel_stats = &stats;
+    auto profile =
+        std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/8, /*report=*/false);
+    parallel.execution_profile = profile;
+    const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(s.has_value());
+    REQUIRE(p.has_value());
+    REQUIRE(stats.parallel_aggregate_partitions.load() > 0);  // the hot path ran
+    REQUIRE(s->rows() == p->rows());
+    const auto& sk = std::get<Column<std::int64_t>>(*s->find_entry("k")->column);
+    const auto& pk = std::get<Column<std::int64_t>>(*p->find_entry("k")->column);
+    const auto& sv = std::get<Column<double>>(*s->find_entry("s")->column);
+    const auto& pv = std::get<Column<double>>(*p->find_entry("s")->column);
+    for (std::size_t i = 0; i < s->rows(); ++i) {
+        REQUIRE(sk[i] == pk[i]);
+        REQUIRE(sv[i] == pv[i]);
+    }
+    const auto rows = profile->snapshot();
+    const auto discovery = std::ranges::find_if(
+        rows, [](const auto& row) { return row.label == "Aggregate.Discovery"; });
+    REQUIRE(discovery != rows.end());
+    // The stage counts the hot jobs plus the cold merge's one task per
+    // partition (the largest power of two within the worker cap).
+    const std::size_t cap = std::min<std::size_t>(8, runtime::process_worker_pool().size());
+    std::size_t parts = 1;
+    while (parts * 2 <= cap) {
+        parts *= 2;
+    }
+    CHECK(discovery->pool_tasks >= parts + 4);  // 4 jobs, not 1
 }
 
 TEST_CASE("A known input size below the radix floor still lets the owned discovery fan out",

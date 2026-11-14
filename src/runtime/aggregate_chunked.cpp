@@ -2457,6 +2457,9 @@ class HashAggregateState final {
     }
 
     static constexpr std::size_t kOwnedHotSlots = 4096;
+    /// Rows per async hot job when one chunk is split (`try_async_hot_int_sum`):
+    /// about one streamed row group, the chunk size the path was tuned on.
+    static constexpr std::size_t kHotJobRows = std::size_t{1} << 20;
 
     struct OwnedHotRecord {
         std::int64_t key = 0;
@@ -2467,11 +2470,16 @@ class HashAggregateState final {
     struct OwnedHotChunk {
         std::shared_ptr<ColumnValue> key_column;
         std::shared_ptr<ColumnValue> sum_column;
-        std::optional<ValidityBitmap> sum_validity;
+        /// Shared by every job cut from the same chunk.
+        std::shared_ptr<const ValidityBitmap> sum_validity;
         /// The sum's `plan_` kind: Int64 accumulates in `slot.int_value`,
         /// Double in `slot.double_value` (they share storage).
         bool sum_is_int = false;
+        /// The chunk's first source row; a record's first row is
+        /// `row_base + row`, with `row` indexing the chunk's columns.
         std::uint64_t row_base = 0;
+        /// This job's rows of the chunk: `[begin, begin + rows)`.
+        std::size_t begin = 0;
         std::size_t rows = 0;
         std::size_t part_count = 0;
         std::vector<std::vector<OwnedHotRecord>> records_by_partition;
@@ -2520,8 +2528,7 @@ class HashAggregateState final {
         try {
             const auto keys = std::get<Column<std::int64_t>>(*job.key_column).integer_view();
             const auto values = value_reader(std::get<Column<ValueT>>(*job.sum_column));
-            const ValidityBitmap* validity =
-                job.sum_validity.has_value() ? &*job.sum_validity : nullptr;
+            const ValidityBitmap* validity = job.sum_validity.get();
             constexpr std::uint32_t kEmpty = std::numeric_limits<std::uint32_t>::max();
             constexpr unsigned kShift = 64U - 12U;
             constexpr std::uint64_t kH2Mult = 0xf1357aea2e62a9c5ULL;
@@ -2555,7 +2562,7 @@ class HashAggregateState final {
                 }
             };
 
-            for (std::size_t row = 0; row < job.rows; ++row) {
+            for (std::size_t row = job.begin; row < job.begin + job.rows; ++row) {
                 const std::int64_t key = keys[row];
                 // HashKeys in Polars computes hashes as a column kernel before
                 // probing. Here keys arrive as raw Int64s, and q18's useful
@@ -2688,24 +2695,40 @@ class HashAggregateState final {
         }
 
         const ColumnEntry& agg0 = *agg_entries[0];
-        auto job = std::make_unique<OwnedHotChunk>();
-        job->key_column = key_column;
-        job->sum_column = agg0.column;
+        std::shared_ptr<const ValidityBitmap> sum_validity;
         if (agg0.validity.has_value()) {
-            job->sum_validity = *agg0.validity;
+            sum_validity = std::make_shared<const ValidityBitmap>(*agg0.validity);
         }
-        job->sum_is_int = plan_[0].kind == ExprType::Int;
-        job->row_base = owned_rows_seen_;
-        job->rows = rows;
-        job->part_count = owned_async_part_count_;
-        auto* const raw_job = job.get();
-        owned_async_jobs_.push_back(std::move(job));
         // Engaged since the block above either emplaced it or `owned_async_hot_mode_`
         // was already set (the two only ever change together).
         if (!owned_async_group_.has_value()) {
             invariant_violation("async hot aggregate: task group missing while accepting chunks");
         }
-        owned_async_group_->submit([raw_job] { process_owned_hot_chunk(*raw_job); });
+        // One job per ~kHotJobRows of the chunk, in row order. The jobs run
+        // concurrently, so a source that arrives as ONE big chunk (a whole
+        // decode: the REPL's statement path, an in-memory table, a
+        // single-row-group file) spreads over the pool the way a streamed
+        // scan's per-row-group chunks do, instead of running on one worker
+        // while the rest wait. Each job keeps its own run shortcut, and the
+        // cold merge already joins a run split across consecutive jobs.
+        // A streamed chunk (about one row group) stays one job.
+        const std::size_t jobs = rows >= 2 * kHotJobRows ? rows / kHotJobRows : 1;
+        for (std::size_t j = 0; j < jobs; ++j) {
+            const std::size_t begin = rows * j / jobs;
+            const std::size_t end = rows * (j + 1) / jobs;
+            auto job = std::make_unique<OwnedHotChunk>();
+            job->key_column = key_column;
+            job->sum_column = agg0.column;
+            job->sum_validity = sum_validity;
+            job->sum_is_int = plan_[0].kind == ExprType::Int;
+            job->row_base = owned_rows_seen_;
+            job->begin = begin;
+            job->rows = end - begin;
+            job->part_count = owned_async_part_count_;
+            auto* const raw_job = job.get();
+            owned_async_jobs_.push_back(std::move(job));
+            owned_async_group_->submit([raw_job] { process_owned_hot_chunk(*raw_job); });
+        }
         owned_rows_seen_ += rows;
         return true;
     }

@@ -297,9 +297,15 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install clang-format
+        # Pinned in scripts/clang-format-version, which scripts/clang-format.sh
+        # reads too, so local formatting and this check agree. From
+        # apt.llvm.org, without a fallback: another version formats differently.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format-20 || sudo apt-get install -y clang-format-18
+          version="$(tr -d '[:space:]' < scripts/clang-format-version)"
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm.sh "$version"
+          sudo apt-get install -y "clang-format-$version"
+          "clang-format-$version" --version
 
       - name: Check formatting
         run: |

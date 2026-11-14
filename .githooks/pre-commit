@@ -3,18 +3,13 @@
 
 set -euo pipefail
 
-CLANG_FORMAT_BIN="${CLANG_FORMAT_BIN:-}"
-if [[ -z "$CLANG_FORMAT_BIN" ]]; then
-    for candidate in clang-format-20 clang-format-19 clang-format-18 clang-format; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-            CLANG_FORMAT_BIN="$candidate"
-            break
-        fi
-    done
-fi
-
-if [[ -z "$CLANG_FORMAT_BIN" ]]; then
-    echo "warning: clang-format not found; skipping format check" >&2
+# The pinned clang-format, through the same wrapper CI's version comes from.
+FORMAT="$(git rev-parse --show-toplevel)/scripts/clang-format.sh"
+HAVE_FORMAT=1
+if ! "$FORMAT" --version >/dev/null 2>&1; then
+    HAVE_FORMAT=0
+    echo "warning: the pinned clang-format is not installed; skipping format check" >&2
+    echo "         (run scripts/clang-format.sh --version for the install command)" >&2
 fi
 
 FILES=$(git diff --cached --name-only --diff-filter=ACM -- '*.cpp' '*.hpp' || true)
@@ -24,12 +19,12 @@ if [[ -z "${FILES}" ]]; then
 fi
 
 FAILED=0
-if [[ -n "$CLANG_FORMAT_BIN" ]]; then
+if [[ "$HAVE_FORMAT" -eq 1 ]]; then
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
-        "$CLANG_FORMAT_BIN" -i "$file"
+        "$FORMAT" -i "$file"
         git add "$file"
-        if ! "$CLANG_FORMAT_BIN" --dry-run --Werror "$file"; then
+        if ! "$FORMAT" --dry-run --Werror "$file"; then
             FAILED=1
         fi
     done <<< "$FILES"

@@ -1272,7 +1272,7 @@ TEST_CASE("LazyTable: a like whose pattern is a bound scalar still fuses",
 
 // --- Streaming a scan in units -------------------------------------------
 //
-// Phase 1 of plans/pipelined-execution-plan.md. The whole point of the design
+// Phase 1 of the retired pipelined-execution plan. The whole point of the design
 // is that a unit-at-a-time scan applies the same pushdowns as the whole-source
 // one, so the tests that matter are equality tests against `project_where`
 // rather than tests of the streaming path in isolation: two code paths that are

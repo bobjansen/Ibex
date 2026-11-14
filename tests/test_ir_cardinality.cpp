@@ -143,7 +143,7 @@ TEST_CASE("cardinality takes the tighter bound when both join sides are unique",
     // grouped one is unique but unsized. So this states the rule through a
     // source-declared unique key, which is the shape a scan-level PK would
     // arrive in if one is ever derived (see the footer note in
-    // plans/decode-fusion-plan.md).
+    // `git show dd03e687:plans/decode-fusion-plan.md`).
     auto unique_source = [](std::string column) {
         auto info = ir::SchemaInfo::known({ir::SchemaField{.name = column, .type = std::nullopt}});
         info.add_unique_key({std::move(column)});

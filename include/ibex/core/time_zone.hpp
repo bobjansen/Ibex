@@ -65,7 +65,7 @@ struct ColumnMeta {
     /// are counted in. A Decimal column without it is a construction bug --
     /// its values are meaningless without the scale -- so readers treat
     /// absent as `Decimal(38, 0)` rather than guess, and producers always set
-    /// it (plans/decimal-plan.md).
+    /// it (SPEC.md §3.1).
     std::optional<DecimalType> decimal;
 
     [[nodiscard]] auto operator==(const ColumnMeta&) const -> bool = default;

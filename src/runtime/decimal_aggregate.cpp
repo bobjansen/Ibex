@@ -10,7 +10,7 @@
 // already groups Decimal keys), Decimal accumulators here, and every other
 // aggregate in the same query delegated to `aggregate_table` keyed on those
 // group ids -- so a non-Decimal aggregate keeps exactly its usual semantics.
-// Semantics: plans/decimal-plan.md.
+// Semantics: SPEC.md §3.5, "Aggregate Functions and Null".
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>

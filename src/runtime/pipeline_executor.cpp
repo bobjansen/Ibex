@@ -1501,7 +1501,8 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
 /// Streams a deferred lazy scan one source unit at a time instead of decoding
 /// the whole source and handing it over as a single chunk.
 ///
-/// This is Phase 1 of `plans/pipelined-execution-plan.md`. The decode it
+/// This is Phase 1 of the retired pipelined-execution plan
+/// (`git show ec861712:plans/pipelined-execution-plan.md`). The decode it
 /// performs is the same decode `materialize_deferred_scan` performs, with the
 /// same pushdowns — projection, static conjuncts, the dynamic key membership
 /// filter, and both fused scans, all restricted to the unit rather than

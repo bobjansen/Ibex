@@ -699,7 +699,8 @@ result;
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
-// --- Plan litmus tests: user-defined query helpers (plans/done/udf-dataframe-plan.md) ---
+// --- Plan litmus tests: user-defined query helpers ---
+// (retired plan: `git show dd03e687:plans/done/udf-dataframe-plan.md`)
 // These exercise the motivating examples end to end through the REPL/runtime path
 // and assert on the produced values, not just that the script runs. A scalar
 // table-consumer extern ("capture") stashes the helper's result table so the test

@@ -3,13 +3,13 @@
 Status: **ongoing umbrella plan, created 2026-10-04** by merging
 `beat-polars-plan.md` and `beat-duckdb-plan.md`. Their full text, with the
 measurement history this file leaves out, is at
-`git show 7a32d537:plans/beat-polars-plan.md` and
-`git show 7a32d537:plans/beat-duckdb-plan.md` (the August Polars plan is at
-`git show e82f679d:plans/beat-polars-plan.md`). Mechanism lives in
+`git show a35d68a5:plans/beat-polars-plan.md` and
+`git show a35d68a5:plans/beat-duckdb-plan.md` (the August Polars plan is at
+`git show d63ef694:plans/beat-polars-plan.md`). Mechanism lives in
 `src/runtime/CONTRACTS.md` and `src/runtime/PARALLELISM.md`; the retired
 owned-aggregate and runtime-multithreading plans are at
-`git show 587bc2e4:plans/owned-agg-per-chunk-barrier-plan.md` and
-`git show 587bc2e4:plans/runtime-multithreading-plan.md`.
+`git show c3876a24:plans/owned-agg-per-chunk-barrier-plan.md` and
+`git show c3876a24:plans/runtime-multithreading-plan.md`.
 
 **The benchmark write-up waits for this plan's first milestone.** Ibex is the
 fastest of the three engines on 1–4 cores, ties at 8 and loses at 16 (§1.0); a

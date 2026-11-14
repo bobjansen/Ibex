@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-// Multi-chunk execution: Phase 0 of plans/pipelined-execution-plan.md.
+// Multi-chunk execution: Phase 0 of the retired
+// `git show ec861712:plans/pipelined-execution-plan.md`.
 //
 // Production has never emitted more than one chunk from any source, so every
 // cross-chunk path in every operator is code that has never run. `IBEX_CHUNK_ROWS`

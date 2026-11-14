@@ -3,7 +3,7 @@
 The one-place statement of the contracts every operator, source, kernel, and
 sink in this directory is bound by. Written 2026-08-22 as Phase 2's opening
 deliverable of the kernel-pipeline migration (plan retired 2026-10-05:
-`git show 2b96e6d6:plans/kernel-pipeline-execution-plan.md`)
+`git show fbb4f75a:plans/kernel-pipeline-execution-plan.md`)
 — extracting the kernel APIs (`ChunkView`, selection, validity, output
 writer) is stating these contracts in code, so they get stated in prose
 first. Each section names the header that owns the normative doc comment;

@@ -6207,7 +6207,8 @@ class Lowerer {
     /// single expression), and whose trailing expression (or any `let` rhs)
     /// contains at least one built-in aggregate call, returns the trailing
     /// expression. This is the inference rule that distinguishes an aggregate
-    /// UDF from an ordinary scalar UDF; see `plans/done/aggregate-udf-plan.md`.
+    /// UDF from an ordinary scalar UDF (SPEC.md; retired plan at
+    /// `git show dd03e687:plans/done/aggregate-udf-plan.md`).
     [[nodiscard]] auto aggregate_udf_body(const std::string& name) const -> const Expr* {
         const auto it = functions_.find(name);
         if (it == functions_.end()) {

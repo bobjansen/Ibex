@@ -102,7 +102,7 @@ namespace {
 //     -0.6% / -1.8%, q04 +5%; reverted. The gain comes from every allocation
 //     (hash tables, selection vectors, Arrow buffers), not one class of them.
 // The full write-up of the September round: the retired
-// plans/allocator-and-huge-pages.md (`git show 47918401:plans/allocator-and-huge-pages.md`).
+// plans/allocator-and-huge-pages.md (`git show e2bd45bc:plans/allocator-and-huge-pages.md`).
 auto tune_allocator_once() -> std::expected<void, std::string> {
     static std::once_flag flag;
     static std::expected<void, std::string> status;

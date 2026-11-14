@@ -93,7 +93,7 @@ in active plans to `plans/done/...` paths refer to that history.
   Parquet arithmetic); the AWS polars-engines run at 013dbbfb did. The one-core arithmetic-filter +1–1.5% is a
   placement effect still open (the alignment hint was rejected).
 - **Retired 2026-10-05**, overtaken or done. Read any of them at
-  `git show 587bc2e4:plans/<name>`.
+  `git show c3876a24:plans/<name>`.
   - **radix-partitioned-groupby.md** — a July note that high-cardinality
     group-by is memory-bound and wants radix partitioning. Overtaken: the
     partition-owned aggregate (one partition per worker) is that partitioning,
@@ -120,7 +120,7 @@ in active plans to `plans/done/...` paths refer to that history.
     2026-08-16, each with its own reader; read that section as history.
 
 - **parallelism-overview.md** — retired 2026-10-05; read it at
-  `git show 47918401:plans/parallelism-overview.md`. The catalogue of where the
+  `git show e2bd45bc:plans/parallelism-overview.md`. The catalogue of where the
   multi-core model diverges from itself (I1–I15) and the findings that closed
   or refused each track. Where it lives now: the open inconsistencies, the
   "not inconsistencies" list, the dropped scheduler and the reverted
@@ -135,7 +135,7 @@ in active plans to `plans/done/...` paths refer to that history.
   down the plan), and a shared "is this type parallel-capable in role X"
   predicate (I2).
 - **allocator-and-huge-pages.md** — retired 2026-10-05; read it at
-  `git show 47918401:plans/allocator-and-huge-pages.md`. A parked analysis of why a
+  `git show e2bd45bc:plans/allocator-and-huge-pages.md`. A parked analysis of why a
   fresh process is slow (first-touch page faults; q21 ~0.43 against Polars
   warm, ~0.63 fresh). jemalloc no; whole-heap huge pages −8.0% / −4.9% fresh
   at 1 / 8 cores and neutral warm; column-buffer-only huge pages reverted. The
@@ -145,7 +145,7 @@ in active plans to `plans/done/...` paths refer to that history.
   `MEASURING.md`.
 
 - **per-occurrence-scan-selections-plan.md** — retired 2026-10-05; read it at
-  `git show c5e9e2b1:plans/per-occurrence-scan-selections-plan.md`. A source scanned
+  `git show abea4075:plans/per-occurrence-scan-selections-plan.md`. A source scanned
   more than once had lost all filter pushdown (`afe55f25` made occurrences
   share a name). Phases 1–3 (`78a09fad`, `bf783ef3`, `f2b298db`): occurrence
   identity (`scan_predicates_by_occurrence`), the `selection_for` seam, and
@@ -164,8 +164,8 @@ in active plans to `plans/done/...` paths refer to that history.
     occurrence (each occurrence's own filter still runs above).
 
 - **query-shape-conformance-plan.md** — retired 2026-10-05; read it at
-  `git show 051dd48f:plans/query-shape-conformance-plan.md` (the full diary is at
-  `git show 81392162:plans/query-shape-conformance-plan.md`). Why the
+  `git show 1cedc0c4:plans/query-shape-conformance-plan.md` (the full diary is at
+  `git show 7b4cb9cd:plans/query-shape-conformance-plan.md`). Why the
   canonical query rewrite (`482eb583`) cost 13–16% and how the suite got back
   to parity without q21. Its open items moved to `beat-both-plan.md` §3 (q13's
   fused non-anchored LIKE in item 6, the row-group task split in item 8), its
@@ -178,7 +178,7 @@ in active plans to `plans/done/...` paths refer to that history.
   it.
 
 - **ibex-compile-conformance-plan.md** — retired 2026-10-05; read it at
-  `git show 707662b7:plans/ibex-compile-conformance-plan.md`. Closed the drift
+  `git show 74007694:plans/ibex-compile-conformance-plan.md`. Closed the drift
   between `ibex_compile` and the interpreter: the parity suite became a
   conformance gate (every case transpiles and matches, or carries an
   `.unsupported` marker; none do), then `map { }` on every surface (W1),
@@ -204,7 +204,7 @@ in active plans to `plans/done/...` paths refer to that history.
     that the plan never closed.
 
 - **kernel-pipeline-execution-plan.md** — retired 2026-10-05; read it at
-  `git show 2b96e6d6:plans/kernel-pipeline-execution-plan.md`. The migration from
+  `git show fbb4f75a:plans/kernel-pipeline-execution-plan.md`. The migration from
   `build_operator` branches to logical IR → physical plan → pipelines →
   morsel executor, drained 2026-08-31: an inspectable physical plan
   (`explain physical`), row-local kernels (`kernel_types.hpp`), one ordered
@@ -229,7 +229,7 @@ in active plans to `plans/done/...` paths refer to that history.
     layer (when the link hurts the inner loop), migrating a fallback kind
     (when one profiles hot), DOP/memory budgets (see the DOP-analysis entry).
 
-- **joins.md** — retired 2026-10-05; read it at `git show fa7aad97:plans/joins.md`.
+- **joins.md** — retired 2026-10-05; read it at `git show 7298d0ba:plans/joins.md`.
   The join contract, built 2026-08: asymmetric keys, the canonical output
   planner, row order outside the contract, `left()`/`right()`, collisions and
   `suffix`, early key checks, order-aware build-side choice, `nulls equal`,
@@ -253,7 +253,7 @@ in active plans to `plans/done/...` paths refer to that history.
     vctrs key coercion.
 
 - **phase3-dop-budget-analysis.md** — retired 2026-10-05; read it at
-  `git show 82ab01d1:plans/phase3-dop-budget-analysis.md`. An analysis of
+  `git show c2c1e740:plans/phase3-dop-budget-analysis.md`. An analysis of
   kernel-pipeline Phase 3 item 2 (DOP and memory budgets). Done: 2a, the named
   compute budget (`ExecutionContext::compute_budget()`), and the removal of
   `IBEX_PARALLEL` (serial is `IBEX_CORES=1`; every core count gives the same
@@ -280,10 +280,10 @@ in active plans to `plans/done/...` paths refer to that history.
 
 - **beat-polars-plan.md** and **beat-duckdb-plan.md** — merged 2026-10-04 into
   `beat-both-plan.md` (one target: both references at 8 cores). Full text at
-  `git show 7a32d537:plans/<name>`, including the dev-box sweeps, the W0
+  `git show a35d68a5:plans/<name>`, including the dev-box sweeps, the W0
   measurement log and the q14 bandwidth study.
 
-- **Retired 2026-10-04.** Read any of them at `git show 0d069262:plans/<name>`.
+- **Retired 2026-10-04.** Read any of them at `git show 937b88a9:plans/<name>`.
   - **adbc-plan.md** — ADBC library work is done: import types, `adbc::write` /
     `execute`, bound parameters, reusable connections, discovery, DuckDB and
     macOS CI, SPEC + `docs/io.html`. Left: bump the driver manager and wheels
@@ -327,11 +327,11 @@ in active plans to `plans/done/...` paths refer to that history.
   rules head `lower_exists` / `mark_exists` in `src/parser/lower.cpp`. Tier 3 —
   a non-equality capture (q21's `l_suppkey <> outer(l_suppkey)`) as equijoin +
   residual filter + dedup on a row identity — is unbuilt; its design is at
-  `git show 2d064b83:plans/exists-subquery-plan.md`. No query needs it (q21
+  `git show 937b88a9:plans/exists-subquery-plan.md`. No query needs it (q21
   ships as a hand-written rewrite).
 
 - **Retired 2026-09-23**, all landed or deliberately reverted. Their rules
-  moved to where they apply; read the files at `git show 81392162:plans/<name>`.
+  moved to where they apply; read the files at `git show 7b4cb9cd:plans/<name>`.
   - **breaker-map-plan.md** — every PDS-H pipeline breaker ranked by idle
     core-ms; all items done or sized and dropped. Regenerate the map with
     `benchmarking/breaker_map.py`.

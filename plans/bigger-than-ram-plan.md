@@ -307,7 +307,7 @@ spill correct and tested first.
   Snowflake, DuckDB, SQLite"). Phase 5 here is also the first real exercise
   of that memory's "sinks are first-class" requirement for the eventual SQL
   backend.
-- **The retired runtime-multithreading plan** (`git show 587bc2e4:plans/runtime-multithreading-plan.md`; current design in `src/runtime/PARALLELISM.md`) intersects only at Phase 7
+- **The retired runtime-multithreading plan** (`git show c3876a24:plans/runtime-multithreading-plan.md`; current design in `src/runtime/PARALLELISM.md`) intersects only at Phase 7
   (stretch). Everything else in this plan is orthogonal to thread count —
   do not block spill correctness work on multithreading landing first.
 - **`plans/done/function-kind-registry-plan.md`** is unrelated in mechanism but

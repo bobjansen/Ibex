@@ -5862,7 +5862,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     // single-key join's right side, through projects/renames only) is not
     // decoded here. The join decodes it during execution, after
     // publishing build-side key bounds into its filter slot — see
-    // plans/dynamic-filter-pushdown-plan.md. The shared LazyTable is what
+    // `git show 10b26c19:plans/dynamic-filter-pushdown-plan.md`. The shared LazyTable is what
     // makes this safe: project_where bypasses its whole-column cache.
     const auto resolve_lazy_ptr = [&](const std::string& name) -> runtime::LazyTablePtr {
         auto it = lazy_sources.find(name);
@@ -5903,7 +5903,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                   });
     }
     // Streaming scan registration: hand a multi-unit source to the plan
-    // still undecoded (Phase 1 of plans/pipelined-execution-plan.md) so its
+    // still undecoded (Phase 1 of the retired pipelined-execution plan) so its
     // scan operator can emit it a unit at a time instead of the whole file
     // arriving as one chunk. The pushdowns are the same ones the eager
     // decode applies -- they travel in the registration rather than being

@@ -6,7 +6,7 @@ this one states the **parallelism model** — the mental picture, the three laye
 and which part of the engine owns which decision. Kept current with the code.
 Where the model is still inconsistent is catalogued below ("Where the model is
 still muddy"); the plan that tracked it, with its measurement history, was
-retired 2026-10-05 (`git show 47918401:plans/parallelism-overview.md`).
+retired 2026-10-05 (`git show e2bd45bc:plans/parallelism-overview.md`).
 
 ## The model in one paragraph
 

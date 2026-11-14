@@ -217,7 +217,7 @@ inline constexpr Int128 kMaxUnits = detail::kPow10[kMaxPrecision] - 1;
     return compare(a.units, a.type.scale, b.units, b.type.scale);
 }
 
-// ── Static result-type rules (plans/decimal-plan.md) ────────────────────────
+// ── Static result-type rules (SPEC.md §3.1, "Arithmetic Type Rules") ────────
 
 [[nodiscard]] constexpr auto add_result_type(DecimalType a, DecimalType b) noexcept -> DecimalType {
     const int scale = std::max(a.scale, b.scale);

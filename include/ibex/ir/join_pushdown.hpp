@@ -36,7 +36,7 @@ namespace ibex::ir {
 ///     LEFT column, so a non-key shared ref evaluated on the right would read
 ///     different values. This test needs a closed (non-open) left schema.
 ///
-/// Join-kind safety (see plans/join-predicate-pushdown-plan.md):
+/// Join-kind safety (retired plan: `git show 44040fcf:plans/join-predicate-pushdown-plan.md`):
 ///   - Inner: push both sides; a conjunct whose refs are all join keys present
 ///     on both sides is duplicated to BOTH sides (keys are equal on surviving
 ///     rows by construction).

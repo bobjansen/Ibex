@@ -6,7 +6,7 @@
 // Decimal arithmetic and comparison kernels shared by the per-row evaluator
 // (expr.cpp) and the vectorized one (filter.cpp). One implementation of each
 // rule, so the two paths cannot disagree on a result type, an overflow, or a
-// rounding. Semantics: plans/decimal-plan.md.
+// rounding. Semantics: SPEC.md §3.1, "Arithmetic Type Rules".
 
 #include <ibex/core/decimal.hpp>
 #include <ibex/ir/node.hpp>

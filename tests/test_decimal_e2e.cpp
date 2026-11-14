@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 /// Decimal end to end: source text -> parse -> lower -> interpret, plus the
-/// CSV and Arrow C Data boundaries. Semantics: plans/decimal-plan.md.
+/// CSV and Arrow C Data boundaries. Semantics: SPEC.md §3.1.
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/decimal.hpp>

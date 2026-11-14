@@ -340,6 +340,9 @@ struct BreakerParallelism {
 struct BreakerPhase {
     std::string_view name;
     BreakerParallelism parallelism;
+    /// The operator decides this phase once its whole input is in, from the
+    /// group count, rather than from its first chunk.
+    bool decided_after_input = false;
 };
 
 /// The `dedup` phase's capability half: the row floor and worker ceiling that

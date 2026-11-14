@@ -1449,7 +1449,7 @@ TEST_CASE("The plan describes a hash aggregate's structural fan-out policies",
         const auto& nodes = *plan.hash_aggregate;
         REQUIRE(nodes.discovery.parallelism.strategy ==
                 runtime::physical::PartitionStrategy::RadixHash);
-        REQUIRE(nodes.discovery.parallelism.row_floor == (1U << 18U));
+        REQUIRE(nodes.discovery.parallelism.row_floor == (1U << 15U));
         REQUIRE(nodes.discovery.parallelism.breaker_max_workers == 64);
         REQUIRE(nodes.accumulation.parallelism.strategy ==
                 runtime::physical::PartitionStrategy::Morsel);
@@ -1838,6 +1838,58 @@ TEST_CASE("The aggregate reads the plan: parallel output equals serial and the f
     for (std::size_t i = 0; i < s->rows(); ++i) {
         REQUIRE(capped_g[i] == sg[i]);
         REQUIRE(capped_v[i] == sv[i]);
+    }
+}
+
+TEST_CASE("A known input size below the radix floor still lets the owned discovery fan out",
+          "[physical][breaker][execute]") {
+    // Discovery's plan floor declines the phase when a confident input
+    // estimate is below it, and a registry table always gives one. The floor
+    // used to be the radix path's 262144, so a 100k-row table grouped on an
+    // Int64 key or an Int64 pair never reached the partition-owned path,
+    // whose own gate (kIntOwnedMinRows / kPairOwnedMinRows, 65536) admits it.
+    // At 40k rows that own gate still declines.
+    const auto run = [](std::int64_t rows, const char* query) {
+        runtime::TableRegistry registry;
+        runtime::Table t;
+        Column<std::int64_t> a;
+        Column<std::int64_t> b;
+        Column<double> v;
+        for (std::int64_t r = 0; r < rows; ++r) {
+            a.push_back((r * 7919) % (rows / 2));  // ~2 rows per key
+            b.push_back(r % 3);
+            v.push_back(static_cast<double>(r % 991) * 0.125);
+        }
+        t.add_column("a", std::move(a));
+        t.add_column("b", std::move(b));
+        t.add_column("v", std::move(v));
+        registry.emplace("t", t);
+        auto ir = require_ir(query);
+        runtime::ParallelPipelineStats stats;
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 8;
+        exec.parallel_stats = &stats;
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        REQUIRE(p.has_value());
+        REQUIRE(s.has_value());
+        REQUIRE(p->rows() == s->rows());
+        const auto& ps = std::get<Column<double>>(*p->find_entry("s")->column);
+        const auto& ss = std::get<Column<double>>(*s->find_entry("s")->column);
+        for (std::size_t i = 0; i < p->rows(); ++i) {
+            REQUIRE(ps[i] == ss[i]);
+        }
+        return stats.parallel_aggregate_partitions.load();
+    };
+    SECTION("single Int64 key") {
+        CHECK(run(100'000, "t[select { s = sum(v) }, by { a }];") > 0);
+        CHECK(run(40'000, "t[select { s = sum(v) }, by { a }];") == 0);
+    }
+    SECTION("Int64 pair key") {
+        CHECK(run(100'000, "t[select { s = sum(v) }, by { a, b }];") > 0);
+        CHECK(run(40'000, "t[select { s = sum(v) }, by { a, b }];") == 0);
     }
 }
 

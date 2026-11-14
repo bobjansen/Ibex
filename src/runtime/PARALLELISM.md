@@ -382,10 +382,19 @@ bugs: each new operator copies whichever neighbour it was written next to.
 - **I9** — worker-count caps differ: the plan-owned phases and the join /
   semi-anti probes cap at 64, every other site is bounded only by budget and
   pool, undocumented.
-- **I10** — aggregate emission compares its _group_ count to a floor named
-  `row_floor` that inherits `parallel_min_rows`. Plan-owned and printed since
-  the Emission node landed; the shared knob is what lets a test force the
-  fan-out on a small table, so the unit mismatch is naming only.
+- **I10** — a phase's plan `row_floor` does two jobs: it declines the phase at
+  plan time when the input estimate is confident (every registry table, lazy
+  or not, gives one), and it is printed as the phase's floor. At run time the
+  aggregate's phases mostly apply their operators' own path gates instead. The
+  rule that keeps the two consistent: **a plan floor must not exceed the
+  lowest gate of any path in its phase**, or the plan vetoes a fan-out the
+  operator admits. Discovery broke it until 2026-11-14: its floor was the
+  radix path's 262144, so a 32k–262k-row source never reached the packed
+  (32768) or partition-owned (65536) discovery; it is now 32768. Emission
+  compares its _group_ count to the inherited `parallel_min_rows` — the right
+  unit, since every group is an output row — and FinalOrdering's 131072 copies
+  the merge's own group floor; groups never exceed input rows, so declining
+  either on the input estimate is safe.
 - **I12** — two thread species: the long-lived stage thread of
   `PipelinedStageOperator` (parks on consumer backpressure; hosting it on the
   pool would deadlock) is named and counted (`on_stage_thread()`,
@@ -402,7 +411,7 @@ bugs: each new operator copies whichever neighbour it was written next to.
 
 - prefix sums in `TwoPhaseFilterOperator` / `try_discover_partitioned` are
   serial on purpose: O(morsels), not O(rows);
-- a refused island runs as one whole-table chunk, not a serial morsel sweep
+- a declined morsel pipeline runs as one whole-table chunk, not a serial morsel sweep
   (fix for a measured 3× regression);
 - `parallel_threads` does not cap the scan pipeline.
 
@@ -575,7 +584,7 @@ Breaker(Aggregate)
   Aggregate(StreamingSorted)
   hash-fallback: Discovery -> Accumulation -> FinalOrdering -> Emission
     edge: InputChunks -> DiscoveredGroups -> AccumulatedGroups -> OrderedGroups -> OutputChunks
-  Discovery: parallel-capable  cap=unresolved  floor 262144  partitions=derived  radix-hash
+  Discovery: parallel-capable  cap=unresolved  floor 32768  partitions=derived  radix-hash
          input estimate 4 rows (table)
   Accumulation: parallel-capable  cap=unresolved  floor 131072  partitions=derived  morsel (deterministic row ranges)
          input estimate 4 rows (table)

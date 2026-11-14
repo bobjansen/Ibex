@@ -72,11 +72,21 @@ constexpr std::size_t kJoinBuildRowFloor = 1U << 17U;
 constexpr std::size_t kJoinProbeRowFloor = 1U << 14U;
 constexpr std::size_t kJoinMaxWorkers = 64;
 
-/// Hash-aggregate fan-out floors for radix partition discovery and finalization.
-/// The operator separately decides whether partition-owned key maps are worthwhile.
-/// Discovery, Accumulation, and FinalOrdering share a 64-worker ceiling; Emission
-/// is bounded by its output-column count and the shared compute budget.
-constexpr std::size_t kAggPartitionRowFloor = 1U << 18U;
+/// Hash-aggregate fan-out floors. A phase's plan floor only declines it
+/// outright, and only when the input estimate is confident -- so it must not
+/// exceed the floor of ANY path the operator could take in that phase, or the
+/// plan vetoes a fan-out the operator's own gate admits. Discovery has three
+/// paths with their own run-time gates in aggregate_chunked.cpp: packed keys
+/// from 32768 rows (`kPackedPartitionMinRows`), the partition-owned Int64 and
+/// pair keys from 65536 (`kIntOwnedMinRows` / `kPairOwnedMinRows`), and radix
+/// partitioning from 262144 (`kDefaultPartitionMinRows`). Its plan floor is the
+/// lowest of them; at 262144 it kept 32k-262k-row inputs off the first two.
+/// Accumulation's 131072 is where its row cut first yields two morsels, and
+/// FinalOrdering's matches the merge's own group floor (groups never exceed
+/// input rows, so a decline on input rows is safe there). Discovery,
+/// Accumulation, and FinalOrdering share a 64-worker ceiling; Emission splits
+/// by output column x group range under the shared compute budget.
+constexpr std::size_t kAggDiscoveryRowFloor = 1U << 15U;
 constexpr std::size_t kAggFinalizeRowFloor = 1U << 17U;
 constexpr std::size_t kAggMaxWorkers = 64;
 
@@ -895,8 +905,11 @@ auto explain_physical(const Plan& plan) -> std::string {
                     {.name = "Accumulation",
                      .parallelism = plan.hash_aggregate->accumulation.parallelism},
                     {.name = "FinalOrdering",
-                     .parallelism = plan.hash_aggregate->final_ordering.parallelism},
-                    {.name = "Emission", .parallelism = plan.hash_aggregate->emission.parallelism},
+                     .parallelism = plan.hash_aggregate->final_ordering.parallelism,
+                     .decided_after_input = true},
+                    {.name = "Emission",
+                     .parallelism = plan.hash_aggregate->emission.parallelism,
+                     .decided_after_input = true},
                 };
                 append_phase_lines(out, nodes);
             }
@@ -1119,7 +1132,7 @@ auto aggregate_discovery_parallelism(RowEstimate estimate) -> BreakerParallelism
     // (partition-owned key maps instead of whole scattered partitions). The
     // operator resolves which at run time from the key type and cardinality,
     // the way the join resolves its build orientation.
-    return {.row_floor = kAggPartitionRowFloor,
+    return {.row_floor = kAggDiscoveryRowFloor,
             .breaker_max_workers = kAggMaxWorkers,
             .strategy = PartitionStrategy::RadixHash,
             .estimate = estimate};
@@ -1200,7 +1213,9 @@ void append_phase_lines(std::string& out, const std::vector<BreakerPhase>& phase
         out += "  partitions=derived  ";
         out += partition_strategy_name(bp.strategy);
         if (!bp.estimate.confident()) {
-            out += "\n         no row estimate -> decided on first chunk";
+            out += phase.decided_after_input
+                       ? "\n         no row estimate -> decided on the group count after input"
+                       : "\n         no row estimate -> decided on first chunk";
             continue;
         }
         out += "\n         input estimate " + std::to_string(bp.estimate.rows) + " rows (";

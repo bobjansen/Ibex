@@ -246,12 +246,21 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install tools
+        # The clang-tidy version is pinned in scripts/clang-tidy-version, which
+        # scripts/clang-tidy.sh reads too, so local runs and CI report the same
+        # findings. Ubuntu's archive lags, so it comes from apt.llvm.org. No
+        # fallback: a different version would pass or fail on other checks.
         run: |
           sudo apt-get update
           # libreadline-dev: src/repl/line_editing_readline.cpp is configured
           # (and so analysed with real flags) only when readline is found.
-          sudo apt-get install -y clang-20 clang-tidy-20 cmake ninja-build libcurl4-openssl-dev libreadline-dev || \
-          sudo apt-get install -y clang-18 clang-tidy-18 cmake ninja-build libcurl4-openssl-dev libreadline-dev
+          sudo apt-get install -y cmake ninja-build libcurl4-openssl-dev libreadline-dev
+          version="$(tr -d '[:space:]' < scripts/clang-tidy-version)"
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm.sh "$version"
+          sudo apt-get install -y "clang-tidy-$version"
+          echo "CLANG_TIDY_VERSION=$version" >> "$GITHUB_ENV"
+          "clang-tidy-$version" --version
 
       - name: Configure (also emits compile_commands.json)
         # Ninja + CMAKE_EXPORT_COMPILE_COMMANDS (set in CMakeLists) writes
@@ -260,29 +269,26 @@ jobs:
         # is needed before clang-tidy. We only tidy our own src/*.cpp, which
         # don't depend on any build-time-generated headers.
         run: |
-          if command -v clang++-20 >/dev/null 2>&1; then CC=clang-20; CXX=clang++-20; else CC=clang-18; CXX=clang++-18; fi
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_C_COMPILER=$CC \
-            -DCMAKE_CXX_COMPILER=$CXX \
+            -DCMAKE_C_COMPILER="clang-$CLANG_TIDY_VERSION" \
+            -DCMAKE_CXX_COMPILER="clang++-$CLANG_TIDY_VERSION" \
             -DIBEX_BUILD_LIGHTGBM=OFF
 
       - name: Run clang-tidy
         # Analyze every project translation unit and treat every diagnostic as
         # an error. clang-tidy parses every included header too, but only
         # *reports* diagnostics located in the main file (the .cpp) unless
-        # --header-filter matches the header's path — and, at least as of
-        # clang-tidy-20, that filter is NOT picked up from .clang-tidy's
-        # HeaderFilterRegex on its own (--dump-config shows it loaded, but it
-        # has no effect unless the same value is also passed on the command
-        # line here). Keep this regex in sync with .clang-tidy.
+        # the header filter matches the header's path. clang-tidy-20 ignored
+        # .clang-tidy's HeaderFilterRegex unless the same value was also
+        # passed on the command line; 23 honours it, but the flag stays so
+        # the scope is visible here. Keep this regex in sync with .clang-tidy.
         run: |
-          if command -v clang-tidy-20 >/dev/null 2>&1; then TIDY=clang-tidy-20; else TIDY=clang-tidy-18; fi
           # Run one clang-tidy process per core. -n1 so each file is its own
           # job for -P to parallelize.
           find src -name '*.cpp' -print0 | \
-            xargs -0 -P "$(nproc)" -n1 "$TIDY" -p build --warnings-as-errors='*' \
+            xargs -0 -P "$(nproc)" -n1 "clang-tidy-$CLANG_TIDY_VERSION" -p build --warnings-as-errors='*' \
               --header-filter='^.*/include/ibex/.*\.hpp$'
 
   format-check:

@@ -47,13 +47,17 @@ Checks: >
 # inside our own headers were silently dropped in CI even though every
 # header is pulled in by some TU. Match only our own headers, not
 # FetchContent'd third-party ones under build/.
-# NOTE: as of clang-tidy-20, setting this here is not sufficient on its own —
-# --dump-config shows it loaded, but it has no effect on `-p <builddir>`
-# invocations unless the identical value is ALSO passed via --header-filter
-# on the command line. CI's clang-tidy step does that; keep both in sync.
+# clang-tidy-20 ignored this unless the identical value was also passed via
+# --header-filter; 23 honours it. CI's clang-tidy step still passes the flag;
+# keep both in sync.
 HeaderFilterRegex: '^.*/include/ibex/.*\.hpp$'
 CheckOptions:
   # libstdc++ implementation headers are not portable include providers.
   # Prefer the public standard-library header for every standard declaration.
   - key: misc-include-cleaner.IgnoreHeaders
     value: '(^|.*/)bits/.*'
+  # `1U << 0` and `0x01U & x` are flagged because the literal is a signed
+  # int. A non-negative literal cannot carry a sign bit, so only a signed
+  # variable operand is worth a finding.
+  - key: bugprone-signed-bitwise.IgnorePositiveIntegerLiterals
+    value: true

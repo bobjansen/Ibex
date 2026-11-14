@@ -36,8 +36,8 @@ with its own timing boundary and provenance:
 | Suite | Measured | Ibex commit | Machine and budget | Timing |
 |---|---|---|---|---|
 | In-memory DataFrame | 2026-10-24 | `950fafc1` | r7i.2xlarge, 64 GiB; separate identical instance per engine (Ibex, Polars, DuckDB); 8 vCPUs on 4 physical cores, SMT on; default engine thread budgets, plus single-thread variants | Load once, excluded; full result materialisation; mean of 5 iterations after 1 warmup |
-| H2O, 10M rows | 2026-11-08 | `23436ea7` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1 or 8 physical cores | Load once, excluded; full result materialisation; minimum of 5 iterations after 1 warmup |
-| PDS-H, SF10 | 2026-11-08 | `23436ea7` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1, 2 or 8 physical cores | Parquet reads included in each query; full result materialisation; mean of 5 iterations after 1 warmup |
+| H2O, 10M rows | 2026-11-14 | `838ae244` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1 or 8 physical cores | Load once, excluded; full result materialisation; minimum of 5 iterations after 1 warmup |
+| PDS-H, SF10 | 2026-11-14 | `838ae244` | One r7i.4xlarge, Xeon Platinum 8488C, 128 GiB; SMT off; all engines pinned to the same 1, 2 or 8 physical cores | Parquet reads included in each query; full result materialisation; mean of 5 iterations after 1 warmup |
 
 H2O and PDS-H use Polars **2.0.0** (streaming) and DuckDB **2.0.0**.
 PDS-H pins upstream `pola-rs/polars-benchmark` at `401908a307f1`;
@@ -67,8 +67,8 @@ worker does not also load and benchmark pandas.
 Source artifacts, under `benchmarking/results/`:
 
 - `scales_aws_20261024T152444.csv` and its `.manifest.json`.
-- `h2o_aws_20261108T134649.tar.gz` (samples, checks sidecars and `versions.txt`).
-- `tpch_aws_20261108T134649.tar.gz` (samples, per-run manifests and `versions.txt`).
+- `h2o_aws_20261114T094732.tar.gz` (samples, checks sidecars and `versions.txt`).
+- `tpch_aws_20261114T094732.tar.gz` (samples, per-run manifests and `versions.txt`).
 
 Report geometric means **and** ratios of total query times. The former gives
 equal weight to multiplicative differences per question; the latter gives
@@ -113,7 +113,7 @@ At `950fafc1`:
     --sizes 1M,2M,4M,8M,16M,32M,50M --warmup 1 --iters 5
 ```
 
-At `23436ea7`:
+At `838ae244`:
 
 ```bash
 ./benchmarking/aws/run-h2o.sh --on-demand --type r7i.4xlarge \
@@ -128,8 +128,8 @@ repository root at the current revision:
 ```bash
 python3 benchmarking/gen_website.py \
     benchmarking/results/scales_aws_20261024T152444.csv --commit 950fafc1 \
-    --h2o benchmarking/results/h2o_aws_20261108T134649.tar.gz \
-    --pdsh benchmarking/results/tpch_aws_20261108T134649.tar.gz
+    --h2o benchmarking/results/h2o_aws_20261114T094732.tar.gz \
+    --pdsh benchmarking/results/tpch_aws_20261114T094732.tar.gz
 ```
 
 ## vCPUs are hyperthreads

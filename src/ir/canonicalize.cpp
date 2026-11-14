@@ -477,7 +477,7 @@ auto try_order_past_rename(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Rename) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& order_n = node_cast<OrderNode>(*node);
+    const auto& order_n = node_cast<OrderNode>(*node);
     const auto& rename = node_cast<RenameNode>(*node->children().front());
     auto remapped = remap_keys_through_rename(order_n.keys(), rename.renames());
     NodePtr order_owned = std::move(node);
@@ -625,7 +625,7 @@ auto try_filter_past_project(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Project) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& filter = node_cast<FilterNode>(*node);
+    const auto& filter = node_cast<FilterNode>(*node);
     const auto& project = node_cast<ProjectNode>(*node->children().front());
     if (project.children().size() != 1 || project.children().front() == nullptr ||
         !is_subset_evaluable_expr(filter.predicate())) {
@@ -749,7 +749,7 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
     if (child_kind == NodeKind::Project) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& agg = node_cast<AggregateNode>(*node);
+    const auto& agg = node_cast<AggregateNode>(*node);
     std::vector<ColumnRef> needed;
     robin_hood::unordered_set<std::string> seen;
     needed.reserve(agg.group_by().size() + agg.aggregations().size());

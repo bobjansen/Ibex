@@ -435,7 +435,7 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
 auto ExecutionProfileState::entry(std::uint64_t node_id, std::string label)
     -> ExecutionProfileEntry* {
     const std::lock_guard lock(impl_->mutex);
-    auto key = std::pair{node_id, label};
+    const auto key = std::pair{node_id, label};
     auto [it, inserted] = impl_->entries.try_emplace(key);
     if (inserted) {
         it->second = std::make_unique<ExecutionProfileEntry>();

@@ -183,7 +183,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
                           token_column);
                 continue;
             }
-            if (auto it = keywords.find(text); it != keywords.end()) {
+            if (const auto it = keywords.find(text); it != keywords.end()) {
                 add_token(it->second, token_start, i - token_start, token_line, token_column);
                 continue;
             }

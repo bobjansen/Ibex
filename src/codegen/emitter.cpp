@@ -495,7 +495,7 @@ void Emitter::emit_deferred_scalar(const ir::DeferredScalarBinding& binding) {
     auto& out = *out_;
     for (const auto& source : binding.sources) {
         out << "    {\n";
-        auto src_var = emit_root(*source.plan);
+        const auto src_var = emit_root(*source.plan);
         emit_scalar_store(source.tmp_name, "ibex::ops::scalar_of_table(" + src_var + ", \"" +
                                                escape_string(source.column.value_or("")) + "\", " +
                                                (source.column.has_value() ? "false" : "true") +
@@ -514,7 +514,7 @@ void Emitter::emit_query(std::ostream& out, const ir::Node& root, const Config& 
         std::ostringstream query_buf;
         auto* saved_out = out_;
         out_ = &query_buf;
-        auto result_var = emit_root(root);
+        const auto result_var = emit_root(root);
         out_ = saved_out;
 
         // Re-indent query code by 4 extra spaces so it sits inside the loop body.
@@ -542,7 +542,7 @@ void Emitter::emit_query(std::ostream& out, const ir::Node& root, const Config& 
             << config.bench_iters << ";\n";
         out << "    std::fprintf(stderr, \"avg_ms=%.3f\\n\", _avg_ms);\n";
     } else {
-        auto result_var = emit_root(root);
+        const auto result_var = emit_root(root);
         if (config.table_entry_point) {
             out << "    return " << result_var << ";\n";
         } else if (config.print_result) {
@@ -642,7 +642,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Filter: {
             const auto& filter = ir::node_cast<ir::FilterNode>(node);
-            auto child = emit_node(require_single_child(filter, "FilterNode"));
+            const auto child = emit_node(require_single_child(filter, "FilterNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::filter(" << child << ", "
                   << emit_filter_expr(filter.predicate()) << ");\n";
@@ -651,7 +651,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Project: {
             const auto& proj = ir::node_cast<ir::ProjectNode>(node);
-            auto child = emit_node(require_single_child(proj, "ProjectNode"));
+            const auto child = emit_node(require_single_child(proj, "ProjectNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::project(" << child << ", {";
             bool first = true;
@@ -666,7 +666,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         }
 
         case ir::NodeKind::Distinct: {
-            auto child = emit_node(require_single_child(node, "DistinctNode"));
+            const auto child = emit_node(require_single_child(node, "DistinctNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::distinct(" << child << ");\n";
             return var;
@@ -674,7 +674,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Order: {
             const auto& order = ir::node_cast<ir::OrderNode>(node);
-            auto child = emit_node(require_single_child(order, "OrderNode"));
+            const auto child = emit_node(require_single_child(order, "OrderNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::order(" << child << ", {";
             bool first = true;
@@ -691,7 +691,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Head: {
             const auto& head = ir::node_cast<ir::HeadNode>(node);
-            auto child = emit_node(require_single_child(head, "HeadNode"));
+            const auto child = emit_node(require_single_child(head, "HeadNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::head(" << child
                   << ", ibex::ops::eval_row_count(" << emit_expr(head.count_expr()) << "), {";
@@ -708,7 +708,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Tail: {
             const auto& tail = ir::node_cast<ir::TailNode>(node);
-            auto child = emit_node(require_single_child(tail, "TailNode"));
+            const auto child = emit_node(require_single_child(tail, "TailNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::tail(" << child
                   << ", ibex::ops::eval_row_count(" << emit_expr(tail.count_expr()) << "), {";
@@ -725,7 +725,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::TopK: {
             const auto& topk = ir::node_cast<ir::TopKNode>(node);
-            auto child = emit_node(require_single_child(topk, "TopKNode"));
+            const auto child = emit_node(require_single_child(topk, "TopKNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::top_k(" << child << ", {";
             bool first = true;
@@ -751,7 +751,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Aggregate: {
             const auto& agg = ir::node_cast<ir::AggregateNode>(node);
-            auto child = emit_node(require_single_child(agg, "AggregateNode"));
+            const auto child = emit_node(require_single_child(agg, "AggregateNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::aggregate(" << child << ",\n";
 
@@ -791,7 +791,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Update: {
             const auto& upd = ir::node_cast<ir::UpdateNode>(node);
-            auto child = emit_node(require_single_child(upd, "UpdateNode"));
+            const auto child = emit_node(require_single_child(upd, "UpdateNode"));
             auto var = fresh_var();
 
             std::vector<std::pair<std::vector<std::string>, std::string>> tuple_sources;
@@ -850,7 +850,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Map: {
             const auto& mn = ir::node_cast<ir::MapNode>(node);
-            auto child = emit_node(require_single_child(mn, "MapNode"));
+            const auto child = emit_node(require_single_child(mn, "MapNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::map(" << child << ", {\n";
             bool first = true;
@@ -867,7 +867,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Rename: {
             const auto& ren = ir::node_cast<ir::RenameNode>(node);
-            auto child = emit_node(require_single_child(ren, "RenameNode"));
+            const auto child = emit_node(require_single_child(ren, "RenameNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::rename(" << child << ", {";
             bool first = true;
@@ -896,7 +896,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     "ibex_compile: a window update does not support tuple fields or a "
                     "`where` guard");
             }
-            auto source = emit_node(require_single_child(upd, "UpdateNode (window payload)"));
+            const auto source = emit_node(require_single_child(upd, "UpdateNode (window payload)"));
             auto var = fresh_var();
             // The common `window + update` keeps its short form; the `select` and
             // `aligned` forms take the full one.
@@ -933,7 +933,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Resample: {
             const auto& rs = ir::node_cast<ir::ResampleNode>(node);
-            auto child = emit_node(require_single_child(rs, "ResampleNode"));
+            const auto child = emit_node(require_single_child(rs, "ResampleNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::resample(" << child << ",\n";
 
@@ -976,7 +976,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::AsTimeframe: {
             const auto& atf = ir::node_cast<ir::AsTimeframeNode>(node);
-            auto child = emit_node(require_single_child(atf, "AsTimeframeNode"));
+            const auto child = emit_node(require_single_child(atf, "AsTimeframeNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::as_timeframe(" << child << ", \""
                   << escape_string(atf.column()) << "\");\n";
@@ -985,9 +985,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Ascribe: {
             const auto& asc = ir::node_cast<ir::AscribeNode>(node);
-            auto child = emit_node(require_single_child(asc, "AscribeNode"));
+            const auto child = emit_node(require_single_child(asc, "AscribeNode"));
             auto var = fresh_var();
-            auto type_name = [](ir::ColumnType t) -> std::string_view {
+            const auto type_name = [](ir::ColumnType t) -> std::string_view {
                 switch (t) {
                     case ir::ColumnType::Int32:
                         return "Int32";
@@ -1036,7 +1036,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         }
 
         case ir::NodeKind::Columns: {
-            auto child = emit_node(require_single_child(node, "ColumnsNode"));
+            const auto child = emit_node(require_single_child(node, "ColumnsNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::columns(" << child << ");\n";
             return var;
@@ -1044,7 +1044,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::ExternCall: {
             // In bench mode ExternCall nodes were pre-emitted; reuse the var.
-            if (auto it = cached_vars_.find(&node); it != cached_vars_.end())
+            if (const auto it = cached_vars_.find(&node); it != cached_vars_.end())
                 return narrow_source(node, it->second);
             const auto& ec = ir::node_cast<ir::ExternCallNode>(node);
             auto var = fresh_var();
@@ -1068,8 +1068,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             if (!join.children()[0] || !join.children()[1]) {
                 throw std::runtime_error("ibex_compile: JoinNode children must be non-null");
             }
-            auto left = emit_node(*join.children()[0]);
-            auto right = emit_node(*join.children()[1]);
+            const auto left = emit_node(*join.children()[0]);
+            const auto right = emit_node(*join.children()[1]);
             auto var = fresh_var();
             const char* fn = nullptr;
             const char* kind = nullptr;
@@ -1158,7 +1158,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Melt: {
             const auto& mn = ir::node_cast<ir::MeltNode>(node);
-            auto child = emit_node(require_single_child(mn, "MeltNode"));
+            const auto child = emit_node(require_single_child(mn, "MeltNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::melt(" << child << ", {";
             bool first = true;
@@ -1182,7 +1182,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Dcast: {
             const auto& dn = ir::node_cast<ir::DcastNode>(node);
-            auto child = emit_node(require_single_child(dn, "DcastNode"));
+            const auto child = emit_node(require_single_child(dn, "DcastNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::dcast(" << child << ", \""
                   << escape_string(dn.pivot_column()) << "\", \""
@@ -1199,21 +1199,21 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         }
 
         case ir::NodeKind::Cov: {
-            auto child = emit_node(require_single_child(node, "CovNode"));
+            const auto child = emit_node(require_single_child(node, "CovNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::cov(" << child << ");\n";
             return var;
         }
 
         case ir::NodeKind::Corr: {
-            auto child = emit_node(require_single_child(node, "CorrNode"));
+            const auto child = emit_node(require_single_child(node, "CorrNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::corr(" << child << ");\n";
             return var;
         }
 
         case ir::NodeKind::Transpose: {
-            auto child = emit_node(require_single_child(node, "TransposeNode"));
+            const auto child = emit_node(require_single_child(node, "TransposeNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::transpose(" << child << ");\n";
             return var;
@@ -1223,8 +1223,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             if (node.children().size() != 2) {
                 throw std::runtime_error("MatmulNode expects exactly two children");
             }
-            auto left = emit_node(*node.children()[0]);
-            auto right = emit_node(*node.children()[1]);
+            const auto left = emit_node(*node.children()[0]);
+            const auto right = emit_node(*node.children()[1]);
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::matmul(" << left << ", " << right
                   << ");\n";
@@ -1261,7 +1261,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                                          "' comes from a plugin, which compiled programs do not "
                                          "support yet (built in: ols, ridge, wls)");
             }
-            auto child = emit_node(require_single_child(mn, "ModelNode"));
+            const auto child = emit_node(require_single_child(mn, "ModelNode"));
             const std::string model_var = "_model" + std::to_string(tmp_counter_++);
             auto var = fresh_var();
             *out_ << "    ibex::runtime::ModelResult " << model_var << ";\n";
@@ -1310,8 +1310,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             for (const auto& col : cn.columns()) {
                 if (col.expr_node) {
                     // Expression column: emit the sub-node then extract the column.
-                    auto sub_var = emit_node(*col.expr_node);
-                    auto cname = escape_string(col.name);
+                    const auto sub_var = emit_node(*col.expr_node);
+                    const auto cname = escape_string(col.name);
                     *out_ << "    {\n";
                     *out_ << "        auto& __sub = " << sub_var << ";\n";
                     *out_ << "        if (__sub.columns.size() == 1) {\n";
@@ -1468,7 +1468,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             auto* saved_out = out_;
             out_ = &transform_buf;
             stream_scan_var_ = sbuf;
-            auto transform_var = emit_node(sn.transform_ir());
+            const auto transform_var = emit_node(sn.transform_ir());
             stream_scan_var_.clear();
             out_ = saved_out;
 
@@ -1599,8 +1599,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             // Fused shape produced by canonicalize R7. Emit as filter + head —
             // the ops layer has no fused primitive.
             const auto& fh = ir::node_cast<ir::FilterHeadNode>(node);
-            auto child = emit_node(require_single_child(fh, "FilterHeadNode"));
-            auto fvar = fresh_var();
+            const auto child = emit_node(require_single_child(fh, "FilterHeadNode"));
+            const auto fvar = fresh_var();
             *out_ << "    auto " << fvar << " = ibex::ops::filter(" << child << ", "
                   << emit_filter_expr(fh.predicate()) << ");\n";
             auto hvar = fresh_var();
@@ -1611,8 +1611,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         case ir::NodeKind::FilterTail: {
             // Fused shape produced by canonicalize R8. Emit as filter + tail.
             const auto& ft = ir::node_cast<ir::FilterTailNode>(node);
-            auto child = emit_node(require_single_child(ft, "FilterTailNode"));
-            auto fvar = fresh_var();
+            const auto child = emit_node(require_single_child(ft, "FilterTailNode"));
+            const auto fvar = fresh_var();
             *out_ << "    auto " << fvar << " = ibex::ops::filter(" << child << ", "
                   << emit_filter_expr(ft.predicate()) << ");\n";
             auto tvar = fresh_var();

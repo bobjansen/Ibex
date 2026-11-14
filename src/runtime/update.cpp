@@ -96,7 +96,7 @@ auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const Scalar
             };
         }
         if (scalars != nullptr) {
-            if (auto it = scalars->find(col->name); it != scalars->end()) {
+            if (const auto it = scalars->find(col->name); it != scalars->end()) {
                 if (is_decimal(it->second)) {
                     return std::nullopt;
                 }
@@ -241,8 +241,8 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange r
     // loop body is a branch-free array kernel that the compiler can auto-vectorize.
     // `run` receives a stateless lambda (unique type per op) and executes the
     // appropriate col/col, col/scalar, or scalar/col loop.
-    auto make_double_result = [&](auto op_fn, const double* lp, double ls, const double* rp,
-                                  double rs) -> ColumnValue {
+    const auto make_double_result = [&](auto op_fn, const double* lp, double ls, const double* rp,
+                                        double rs) -> ColumnValue {
         Column<double> out;
         out.resize_for_overwrite(rows);
         double* dst = out.data();
@@ -258,8 +258,8 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange r
         }
         return ColumnValue{std::move(out)};
     };
-    auto make_int_result = [&](auto op_fn, IntegerView lp, std::int64_t ls, IntegerView rp,
-                               std::int64_t rs) -> ColumnValue {
+    const auto make_int_result = [&](auto op_fn, IntegerView lp, std::int64_t ls, IntegerView rp,
+                                     std::int64_t rs) -> ColumnValue {
         Column<std::int64_t> out;
         out.resize_for_overwrite(rows);
         std::int64_t* dst = out.data();
@@ -1152,9 +1152,9 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, RowRange 
         return std::nullopt;  // two scalars: nothing to vectorize, and no column to read
     }
 
-    auto run = [&](auto* dst, auto lp, auto ls, auto rp, auto rs) {
+    const auto run = [&](auto* dst, auto lp, auto ls, auto rp, auto rs) {
         using V = std::decay_t<decltype(ls)>;
-        auto pick = [is_min](V a, V b) -> V {
+        const auto pick = [is_min](V a, V b) -> V {
             if (is_min) {
                 return b < a ? b : a;
             }
@@ -1445,7 +1445,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 continue;
             }
             if (scalars != nullptr) {
-                if (auto it = scalars->find(col_ref->name); it != scalars->end()) {
+                if (const auto it = scalars->find(col_ref->name); it != scalars->end()) {
                     if (const auto* null = std::get_if<NullScalar>(&it->second)) {
                         // An all-null column of the binding's type.
                         auto [column, validity] = null_column(*null, rows);
@@ -3472,7 +3472,7 @@ struct WindowTask {
         if (const auto* ts = std::get_if<Column<Timestamp>>(tcv)) {
             const std::int64_t unit = duration.count();
             if (unit > 0) {
-                auto bucket_of = [&](std::size_t r) {
+                const auto bucket_of = [&](std::size_t r) {
                     return window_bucket_index((*ts)[r].nanos, unit);
                 };
                 for (const auto& task : tasks) {
@@ -3484,7 +3484,7 @@ struct WindowTask {
             static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
             const std::int64_t unit = duration.count() / kNsPerDay;
             if (unit > 0) {
-                auto bucket_of = [&](std::size_t r) {
+                const auto bucket_of = [&](std::size_t r) {
                     return window_bucket_index((*dt)[r].days, unit);
                 };
                 for (const auto& task : tasks) {
@@ -3630,7 +3630,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // Bucket rows by group key — the row indices land in original
     // (time-sorted) order within each group, which is the precondition the
     // single-buffer rolling implementation relies on.
-    auto row_gid_buf = make_owned_array<std::uint32_t>(rows);
+    const auto row_gid_buf = make_owned_array<std::uint32_t>(rows);
     const std::span<std::uint32_t> row_gid{row_gid_buf.get(), rows};
     const std::size_t group_count =
         assign_group_ids(group_columns, group_validity, rows, exec, row_gid);
@@ -3824,7 +3824,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // shares them with `input`. NOT a move: `slice_source` still refers to
     // `permuted`, and the remaining groups are cut from it below.
     Table output = needs_permute ? permuted : input;
-    auto allocate_full = [&](const ColumnValue& sample) -> std::expected<ColumnValue, std::string> {
+    const auto allocate_full =
+        [&](const ColumnValue& sample) -> std::expected<ColumnValue, std::string> {
         return std::visit(
             [&](const auto& col) -> std::expected<ColumnValue, std::string> {
                 using ColT = std::decay_t<decltype(col)>;
@@ -4045,7 +4046,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         if (!output_validity[f].has_value()) {
             continue;
         }
-        auto idx_it = output.index.find(written_field_names[f]);
+        const auto idx_it = output.index.find(written_field_names[f]);
         if (idx_it != output.index.end()) {
             output.columns[idx_it->second].validity = std::move(output_validity[f]);
         }
@@ -4418,7 +4419,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 continue;
             }
             if (scalars != nullptr) {
-                if (auto it = scalars->find(col_ref->name); it != scalars->end()) {
+                if (const auto it = scalars->find(col_ref->name); it != scalars->end()) {
                     if (const auto* null = std::get_if<NullScalar>(&it->second)) {
                         // An all-null column of the binding's type.
                         auto [column, validity] = null_column(*null, rows);
@@ -4482,7 +4483,7 @@ auto preserve_categorical_target(const ColumnEntry* target, std::shared_ptr<Colu
     const auto& strings = std::get<Column<std::string>>(*values);
     Column<Categorical> categorical;
     categorical.reserve(strings.size());
-    for (auto string : strings) {
+    for (const auto string : strings) {
         categorical.push_back(string);
     }
     return std::make_shared<ColumnValue>(std::move(categorical));
@@ -5074,7 +5075,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                 broadcast_scalar_column(scalar_from_literal(*literal), std::size_t{1});
             auto replacement_values = preserve_categorical_target(
                 old_entry, std::make_shared<ColumnValue>(std::move(replacement)));
-            auto old_values = promote_integer_target(old_entry->column, replacement_values);
+            const auto old_values = promote_integer_target(old_entry->column, replacement_values);
             auto target = prepare_guarded_write(input, field.alias, *replacement_values);
             if (!target.has_value()) {
                 return std::unexpected(std::move(target.error()));
@@ -5501,11 +5502,14 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         // Resolve both ends once; see `ColumnAppender`. Only
                         // `Column<bool>` reaches this branch without a dense
                         // buffer, so it keeps the indexed path.
+                        // Written through only in an `if constexpr` branch,
+                        // which misc-const-correctness does not see.
+                        // NOLINTNEXTLINE(misc-const-correctness)
                         typename Col::value_type* out_values = nullptr;
                         if constexpr (is_dense_column_v<Col>) {
                             out_values = out.data();
                         }
-                        auto scatter = [&](std::size_t dst, std::size_t s) {
+                        const auto scatter = [&](std::size_t dst, std::size_t s) {
                             if constexpr (is_dense_column_v<Col>) {
                                 out_values[dst] = src[s];
                             } else {
@@ -5540,6 +5544,9 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         const auto& rows_matched = need_matched_idx();
                         ValidityBitmap valid(n, false);
                         bool any_invalid = rows_matched.size() < n;
+                        // Written through only in an `if constexpr` branch,
+                        // which misc-const-correctness does not see.
+                        // NOLINTNEXTLINE(misc-const-correctness)
                         typename Col::value_type* out_values = nullptr;
                         if constexpr (is_dense_column_v<Col>) {
                             out_values = out.data();
@@ -5809,7 +5816,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
         return output;
     }
 
-    auto run_group =
+    const auto run_group =
         [&](std::span<const std::size_t> row_idx) -> std::expected<Table, std::string> {
         Table sub;
         for (const auto& entry : input.columns) {
@@ -5838,7 +5845,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
         }
 
         std::vector<ir::FieldSpec> pending_row_fields;
-        auto flush_pending = [&] -> std::expected<void, std::string> {
+        const auto flush_pending = [&] -> std::expected<void, std::string> {
             if (pending_row_fields.empty()) {
                 return {};
             }
@@ -5904,7 +5911,8 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
                                             written_field_names.size())});
 
     Table output = input;
-    auto allocate_full = [&](const ColumnValue& sample) -> std::expected<ColumnValue, std::string> {
+    const auto allocate_full =
+        [&](const ColumnValue& sample) -> std::expected<ColumnValue, std::string> {
         return std::visit(
             [&](const auto& col) -> std::expected<ColumnValue, std::string> {
                 using ColT = std::decay_t<decltype(col)>;
@@ -5985,7 +5993,8 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
         }
     };
 
-    auto scatter_group = [&](std::size_t group, const Table& sub) -> std::optional<std::string> {
+    const auto scatter_group = [&](std::size_t group,
+                                   const Table& sub) -> std::optional<std::string> {
         for (std::size_t f = 0; f < written_field_names.size(); ++f) {
             const auto& fname = written_field_names[f];
             const auto* src = sub.find_entry(fname);
@@ -6021,7 +6030,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
         if (!output_validity[f].has_value()) {
             continue;
         }
-        auto idx_it = output.index.find(written_field_names[f]);
+        const auto idx_it = output.index.find(written_field_names[f]);
         if (idx_it != output.index.end()) {
             output.columns[idx_it->second].validity = std::move(output_validity[f]);
         }

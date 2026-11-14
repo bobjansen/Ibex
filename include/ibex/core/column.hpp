@@ -807,7 +807,7 @@ class Column {
             const auto* first = source.compact_int32_data();
             const auto count = source.size();
             if (!is_compact_int32()) {
-                auto meta = meta_;
+                const auto meta = meta_;
                 *this = from_compact_int32({});
                 meta_ = meta;
             }
@@ -1210,7 +1210,7 @@ class Column<Categorical> {
     void push_back(value_type value) {
         detach_dictionary();
         detach_codes();
-        auto code = find_or_insert(value);
+        const auto code = find_or_insert(value);
         codes_.push_back(code);
     }
 
@@ -1267,7 +1267,7 @@ class Column<Categorical> {
 
     [[nodiscard]] auto find_code(value_type value) const -> std::optional<code_type> {
         ensure_index();
-        auto it = index_->find(value);
+        const auto it = index_->find(value);
         if (it == index_->end()) {
             return std::nullopt;
         }
@@ -1286,11 +1286,11 @@ class Column<Categorical> {
 
     auto find_or_insert(value_type value) -> code_type {
         ensure_index();
-        auto it = index_->find(value);
+        const auto it = index_->find(value);
         if (it != index_->end()) {
             return it->second;
         }
-        auto code = static_cast<code_type>(dict_->size());
+        const auto code = static_cast<code_type>(dict_->size());
         dict_->emplace_back(value);
         index_->emplace(dict_->back(), code);
         return code;
@@ -1464,7 +1464,7 @@ class Column<std::string> {
 
     // Initializer list (used in REPL, tests); const char* → string_view is implicit.
     Column(std::initializer_list<std::string_view> init) : Column() {
-        for (auto sv : init)
+        for (const auto sv : init)
             push_back(sv);
     }
 

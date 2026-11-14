@@ -80,7 +80,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                           const std::vector<ir::ColumnRef>& group_by, const ExecutionContext& exec)
     -> std::expected<ComputedColumn, std::string> {
     const std::size_t rows = input.rows();
-    auto order_keys = ordering_keys_for_table(input, rank.order_keys);
+    const auto order_keys = ordering_keys_for_table(input, rank.order_keys);
     if (order_keys.empty()) {
         return std::unexpected("rank(): expected at least one order key");
     }
@@ -140,7 +140,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                 if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
                     fc.kind = FlatKind::I64;
                     fc.u64.reserve(rows);
-                    for (auto v : col)
+                    for (const auto v : col)
                         fc.u64.push_back(static_cast<std::uint64_t>(v) ^ kSignFlip);
                 } else if constexpr (std::is_same_v<ColT, Column<double>>) {
                     fc.kind = FlatKind::F64;
@@ -181,7 +181,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     // — built only to be thrown away. Only the comparison-sort fallback and
     // the single-string-key group id loop actually read it.
     std::vector<FlatCol> group_flat;
-    auto ensure_group_flat = [&] {
+    const auto ensure_group_flat = [&] {
         if (!group_flat.empty() || group_entries.empty()) {
             return;
         }
@@ -204,8 +204,8 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     auto flat_cmp = [](const FlatCol& fc, std::size_t lhs, std::size_t rhs) -> int {
         switch (fc.kind) {
             case FlatKind::I64: {
-                auto l = fc.u64[lhs];
-                auto r = fc.u64[rhs];
+                const auto l = fc.u64[lhs];
+                const auto r = fc.u64[rhs];
                 return (l > r) - (l < r);
             }
             case FlatKind::F64:
@@ -224,7 +224,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                                    [&](const FlatCol& fc) { return flat_is_null(fc, row); });
     };
 
-    auto same_group = [&](std::size_t lhs, std::size_t rhs) -> bool {
+    const auto same_group = [&](std::size_t lhs, std::size_t rhs) -> bool {
         return std::ranges::all_of(group_flat, [&](const FlatCol& fc) {
             const bool ln = flat_is_null(fc, lhs);
             const bool rn = flat_is_null(fc, rhs);
@@ -662,7 +662,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                 }
                 if (rank.method == ir::RankMethod::First) {
                     for (std::size_t k = i; k < tie_end; ++k) {
-                        auto value = static_cast<double>(ordinal + (k - i));
+                        const auto value = static_cast<double>(ordinal + (k - i));
                         rank_values[idx[k]] =
                             rank.pct ? value / static_cast<double>(group_end - pos) : value;
                     }

@@ -65,7 +65,7 @@ void radix_sort_by_key_serial(std::vector<std::uint64_t> src_keys, std::vector<I
     // Build all 8 byte-histograms in one sequential scan.
     std::array<std::array<std::size_t, 256>, 8> hists{};
     for (std::size_t i = 0; i < rows; ++i) {
-        auto k = src_keys[i];
+        const auto k = src_keys[i];
         for (std::size_t p = 0; p < 8; ++p)
             ++hists[p][(k >> (p * 8U)) & 0xFFU];
     }
@@ -84,13 +84,13 @@ void radix_sort_by_key_serial(std::vector<std::uint64_t> src_keys, std::vector<I
         const auto& h = hists[pass];
         // Skip pass if all elements have the same byte value.
         std::size_t non_zero = 0;
-        for (auto c : h)
+        for (const auto c : h)
             if (c)
                 ++non_zero;
         if (non_zero <= 1)
             continue;
 
-        auto shift = pass * 8U;
+        const auto shift = pass * 8U;
         // Convert histogram to exclusive prefix-sum write positions.
         std::size_t total = 0;
         for (std::size_t b = 0; b < 256; ++b) {
@@ -651,7 +651,7 @@ auto gather_rows_parallel(const Table& input, const std::vector<Idx>& idx,
     std::visit(
         [&](const auto& col) {
             using ColT = std::decay_t<decltype(col)>;
-            auto scan = [&](auto get) {
+            const auto scan = [&](auto get) {
                 sorted = true;
                 for (std::size_t i = 1; i < rows; ++i) {
                     if (get(col, i) < get(col, i - 1)) {
@@ -835,7 +835,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                 if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
                     fk.kind = FlatKind::I64;
                     fk.u64.reserve(rows);
-                    for (auto v : col)
+                    for (const auto v : col)
                         fk.u64.push_back(static_cast<std::uint64_t>(v) ^ kSignFlip);
                 } else if constexpr (std::is_same_v<ColT, Column<double>>) {
                     fk.kind = FlatKind::F64;
@@ -999,7 +999,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                     total += counts[b];
                 }
             }
-            auto build = [&]<typename Idx>() -> SortIdx {
+            const auto build = [&]<typename Idx>() -> SortIdx {
                 std::vector<Idx> idx(rows);
                 for (std::size_t i = 0; i < rows; ++i) {
                     idx[position[static_cast<std::size_t>(keys[i] ^ kSignFlip)]++] =
@@ -1057,11 +1057,12 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     // so a high-cardinality reject is cheap) — the caller then prefers a
     // comparison sort, where the distinct-sort would cost as much as sorting all
     // rows anyway.
-    auto ordinal_encode = [rows](const std::vector<std::string_view>& vals,
-                                 std::size_t cap) -> std::optional<std::vector<std::uint64_t>> {
+    const auto ordinal_encode = [rows](
+                                    const std::vector<std::string_view>& vals,
+                                    std::size_t cap) -> std::optional<std::vector<std::uint64_t>> {
         robin_hood::unordered_map<std::string_view, std::uint64_t> code_of;
         std::vector<std::string_view> distinct;
-        for (auto sv : vals) {
+        for (const auto sv : vals) {
             if (code_of.emplace(sv, 0).second) {
                 distinct.push_back(sv);
                 if (distinct.size() > cap)
@@ -1077,19 +1078,19 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         return code;
     };
 
-    auto radix_gather =
+    const auto radix_gather =
         [&](std::vector<std::vector<std::uint64_t>>& codes) -> std::expected<Table, std::string> {
         if (rows <= std::numeric_limits<std::uint32_t>::max()) {
-            auto idx = lsd_multi_radix<std::uint32_t>(codes, rows, exec, sort_workers);
+            const auto idx = lsd_multi_radix<std::uint32_t>(codes, rows, exec, sort_workers);
             return gather_rows_parallel(input, idx, &resolved_keys, exec);
         }
-        auto idx = lsd_multi_radix<std::uint64_t>(codes, rows, exec, sort_workers);
+        const auto idx = lsd_multi_radix<std::uint64_t>(codes, rows, exec, sort_workers);
         return gather_rows_parallel(input, idx, &resolved_keys, exec);
     };
 
     // Invert order-preserving codes for a descending key so an ascending radix
     // yields descending order (equal codes stay equal → still stable).
-    auto apply_descending = [](std::vector<std::uint64_t>& code, bool ascending) {
+    const auto apply_descending = [](std::vector<std::uint64_t>& code, bool ascending) {
         if (!ascending)
             for (auto& c : code)
                 c = ~c;
@@ -1158,7 +1159,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     // General path: a lone high-cardinality string key — comparison-based sort.
     // pdqsort is unstable, but the comparator's `lhs < rhs` tiebreak makes the
     // order total (no real ties), so the result matches a stable sort.
-    auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
+    const auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
         for (const auto& fk : flat_keys) {
             // Null-ness outranks value and ignores `ascending`: a non-null always
             // precedes a null, so nulls land last on asc and desc alike.
@@ -1172,8 +1173,8 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             }
             switch (fk.kind) {
                 case FlatKind::I64: {
-                    auto l = fk.u64[lhs];
-                    auto r = fk.u64[rhs];
+                    const auto l = fk.u64[lhs];
+                    const auto r = fk.u64[rhs];
                     if (l != r)
                         return fk.ascending ? (l < r) : (l > r);
                     break;
@@ -1185,8 +1186,8 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                     break;
                 }
                 case FlatKind::Str: {
-                    auto l = fk.str[lhs];
-                    auto r = fk.str[rhs];
+                    const auto l = fk.str[lhs];
+                    const auto r = fk.str[rhs];
                     if (l != r)
                         return fk.ascending ? (l < r) : (l > r);
                     break;

@@ -165,7 +165,7 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                     continue;
                 }
 
-                auto ok = std::visit(
+                const auto ok = std::visit(
                     [&](const auto& c) -> bool {
                         using T = std::decay_t<decltype(c)>;
                         if constexpr (std::is_same_v<T, Column<double>>) {
@@ -236,7 +236,7 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                 message += name;
                 return std::unexpected(std::move(message));
             }
-            auto ok = std::visit(
+            const auto ok = std::visit(
                 [&](const auto& c) -> bool {
                     using T = std::decay_t<decltype(c)>;
                     if constexpr (std::is_same_v<T, Column<double>>) {
@@ -438,8 +438,8 @@ auto solve_spd(const std::vector<std::vector<double>>& a, const std::vector<doub
 
 auto compute_xtx_xty(const std::vector<std::vector<double>>& x, const std::vector<double>& y)
     -> std::pair<std::vector<std::vector<double>>, std::vector<double>> {
-    auto p = x.size();
-    auto n = y.size();
+    const auto p = x.size();
+    const auto n = y.size();
     std::vector<std::vector<double>> xtx(p, std::vector<double>(p, 0.0));
     std::vector<double> xty(p, 0.0);
     for (std::size_t a = 0; a < p; ++a) {
@@ -648,7 +648,7 @@ auto eval_model_param_scalar(const ir::Expr& expr, const ScalarRegistry* scalars
             message += '\'';
             return std::unexpected(std::move(message));
         }
-        auto it = scalars->find(ref->name);
+        const auto it = scalars->find(ref->name);
         if (it == scalars->end()) {
             std::string message = "unknown scalar binding '";
             message += ref->name;

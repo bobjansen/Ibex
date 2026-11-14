@@ -450,7 +450,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             right_rows < kMinParallelPredicateRows) {
             return 0;
         }
-        auto& pool = process_worker_pool();
+        const auto& pool = process_worker_pool();
         const std::size_t budget = exec_->compute_budget();
         std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
         workers = std::min(workers, std::max<std::size_t>(kSlotBudgetBytes / slots, 1));

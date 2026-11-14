@@ -552,7 +552,7 @@ class Parser {
                 if (!spec.has_value()) {
                     return false;
                 }
-                auto key = effect_dedup_key(*spec);
+                const auto key = effect_dedup_key(*spec);
                 if (!seen.insert(key).second) {
                     error_ = make_error(previous(), "duplicate effect annotation: " + key);
                     return false;
@@ -654,7 +654,7 @@ class Parser {
     }
 
     static auto effect_dedup_key(const EffectSpec& spec) -> std::string {
-        auto kind_name = [](EffectKind kind) -> std::string_view {
+        const auto kind_name = [](EffectKind kind) -> std::string_view {
             switch (kind) {
                 case EffectKind::IoRead:
                     return "io_read";
@@ -886,7 +886,7 @@ class Parser {
             // ambiguity to resolve.
             if (check(TokenKind::Identifier) && peek().lexeme == "nulls") {
                 advance();
-                auto parsed = parse_join_null_match();
+                const auto parsed = parse_join_null_match();
                 if (!parsed.has_value()) {
                     return nullptr;
                 }
@@ -924,7 +924,7 @@ class Parser {
             std::optional<MatchSelection> take;
             if (check(TokenKind::Identifier) && peek().lexeme == "take") {
                 advance();
-                auto parsed = parse_join_take();
+                const auto parsed = parse_join_take();
                 if (!parsed.has_value()) {
                     return nullptr;
                 }
@@ -1145,11 +1145,11 @@ class Parser {
             // constructor elements, RNG arguments, and so on — instead of
             // leaving a UnaryExpr those contexts reject.
             if (auto* lit = std::get_if<LiteralExpr>(&expr->node)) {
-                if (auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
                     lit->value = -*iv;
                     return expr;
                 }
-                if (auto* dv = std::get_if<double>(&lit->value)) {
+                if (const auto* dv = std::get_if<double>(&lit->value)) {
                     lit->value = -*dv;
                     return expr;
                 }
@@ -1605,7 +1605,7 @@ class Parser {
             }
             // Reuses the type-parameter parser, which expects the '(' it opens
             // with; here the value came first, so feed it the rest by hand.
-            auto read_int = [&](std::string_view what) -> std::optional<std::int64_t> {
+            const auto read_int = [&](std::string_view what) -> std::optional<std::int64_t> {
                 if (!check(TokenKind::IntLiteral)) {
                     error_ = make_error(peek(), "expected integer " + std::string(what) +
                                                     " in Decimal(x, precision, scale)");
@@ -1692,7 +1692,7 @@ class Parser {
             if (is_null_literal(*arg)) {
                 return make_typed_null(ScalarKind::String);
             }
-            auto empty_segment = [] {
+            const auto empty_segment = [] {
                 auto lit = std::make_unique<Expr>();
                 lit->node = LiteralExpr{.value = std::string{}};
                 return lit;
@@ -2811,7 +2811,7 @@ class Parser {
             }
             const Token& at = peek();
             advance();
-            auto name = parse_qualified_rest(std::string(previous().lexeme));
+            const auto name = parse_qualified_rest(std::string(previous().lexeme));
             error_ = make_error(at, "unknown type '" + name.value_or(std::string(at.lexeme)) +
                                         "' (a resource type declared with 'extern type' "
                                         "can appear only in function signatures)");
@@ -2893,7 +2893,7 @@ class Parser {
                      "expected '(' after 'Decimal' (Decimal(precision, scale))")) {
             return std::nullopt;
         }
-        auto read_int = [&](std::string_view what) -> std::optional<std::int64_t> {
+        const auto read_int = [&](std::string_view what) -> std::optional<std::int64_t> {
             if (!check(TokenKind::IntLiteral)) {
                 error_ = make_error(peek(), "expected integer " + std::string(what) +
                                                 " in Decimal(precision, scale)");
@@ -2931,7 +2931,7 @@ class Parser {
     auto parse_scalar_type() -> std::optional<ParsedScalarType> {
         decimal_type_error_ = false;
         if (match(TokenKind::KeywordDecimal)) {
-            auto params = parse_decimal_type_params();
+            const auto params = parse_decimal_type_params();
             if (!params.has_value()) {
                 decimal_type_error_ = true;
                 return std::nullopt;
@@ -3071,7 +3071,7 @@ class Parser {
 
     static auto parse_int(std::string_view text) -> std::optional<std::int64_t> {
         std::int64_t value = 0;
-        auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
         if (result.ec != std::errc()) {
             return std::nullopt;
         }
@@ -3188,7 +3188,7 @@ class Parser {
     auto build_interpolation(const std::string& content) -> ExprPtr {
         std::vector<ExprPtr> args;
         std::string literal;
-        auto flush_literal = [&]() {
+        const auto flush_literal = [&]() {
             auto lit = std::make_unique<Expr>();
             lit->node = LiteralExpr{.value = literal};
             args.push_back(std::move(lit));
@@ -3245,9 +3245,9 @@ class Parser {
         if (text.size() != 10 || text[4] != '-' || text[7] != '-') {
             return std::nullopt;
         }
-        auto parse_int = [](std::string_view part) -> std::optional<int> {
+        const auto parse_int = [](std::string_view part) -> std::optional<int> {
             int value = 0;
-            auto result = std::from_chars(part.data(), part.data() + part.size(), value);
+            const auto result = std::from_chars(part.data(), part.data() + part.size(), value);
             if (result.ec != std::errc()) {
                 return std::nullopt;
             }
@@ -3267,7 +3267,7 @@ class Parser {
             return std::nullopt;
         }
         const sys_days days_since = sys_days{ymd};
-        auto days = days_since.time_since_epoch().count();
+        const auto days = days_since.time_since_epoch().count();
         if (days < std::numeric_limits<std::int32_t>::min() ||
             days > std::numeric_limits<std::int32_t>::max()) {
             return std::nullopt;
@@ -3280,9 +3280,9 @@ class Parser {
             (text[10] != 'T' && text[10] != ' ') || text[13] != ':' || text[16] != ':') {
             return std::nullopt;
         }
-        auto parse_int = [](std::string_view part) -> std::optional<int> {
+        const auto parse_int = [](std::string_view part) -> std::optional<int> {
             int value = 0;
-            auto result = std::from_chars(part.data(), part.data() + part.size(), value);
+            const auto result = std::from_chars(part.data(), part.data() + part.size(), value);
             if (result.ec != std::errc()) {
                 return std::nullopt;
             }
@@ -3313,7 +3313,7 @@ class Parser {
                 return std::nullopt;
             }
             std::int64_t frac = 0;
-            auto result = std::from_chars(text.data() + start, text.data() + pos, frac);
+            const auto result = std::from_chars(text.data() + start, text.data() + pos, frac);
             if (result.ec != std::errc()) {
                 return std::nullopt;
             }
@@ -3346,7 +3346,8 @@ class Parser {
              kNanosPerSecond) +
             nanos;
 
-        auto checked_mul = [](std::int64_t lhs, std::int64_t rhs) -> std::optional<std::int64_t> {
+        const auto checked_mul = [](std::int64_t lhs,
+                                    std::int64_t rhs) -> std::optional<std::int64_t> {
             if (lhs == 0 || rhs == 0) {
                 return std::int64_t{0};
             }
@@ -3367,7 +3368,8 @@ class Parser {
             }
             return lhs * rhs;
         };
-        auto checked_add = [](std::int64_t lhs, std::int64_t rhs) -> std::optional<std::int64_t> {
+        const auto checked_add = [](std::int64_t lhs,
+                                    std::int64_t rhs) -> std::optional<std::int64_t> {
             if (rhs > 0 && lhs > std::numeric_limits<std::int64_t>::max() - rhs) {
                 return std::nullopt;
             }

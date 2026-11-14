@@ -293,8 +293,8 @@ auto implied_side_predicate(const Expr& expr, Destination side, const SchemaInfo
 /// Rewrite one `Filter(pred, Join(a, b))` root. Children are assumed already
 /// processed. Returns the (possibly unchanged) root.
 auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> NodePtr {
-    auto& filter = node_cast<FilterNode>(*node);
-    auto& join = node_cast<JoinNode>(*node->mutable_children().front());
+    const auto& filter = node_cast<FilterNode>(*node);
+    const auto& join = node_cast<JoinNode>(*node->mutable_children().front());
     const JoinKind kind = join.kind();
     // Filtering candidates before match selection can select a different
     // right row instead of discarding the already-selected result. Filtering
@@ -391,7 +391,7 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
     NodePtr right_child = std::move(join_owned->mutable_children()[1]);
     join_owned->mutable_children().clear();
 
-    auto wrap = [&sources](NodePtr child, std::vector<Expr> parts) -> NodePtr {
+    const auto wrap = [&sources](NodePtr child, std::vector<Expr> parts) -> NodePtr {
         if (parts.empty()) {
             return child;
         }

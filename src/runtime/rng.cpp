@@ -29,7 +29,7 @@ std::uint64_t entropy_seed() noexcept {
     } catch (...) {
         auto t =
             static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-        auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        const auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
         // Mix so two threads seeding within the same clock tick still diverge.
         return t ^ (static_cast<std::uint64_t>(tid) * 0x9E3779B97F4A7C15ULL);
     }
@@ -40,7 +40,7 @@ std::uint64_t entropy_seed() noexcept {
 auto derive_rng_seed(std::uint64_t master_seed, std::uint64_t stream_id) noexcept -> std::uint64_t {
     // SplitMix64 finalizer. Mixing the stream ID separately avoids correlated
     // low-numbered worker seeds while keeping assignment fully deterministic.
-    auto mix = [](std::uint64_t value) noexcept {
+    const auto mix = [](std::uint64_t value) noexcept {
         value ^= value >> 30;
         value *= 0xBF58476D1CE4E5B9ULL;
         value ^= value >> 27;

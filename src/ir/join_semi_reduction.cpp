@@ -204,7 +204,7 @@ auto expression_reads_right_output(const Expr& expr, const std::vector<JoinOutpu
 auto rewrite_left_null_filter_to_anti(NodePtr node, const SourceSchemas& sources,
                                       const std::map<const Node*, ColumnDemand>& filter_demand)
     -> NodePtr {
-    auto& filter = node_cast<FilterNode>(*node);
+    const auto& filter = node_cast<FilterNode>(*node);
     auto& join = node_cast<JoinNode>(*node->mutable_children().front());
     if (!default_existence_join(join)) {
         return node;

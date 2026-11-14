@@ -53,7 +53,7 @@ auto intern_zone(std::string_view name) -> ZoneId {
     auto& t = table();
     const std::scoped_lock lock(t.mutex);
     std::string key(name);
-    if (auto it = t.ids.find(key); it != t.ids.end()) {
+    if (const auto it = t.ids.find(key); it != t.ids.end()) {
         return it->second;
     }
     if (t.names.size() >= std::size_t{1} << 16U) {

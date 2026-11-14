@@ -972,7 +972,7 @@ auto write_string_case(const Chunk& input, const ir::FieldSpec& field, const Dir
     literals.reserve(plan.values.size());
     for (const auto& value : plan.values) {
         if (value.literal != nullptr) {
-            auto literal = direct_literal_value<std::string_view>(*value.literal);
+            const auto literal = direct_literal_value<std::string_view>(*value.literal);
             if (!literal.has_value()) {
                 return std::nullopt;
             }
@@ -1044,7 +1044,7 @@ auto write_categorical_case(const Chunk& input, const ir::FieldSpec& field,
     literals.reserve(plan.values.size());
     for (const auto& value : plan.values) {
         if (value.literal != nullptr) {
-            auto literal = direct_literal_value<std::string_view>(*value.literal);
+            const auto literal = direct_literal_value<std::string_view>(*value.literal);
             if (!literal.has_value()) {
                 return std::nullopt;
             }
@@ -2627,7 +2627,7 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
             const double* p = std::get<Column<double>>(*operand.column).data() + begin;
             return body([p](std::size_t i) { return p[i]; });
         };
-        auto write = [&](auto op) {
+        const auto write = [&](auto op) {
             if (!left.is_column && !right.is_column) {
                 std::fill_n(output.doubles, rows,
                             op(numeric_double_value(left), numeric_double_value(right)));
@@ -2668,7 +2668,7 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
                             : nullptr;
         const std::int64_t ls = left.is_column ? 0 : numeric_int_value(left);
         const std::int64_t rs = right.is_column ? 0 : numeric_int_value(right);
-        auto write = [&](auto op) {
+        const auto write = [&](auto op) {
             // Locals, not captures: write is not inlined, and an int64_t store may
             // alias the closure's size_t/int64_t fields, so a captured trip count
             // or scalar is reloaded every row and the loop never vectorizes.

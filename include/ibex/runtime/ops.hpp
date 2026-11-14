@@ -126,7 +126,8 @@ struct ScalarArg {
 /// which reads them from `IBEX_ARGS` (one entry per line) — the compiled
 /// equivalent of `ibex script.ibex -- <args>`. A no-op when `argc <= 1`, so an
 /// `IBEX_ARGS` already in the environment still applies to an argument-less run.
-void forward_cli_args(int argc, char** argv);
+// `main`'s own argv type, so generated code passes it unchanged.
+void forward_cli_args(int argc, char** argv);  // NOLINT(misc-const-correctness)
 
 // ─── Core table operations ────────────────────────────────────────────────────
 //  These are the functions emitted by ibex_compile into the generated C++ file.

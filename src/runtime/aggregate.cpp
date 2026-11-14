@@ -315,7 +315,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     auto make_state = [&] -> AggState {
         AggState state;
         state.slots.reserve(aggregations.size());
-        for (auto& i : plan) {
+        for (const auto& i : plan) {
             AggSlot slot;
             slot.func = i.func;
             slot.kind = i.kind;
@@ -327,7 +327,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     // Set once the aggregates are known: std() is folded by the moment pass
     // after grouping rather than per row here.
     bool moment_after_grouping = false;
-    auto update_state = [&](AggSlot* slots, std::size_t row) -> std::optional<std::string> {
+    const auto update_state = [&](AggSlot* slots, std::size_t row) -> std::optional<std::string> {
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto& agg = aggregations[i];
             AggSlot& slot = slots[i];
@@ -550,7 +550,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         return std::nullopt;
     };
 
-    auto update_state_numeric = [&](AggSlot* slots, std::size_t row) -> std::optional<std::string> {
+    const auto update_state_numeric = [&](AggSlot* slots,
+                                          std::size_t row) -> std::optional<std::string> {
         for (std::size_t i = 0; i < plan.size(); ++i) {
             const auto& item = plan[i];
             AggSlot& slot = slots[i];
@@ -669,7 +670,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         return std::nullopt;
     };
 
-    auto build_output = [&] -> std::expected<Table, std::string> {
+    const auto build_output = [&] -> std::expected<Table, std::string> {
         Table output;
         for (std::size_t i = 0; i < group_by.size(); ++i) {
             const auto* column = input.find(group_by[i].name);
@@ -737,7 +738,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     // Non-const slots: Median/Quantile select in place (std::nth_element) on
     // slot.values rather than copying + fully sorting it. Every caller passes a
     // mutable, about-to-be-discarded slot array, so the in-place reorder is safe.
-    auto append_agg_values_flat = [&](Table& output, AggSlot* slots) -> std::optional<std::string> {
+    const auto append_agg_values_flat = [&](Table& output,
+                                            AggSlot* slots) -> std::optional<std::string> {
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto& agg = aggregations[i];
             auto* column = output.find(agg.alias);
@@ -819,7 +821,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         return std::nullopt;
     };
 
-    auto agg_result_is_valid = [&](std::size_t agg_index, const AggSlot& slot) -> bool {
+    const auto agg_result_is_valid = [&](std::size_t agg_index, const AggSlot& slot) -> bool {
         const auto func = aggregations[agg_index].func;
         switch (func) {
             case ir::AggFunc::Mean:
@@ -859,8 +861,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
     std::size_t rows = input.rows();
 
-    auto run_flat_pass2 = [&](const std::uint32_t* gids, std::uint32_t n_groups, AggSlot* fs,
-                              std::size_t n_aggs_flat) -> void {
+    const auto run_flat_pass2 = [&](const std::uint32_t* gids, std::uint32_t n_groups, AggSlot* fs,
+                                    std::size_t n_aggs_flat) -> void {
         for (std::size_t agg_i = 0; agg_i < plan.size(); ++agg_i) {
             const auto& item = plan[agg_i];
             const auto slot_for = [&](std::uint32_t g) -> AggSlot& {
@@ -1676,7 +1678,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 // register: without one, the reduce below skips moving NaNs
                 // aside, a whole extra pass over every group's values.
                 bool any_nan = false;
-                auto scatter = [&](const auto* data) {
+                const auto scatter = [&](const auto* data) {
                     using V = std::remove_cvref_t<decltype(*data)>;
                     if (parallel_collect) {
                         std::vector<char> range_nan(range_workers, 0);
@@ -1903,7 +1905,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (!has_null) {
                 continue;
             }
-            auto out_it = output->index.find(aggregations[i].alias);
+            const auto out_it = output->index.find(aggregations[i].alias);
             if (out_it == output->index.end()) {
                 return std::unexpected("missing aggregate column in output");
             }
@@ -1921,7 +1923,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             for (const Key& key : group_order) {
                 valid.push_back(!key.is_null(ci));
             }
-            auto out_it = output->index.find(group_by[ci].name);
+            const auto out_it = output->index.find(group_by[ci].name);
             if (out_it == output->index.end()) {
                 return std::unexpected("missing group-by column in output");
             }
@@ -1958,7 +1960,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 Column<Categorical>::code_type prev_key = -1;
                 std::uint32_t prev_gid = no_gid;
                 for (std::size_t row = 0; row < rows; ++row) {
-                    auto key = codes[row];
+                    const auto key = codes[row];
                     std::uint32_t gid{};
                     if (key == prev_key) {
                         gid = prev_gid;
@@ -1995,7 +1997,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 out_col != nullptr && std::holds_alternative<Column<Categorical>>(*out_col)) {
                 auto& out_cat = std::get<Column<Categorical>>(*out_col);
                 out_cat.reserve(order.size());
-                for (auto code : order) {
+                for (const auto code : order) {
                     out_cat.push_code(code);
                 }
             } else {
@@ -2026,8 +2028,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             std::vector<AggSlot> flat_slots_cat;
             flat_slots_cat.reserve(rows * (n_aggs_cat == 0 ? 1 : n_aggs_cat));
             for (std::size_t row = 0; row < rows; ++row) {
-                auto key = col.code_at(row);
-                auto it = index.find(key);
+                const auto key = col.code_at(row);
+                const auto it = index.find(key);
                 std::size_t slot_index = 0;
                 if (it == index.end()) {
                     slot_index = order.size();
@@ -2074,7 +2076,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             flat_slots_i64.reserve(rows * (n_aggs_i64 == 0 ? 1 : n_aggs_i64));
             for (std::size_t row = 0; row < rows; ++row) {
                 const std::int64_t key = col[row];
-                auto it = index.find(key);
+                const auto it = index.find(key);
                 std::size_t slot_index = 0;
                 if (it == index.end()) {
                     slot_index = order.size();
@@ -2120,7 +2122,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             flat_slots_dbl.reserve(rows * (n_aggs_dbl == 0 ? 1 : n_aggs_dbl));
             for (std::size_t row = 0; row < rows; ++row) {
                 const double key = col[row];
-                auto it = index.find(key);
+                const auto it = index.find(key);
                 std::size_t slot_index = 0;
                 if (it == index.end()) {
                     slot_index = order.size();
@@ -2204,7 +2206,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     if (have_prev && key == prev_key) {
                         gid = prev_gid;
                     } else {
-                        auto result = key_to_gid.emplace(key, n_groups);
+                        const auto result = key_to_gid.emplace(key, n_groups);
                         if (result.second) {
                             gid = n_groups++;
                             dict_chars.insert(dict_chars.end(), key.begin(), key.end());
@@ -2373,7 +2375,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         if (have_prev && key == prev_key) {
                             code = prev_code;
                         } else {
-                            auto it = map.find(key);
+                            const auto it = map.find(key);
                             if (it == map.end()) {
                                 code = cc.n_distinct++;
                                 map.emplace(key, code);
@@ -2417,7 +2419,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             continue;
                         }
                         const T key = col[row];
-                        auto it = map.find(key);
+                        const auto it = map.find(key);
                         std::uint32_t code{};
                         if (it == map.end()) {
                             code = cc.n_distinct++;
@@ -2497,7 +2499,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 all_cat = false;
         }
 
-        auto code_at_fast = [&](std::size_t ci, std::size_t row) -> std::uint32_t {
+        const auto code_at_fast = [&](std::size_t ci, std::size_t row) -> std::uint32_t {
             return kacc[ci].cat_raw != nullptr ? static_cast<std::uint32_t>(kacc[ci].cat_raw[row])
                                                : kacc[ci].nonsparse_codes[row];
         };
@@ -2646,7 +2648,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                       ? Column<Categorical>::code_type{0}
                                       : static_cast<Column<Categorical>::code_type>(gc[ci]));
             } else if (per_col[ci].is_str) {
-                auto sv = is_null_group ? std::string_view{} : per_col[ci].str_val_at(gc[ci]);
+                const auto sv = is_null_group ? std::string_view{} : per_col[ci].str_val_at(gc[ci]);
                 if (auto* str_col = std::get_if<Column<std::string>>(column)) {
                     str_col->push_back(sv);
                 } else {
@@ -2665,7 +2667,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         if (per_col[ci].null_code == kNoNullCode) {
             continue;
         }
-        if (auto pos = output->index.find(group_by[ci].name); pos != output->index.end()) {
+        if (const auto pos = output->index.find(group_by[ci].name); pos != output->index.end()) {
             output->columns[pos->second].validity = std::move(key_validity[ci]);
         }
     }
@@ -2966,7 +2968,7 @@ auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const Scala
                 return std::visit([](const auto& v) -> ScalarValue { return v; }, node.value);
             } else if constexpr (std::is_same_v<T, ir::ColumnRef>) {
                 if (scalars != nullptr) {
-                    auto it = scalars->find(node.name);
+                    const auto it = scalars->find(node.name);
                     if (it != scalars->end()) {
                         return it->second;
                     }
@@ -3138,7 +3140,7 @@ auto broadcast_aggregate_column(const Table& input, const ir::FieldSpec& field,
                 return std::unexpected("grouped update aggregate produced invalid result: " +
                                        field.alias);
             }
-            auto scalar = scalar_from_column(*entry->column, 0);
+            const auto scalar = scalar_from_column(*entry->column, 0);
             BroadcastAggregateColumn result{
                 .column = broadcast_scalar_column(scalar, input.rows()),
                 .validity = std::nullopt,

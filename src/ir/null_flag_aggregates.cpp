@@ -74,7 +74,7 @@ void substitute_zeros(Expr& expr, const std::set<std::string>& zeros) {
             substitute_zeros(*ptr, zeros);
         }
     };
-    if (auto* ref = std::get_if<ColumnRef>(&expr.node)) {
+    if (const auto* ref = std::get_if<ColumnRef>(&expr.node)) {
         if (!ref->lexical && zeros.contains(ref->name)) {
             expr.node = Literal{.value = std::int64_t{0}};
         }

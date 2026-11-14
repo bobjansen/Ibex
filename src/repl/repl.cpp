@@ -583,8 +583,8 @@ auto bind_call_arguments(const std::string& callee, parser::CallExpr& call,
         bound[i].expr = call.args[i].get();
     }
 
-    for (auto& named_arg : call.named_args) {
-        auto it = param_index.find(named_arg.name);
+    for (const auto& named_arg : call.named_args) {
+        const auto it = param_index.find(named_arg.name);
         if (it == param_index.end()) {
             return std::unexpected(callee + ": unknown named argument '" + named_arg.name + "'");
         }
@@ -747,10 +747,10 @@ auto command_exec() -> runtime::ExecutionContext {
 auto resolve_table(const std::string& name, const runtime::TableRegistry& tables,
                    const LazyTableRegistry& lazy_tables)
     -> std::expected<runtime::Table, std::string> {
-    if (auto it = tables.find(name); it != tables.end()) {
+    if (const auto it = tables.find(name); it != tables.end()) {
         return it->second;
     }
-    if (auto it = lazy_tables.find(name); it != lazy_tables.end()) {
+    if (const auto it = lazy_tables.find(name); it != lazy_tables.end()) {
         return it->second->materialize(command_exec());
     }
     return std::unexpected("unknown table '" + name + "'");
@@ -922,7 +922,7 @@ void print_scalars(const runtime::ScalarRegistry& scalars) {
 }
 
 auto type_to_string(const parser::Type& type) -> std::string {
-    auto schema_to_string = [](const parser::SchemaType& schema) {
+    const auto schema_to_string = [](const parser::SchemaType& schema) {
         if (schema.fields.empty()) {
             return std::string{};
         }
@@ -1956,14 +1956,14 @@ void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& exte
 }
 
 void print_doc_text(const DeclarationDocRegistry& declaration_docs, const std::string& key) {
-    auto doc_it = declaration_docs.find(key);
+    const auto doc_it = declaration_docs.find(key);
     if (doc_it == declaration_docs.end() || doc_it->second.empty()) {
         return;
     }
     ibex::formatting::print("doc:\n");
     std::string_view text = doc_it->second;
     while (!text.empty()) {
-        auto newline = text.find('\n');
+        const auto newline = text.find('\n');
         auto line = newline == std::string_view::npos ? text : text.substr(0, newline);
         ibex::formatting::print("  {}\n", line);
         if (newline == std::string_view::npos) {
@@ -1983,28 +1983,28 @@ void print_doc(std::string_view name, const runtime::TableRegistry& tables,
         return;
     }
     const std::string key{name};
-    if (auto it = tables.find(key); it != tables.end()) {
+    if (const auto it = tables.find(key); it != tables.end()) {
         ibex::formatting::print("table {}\n", key);
         print_schema(it->second);
         ibex::formatting::print("rows: {}\n", it->second.rows());
         return;
     }
-    if (auto it = lazy_tables.find(key); it != lazy_tables.end()) {
+    if (const auto it = lazy_tables.find(key); it != lazy_tables.end()) {
         ibex::formatting::print("table {}\n", key);
         print_schema(it->second->schema());
         ibex::formatting::print("rows: {}\n", it->second->rows());
         return;
     }
-    if (auto it = scalars.find(key); it != scalars.end()) {
+    if (const auto it = scalars.find(key); it != scalars.end()) {
         ibex::formatting::print("scalar {}: {} = {}\n", key, scalar_value_type_name(it->second),
                                 format_scalar(it->second));
         return;
     }
-    if (auto it = columns.find(key); it != columns.end()) {
+    if (const auto it = columns.find(key); it != columns.end()) {
         ibex::formatting::print("column {}: {}\n", key, column_type_name(it->second));
         return;
     }
-    if (auto it = models.find(key); it != models.end()) {
+    if (const auto it = models.find(key); it != models.end()) {
         ibex::formatting::print("model {}\n", key);
         ibex::formatting::print("  method: {}\n", it->second.method);
         ibex::formatting::print("  observations: {}\n", it->second.n_obs);
@@ -2012,13 +2012,13 @@ void print_doc(std::string_view name, const runtime::TableRegistry& tables,
                                 runtime::format_float_mixed(it->second.r_squared));
         return;
     }
-    if (auto it = functions.find(key); it != functions.end()) {
+    if (const auto it = functions.find(key); it != functions.end()) {
         ibex::formatting::print("{}\n", function_signature(it->second));
         print_doc_text(declaration_docs, key);
         ibex::formatting::print("source: use :source {}\n", key);
         return;
     }
-    if (auto it = extern_decls.find(key); it != extern_decls.end()) {
+    if (const auto it = extern_decls.find(key); it != extern_decls.end()) {
         ibex::formatting::print("{}\n", extern_signature(it->second));
         print_doc_text(declaration_docs, key);
         if (!it->second.source_path.empty()) {
@@ -2048,12 +2048,12 @@ void print_source(std::string_view name, const FunctionRegistry& functions,
         return;
     }
     const std::string key{name};
-    auto fn_it = functions.find(key);
+    const auto fn_it = functions.find(key);
     if (fn_it == functions.end()) {
         ibex::formatting::print("error: unknown user function '{}'\n", name);
         return;
     }
-    auto source_it = sources.find(key);
+    const auto source_it = sources.find(key);
     if (source_it != sources.end() && !source_it->second.empty()) {
         ibex::formatting::print("{}\n", source_it->second);
         return;
@@ -2094,7 +2094,7 @@ auto format_bytes(std::size_t bytes) -> std::string {
     constexpr double kKiB = 1024.0;
     constexpr double kMiB = kKiB * 1024.0;
     constexpr double kGiB = kMiB * 1024.0;
-    auto b = static_cast<double>(bytes);
+    const auto b = static_cast<double>(bytes);
     if (b >= kGiB) {
         return ibex::formatting::format("{:.2f} GiB", b / kGiB);
     }
@@ -2172,7 +2172,7 @@ void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
         }
     }
 
-    auto print_sep = [&]() {
+    const auto print_sep = [&]() {
         ibex::formatting::print("+");
         for (std::size_t c = 0; c < col_count; ++c) {
             ibex::formatting::print("{:-<{}}+", "", widths[c] + 2);
@@ -2211,7 +2211,7 @@ bool starts_with_command(std::string_view text, std::string_view command) {
     if (text.size() == command.size()) {
         return true;
     }
-    auto next = static_cast<unsigned char>(text[command.size()]);
+    const auto next = static_cast<unsigned char>(text[command.size()]);
     return std::isspace(next) != 0;
 }
 
@@ -2222,7 +2222,7 @@ std::string parse_load_path(std::string_view text) {
     }
     if (view.front() == '"' || view.front() == '\'') {
         const char quote = view.front();
-        auto end = view.find(quote, 1);
+        const auto end = view.find(quote, 1);
         if (end != std::string_view::npos) {
             return std::string(view.substr(1, end - 1));
         }
@@ -2236,7 +2236,7 @@ std::size_t parse_optional_size(std::string_view text, std::size_t default_value
         return default_value;
     }
     std::size_t value = 0;
-    auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
     if (result.ec != std::errc()) {
         return default_value;
     }
@@ -2341,7 +2341,7 @@ auto lookup_model_binding(const parser::CallExpr& call, const ModelRegistry& mod
     if (ident == nullptr) {
         return std::unexpected(call.callee + ": argument must be a model binding name");
     }
-    auto it = models.find(ident->name);
+    const auto it = models.find(ident->name);
     if (it == models.end()) {
         return std::unexpected(call.callee + ": unknown model binding '" + ident->name + "'");
     }
@@ -2383,11 +2383,11 @@ auto eval_model_scalar_accessor(const parser::CallExpr& call, const ModelRegistr
 auto resource_functions(const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls)
     -> parser::ResourceFunctions {
     return {[&extern_decls](std::string_view name) -> const parser::ExternDecl* {
-                auto it = extern_decls.find(std::string(name));
+                const auto it = extern_decls.find(std::string(name));
                 return it == extern_decls.end() ? nullptr : &it->second;
             },
             [&functions](std::string_view name) -> const parser::FunctionDecl* {
-                auto it = functions.find(std::string(name));
+                const auto it = functions.find(std::string(name));
                 return it == functions.end() ? nullptr : &it->second;
             }};
 }
@@ -2548,7 +2548,7 @@ auto eval_model_predict(parser::CallExpr& call, runtime::TableRegistry& tables,
     if (ident == nullptr) {
         return std::unexpected(call.callee + ": first argument must be a model binding name");
     }
-    auto it = models.find(ident->name);
+    const auto it = models.find(ident->name);
     if (it == models.end()) {
         return std::unexpected(call.callee + ": unknown model binding '" + ident->name + "'");
     }
@@ -2649,10 +2649,10 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                                models, functions, compile_time_lists, extern_decls, externs);
     }
     if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
-        if (auto it = scalars.find(ident->name); it != scalars.end()) {
+        if (const auto it = scalars.find(ident->name); it != scalars.end()) {
             return EvalValue{it->second};
         }
-        if (auto it = columns.find(ident->name); it != columns.end()) {
+        if (const auto it = columns.find(ident->name); it != columns.end()) {
             return EvalValue{it->second};
         }
     }
@@ -2849,7 +2849,7 @@ auto eval_on_runtime(parser::Expr& expr, bool allow_series, runtime::TableRegist
                     error = value.error();
                     return false;
                 }
-                if (auto* column = std::get_if<runtime::ColumnValue>(&*value)) {
+                if (const auto* column = std::get_if<runtime::ColumnValue>(&*value)) {
                     if (!add_series(name, *column)) {
                         return false;
                     }
@@ -3107,7 +3107,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!value) {
                 return std::unexpected(value.error());
             }
-            if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
+            if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
                 return *scalar;
             }
             return std::unexpected("function returned table where scalar expected");
@@ -3154,7 +3154,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 if (!result) {
                     return std::unexpected(result.error());
                 }
-                if (auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
+                if (const auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
                     return *scalar;
                 }
                 return std::unexpected("extern function returned table: " + call->callee);
@@ -3174,7 +3174,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!result) {
                 return std::unexpected(result.error());
             }
-            if (auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
+            if (const auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
                 return *scalar;
             }
             return std::unexpected("extern function returned table: " + call->callee);
@@ -3187,7 +3187,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!value) {
                 return std::unexpected(value.error());
             }
-            if (auto* s = std::get_if<runtime::ScalarValue>(&value.value())) {
+            if (const auto* s = std::get_if<runtime::ScalarValue>(&value.value())) {
                 return *s;
             }
             return std::unexpected(call->callee +
@@ -3351,7 +3351,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
                      runtime::ModelResult* model_out)
     -> std::expected<runtime::Table, std::string> {
-    if (auto* table_expr = std::get_if<parser::TableExpr>(&expr.node);
+    if (const auto* table_expr = std::get_if<parser::TableExpr>(&expr.node);
         table_expr != nullptr && table_expr->row_count == nullptr) {
         runtime::Table out;
         for (const auto& col_def : table_expr->columns) {
@@ -3383,7 +3383,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                     const runtime::ColumnEntry* entry = nullptr;
                     if (table->columns.size() == 1) {
                         entry = &table->columns.front();
-                    } else if (auto it = table->index.find(col_def.name);
+                    } else if (const auto it = table->index.find(col_def.name);
                                it != table->index.end()) {
                         entry = &table->columns[it->second];
                     } else {
@@ -3413,7 +3413,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return out;
     }
 
-    auto eval_extern_table_call =
+    const auto eval_extern_table_call =
         [&](parser::CallExpr& call) -> std::expected<runtime::Table, std::string> {
         const auto& decl = extern_decls.at(call.callee);
         if (decl.return_type.kind == parser::Type::Kind::Scalar) {
@@ -3486,7 +3486,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 if (!std::holds_alternative<runtime::Table>(*value)) {
                     return std::unexpected("function returned scalar where table expected");
                 }
-                auto temp_name = make_temp_table_name();
+                const auto temp_name = make_temp_table_name();
                 tables.insert_or_assign(temp_name,
                                         std::get<runtime::Table>(std::move(value.value())));
                 block->base = std::make_unique<parser::Expr>(
@@ -3563,12 +3563,12 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (columns.contains(ident->name)) {
             return std::unexpected("expected table expression (name refers to column)");
         }
-        if (auto it = tables.find(ident->name); it != tables.end()) {
+        if (const auto it = tables.find(ident->name); it != tables.end()) {
             return it->second;
         }
         // A lazy binding named on its own — printed, passed to a function, written
         // out — is consumed whole, so there is nothing to push down. Force it.
-        if (auto it = lazy_tables.find(ident->name); it != lazy_tables.end()) {
+        if (const auto it = lazy_tables.find(ident->name); it != lazy_tables.end()) {
             return it->second->materialize(command_exec());
         }
         return std::unexpected("unknown table: " + ident->name +
@@ -3702,7 +3702,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         const ExternDeclRegistry& extern_decls,
                         const runtime::ExternRegistry& externs)
     -> std::expected<EvalValue, std::string> {
-    auto it = functions.find(call.callee);
+    const auto it = functions.find(call.callee);
     if (it == functions.end()) {
         return std::unexpected("unknown function: " + call.callee + " (available: " +
                                format_function_names(functions, extern_decls) + ")");
@@ -3756,7 +3756,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
     std::string last_error;
     std::string last_candidate;
     for (const auto& dir : search_paths) {
-        auto full_path = std::filesystem::path(dir) / filename;
+        const auto full_path = std::filesystem::path(dir) / filename;
 #ifdef __APPLE__
         if (const auto dylib_path = std::filesystem::path(dir) / dylib_filename;
             std::filesystem::exists(dylib_path)) {
@@ -3823,7 +3823,7 @@ auto find_library_source(const std::string& name, const std::vector<std::string>
     -> std::optional<std::string> {
     const std::string filename = name + ".ibex";
     for (const auto& dir : search_paths) {
-        auto full_path = std::filesystem::path(dir) / filename;
+        const auto full_path = std::filesystem::path(dir) / filename;
         std::ifstream in{full_path};
         if (!in) {
             continue;
@@ -3859,7 +3859,7 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
     if (fn == nullptr || !fn->lazy_table_func) {
         return std::nullopt;
     }
-    auto decl = extern_decls.find(call->callee);
+    const auto decl = extern_decls.find(call->callee);
     if (decl == extern_decls.end()) {
         return std::nullopt;
     }
@@ -3974,7 +3974,7 @@ auto rewrite_inline_sources(parser::Expr& expr, InlineSourceRewrites& rewrites,
                             const runtime::ExternRegistry& externs) -> std::optional<std::string> {
     // Rewrite the expression `slot` points at, if it is a bare call to a lazy
     // source; otherwise recurse into it.
-    auto visit_slot = [&](parser::ExprPtr& slot) -> std::optional<std::string> {
+    const auto visit_slot = [&](parser::ExprPtr& slot) -> std::optional<std::string> {
         if (!slot) {
             return std::nullopt;
         }
@@ -4169,7 +4169,7 @@ class ResourceCalls {
     auto run_statement(parser::Expr& value, const parser::LetStmt* let, bool tuple_let,
                        HoistedResourceCalls& hoisted) -> std::expected<Handled, std::string> {
         if (const auto* ident = std::get_if<parser::IdentifierExpr>(&value.node)) {
-            if (auto it = resources_->find(ident->name); it != resources_->end()) {
+            if (const auto it = resources_->find(ident->name); it != resources_->end()) {
                 if (tuple_let) {
                     return std::unexpected("'" + ident->name +
                                            "' is a resource and cannot be destructured");
@@ -4236,7 +4236,7 @@ class ResourceCalls {
     }
 
     auto call(parser::CallExpr& call) -> std::expected<ResourceCallValue, std::string> {
-        if (auto fn = functions_->find(call.callee); fn != functions_->end()) {
+        if (const auto fn = functions_->find(call.callee); fn != functions_->end()) {
             return run_function(call, fn->second, *tables_, *lazy_tables_, *scalars_, *columns_,
                                 *models_, *functions_, *compile_time_lists_, *extern_decls_,
                                 *externs_, this);
@@ -4341,7 +4341,7 @@ class ResourceCalls {
     /// position of `expr`, in source order, and replaces it with a temporary
     /// binding of its result. `expr` itself is the caller's to handle.
     auto hoist(parser::Expr& expr, HoistedResourceCalls& rewrites) -> std::optional<std::string> {
-        auto visit_slot = [&](parser::ExprPtr& slot) { return hoist_slot(slot, rewrites); };
+        const auto visit_slot = [&](parser::ExprPtr& slot) { return hoist_slot(slot, rewrites); };
         if (auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
             return visit_slot(block->base);
         }
@@ -4422,6 +4422,9 @@ class ResourceCalls {
     /// statement by statement (`parser::table_function_needs_statements`):
     /// one whose body reads a `let` out of a table with `scalar(...)`.
     [[nodiscard]] auto as_statement_table_call(parser::Expr& expr) const -> parser::CallExpr* {
+        // Returned as a mutable pointer below; misc-const-correctness misses
+        // that the conditional return needs a non-const pointee.
+        // NOLINTNEXTLINE(misc-const-correctness)
         auto* call = std::get_if<parser::CallExpr>(&expr.node);
         if (call == nullptr) {
             return nullptr;
@@ -4489,7 +4492,7 @@ class ResourceCalls {
                                          param.name, expected_type, what, actual));
         };
         if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
-            auto it = resources_->find(ident->name);
+            const auto it = resources_->find(ident->name);
             if (it == resources_->end()) {
                 if (auto err = outside_frame(ident->name)) {
                     return std::unexpected(std::move(*err));
@@ -4522,10 +4525,10 @@ class ResourceCalls {
 
    private:
     [[nodiscard]] auto returns_resource(const std::string& callee) const -> bool {
-        if (auto fn = functions_->find(callee); fn != functions_->end()) {
+        if (const auto fn = functions_->find(callee); fn != functions_->end()) {
             return fn->second.return_type.kind == parser::Type::Kind::Resource;
         }
-        auto decl = extern_decls_->find(callee);
+        const auto decl = extern_decls_->find(callee);
         return decl != extern_decls_->end() &&
                decl->second.return_type.kind == parser::Type::Kind::Resource;
     }
@@ -5080,7 +5083,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             // again is only allowed with the same signature, which is what
             // importing a library twice does.
             if (parser::is_qualified(fn.name)) {
-                if (auto it = functions.find(fn.name);
+                if (const auto it = functions.find(fn.name);
                     it != functions.end() &&
                     function_signature(it->second) != function_signature(fn)) {
                     ibex::formatting::print(
@@ -5126,7 +5129,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         }
         if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
             // Registered by the pre-pass; its body sees the `using`s in effect here.
-            if (auto it = functions.find(fn_names[stmt_index]); it != functions.end()) {
+            if (const auto it = functions.find(fn_names[stmt_index]); it != functions.end()) {
                 if (auto resolved = parser::resolve_names(it->second, using_scope, declared);
                     !resolved) {
                     ibex::formatting::print("error: {}\n", resolved.error());
@@ -5145,7 +5148,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             auto decl = std::get<parser::ExternDecl>(std::move(stmt));
             auto decl_name = decl.name;
             if (parser::is_qualified(decl_name)) {
-                if (auto it = extern_decls.find(decl_name);
+                if (const auto it = extern_decls.find(decl_name);
                     it != extern_decls.end() &&
                     extern_signature(it->second) != extern_signature(decl)) {
                     ibex::formatting::print(
@@ -5223,8 +5226,8 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                         parsed.error().format());
                 return false;
             }
-            auto import_comments = collect_script_comment_lines(*source);
-            auto import_doc_groups =
+            const auto import_comments = collect_script_comment_lines(*source);
+            const auto import_doc_groups =
                 build_statement_comment_groups(parsed->statements, import_comments);
             // Recursively execute the imported file's statements (which will typically
             // only contain extern fn and fn declarations).
@@ -5243,9 +5246,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         // table operand is replaced by its materialized result for the rest of
         // the statement (restored when `hoisted` goes out of scope).
         HoistedResourceCalls hoisted(&tables, &scalars, &columns);
-        auto* let_stmt_ptr = std::get_if<parser::LetStmt>(&stmt);
-        auto* tuple_let_ptr = std::get_if<parser::TupleLetStmt>(&stmt);
-        auto* expr_stmt_ptr = std::get_if<parser::ExprStmt>(&stmt);
+        const auto* let_stmt_ptr = std::get_if<parser::LetStmt>(&stmt);
+        const auto* tuple_let_ptr = std::get_if<parser::TupleLetStmt>(&stmt);
+        const auto* expr_stmt_ptr = std::get_if<parser::ExprStmt>(&stmt);
         parser::Expr* statement_value = let_stmt_ptr != nullptr    ? let_stmt_ptr->value.get()
                                         : tuple_let_ptr != nullptr ? tuple_let_ptr->value.get()
                                         : expr_stmt_ptr != nullptr ? expr_stmt_ptr->expr.get()
@@ -5263,7 +5266,8 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             }
             if (handled->done) {
                 if (handled->value.has_value()) {
-                    if (auto* resource = std::get_if<runtime::ResourcePtr>(&*handled->value)) {
+                    if (const auto* resource =
+                            std::get_if<runtime::ResourcePtr>(&*handled->value)) {
                         ibex::formatting::print("<{}>\n", (*resource)->type_name());
                     } else {
                         render_eval_value(std::get<EvalValue>(std::move(*handled->value)));
@@ -6109,11 +6113,11 @@ auto try_execute_whole_script(parser::Program& program, runtime::ExternRegistry&
         collect_decls(program);
         const parser::ResourceFunctions resource_calls(
             [&](std::string_view name) -> const parser::ExternDecl* {
-                auto it = extern_decls.find(std::string(name));
+                const auto it = extern_decls.find(std::string(name));
                 return it == extern_decls.end() ? nullptr : it->second;
             },
             [&](std::string_view name) -> const parser::FunctionDecl* {
-                auto it = fn_decls.find(std::string(name));
+                const auto it = fn_decls.find(std::string(name));
                 return it == fn_decls.end() ? nullptr : it->second;
             });
         for (const auto& stmt : program.statements) {
@@ -6465,7 +6469,7 @@ auto try_execute_whole_script(parser::Program& program, runtime::ExternRegistry&
 
 /// Lower one REPL expression exactly as the evaluator would, then render the
 /// physical planning capability without materializing a source or executing it.
-void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& tables,
+void print_physical_explain(const parser::Expr& expr, const runtime::TableRegistry& tables,
                             const LazyTableRegistry& lazy_tables,
                             const runtime::ScalarRegistry& scalars, const ColumnRegistry& columns,
                             const ModelRegistry& models, const FunctionRegistry& functions,
@@ -6540,8 +6544,8 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
     FunctionSourceRegistry function_sources;
     DeclarationDocRegistry declaration_docs;
     ImportRegistry imports;
-    auto comments = collect_script_comment_lines(source);
-    auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
+    const auto comments = collect_script_comment_lines(source);
+    const auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
     robin_hood::unordered_set<std::string> loaded_plugins;
     // Declared last so resources close before the bindings that may hold
     // their results.
@@ -6660,8 +6664,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     // Parse and execute one complete statement buffer (possibly spanning
     // several physical lines). Shared by the normal path and the multi-line
     // continuation path.
-    auto submit_buffer = [&](const std::string& buffer) {
-        auto normalized = normalize_input(buffer);
+    const auto submit_buffer = [&](const std::string& buffer) {
+        const auto normalized = normalize_input(buffer);
         auto parsed = parser::parse(normalized);
         if (!parsed) {
             ibex::formatting::print("error: {}\n", parsed.error().format());
@@ -6729,7 +6733,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         std::string_view line_view(line);
 
         if (starts_with_command(line_view, ":help")) {
-            auto arg = trim(line_view.substr(std::string_view(":help").size()));
+            const auto arg = trim(line_view.substr(std::string_view(":help").size()));
             if (arg.empty()) {
                 print_help();
             } else {
@@ -6739,13 +6743,13 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (line_view.size() > 1 && line_view.front() == '?') {
-            auto arg = trim(line_view.substr(1));
+            const auto arg = trim(line_view.substr(1));
             print_doc(arg, tables, lazy_tables, scalars, columns, models, functions, extern_decls,
                       declaration_docs, imports);
             continue;
         }
         if (starts_with_command(line_view, ":functions")) {
-            auto arg = trim(line_view.substr(std::string_view(":functions").size()));
+            const auto arg = trim(line_view.substr(std::string_view(":functions").size()));
             if (!arg.empty()) {
                 ibex::formatting::print("usage: :functions\n");
                 continue;
@@ -6754,7 +6758,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (starts_with_command(line_view, ":imports")) {
-            auto arg = trim(line_view.substr(std::string_view(":imports").size()));
+            const auto arg = trim(line_view.substr(std::string_view(":imports").size()));
             if (!arg.empty()) {
                 ibex::formatting::print("usage: :imports\n");
                 continue;
@@ -6763,18 +6767,18 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (starts_with_command(line_view, ":doc")) {
-            auto arg = trim(line_view.substr(std::string_view(":doc").size()));
+            const auto arg = trim(line_view.substr(std::string_view(":doc").size()));
             print_doc(arg, tables, lazy_tables, scalars, columns, models, functions, extern_decls,
                       declaration_docs, imports);
             continue;
         }
         if (starts_with_command(line_view, ":source")) {
-            auto arg = trim(line_view.substr(std::string_view(":source").size()));
+            const auto arg = trim(line_view.substr(std::string_view(":source").size()));
             print_source(arg, functions, function_sources);
             continue;
         }
         if (starts_with_command(line_view, ":timing")) {
-            auto arg = trim(line_view.substr(std::string_view(":timing").size()));
+            const auto arg = trim(line_view.substr(std::string_view(":timing").size()));
             if (arg.empty()) {
                 timing_enabled = !timing_enabled;
             } else if (arg == "on") {
@@ -6789,7 +6793,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (starts_with_command(line_view, ":comments")) {
-            auto arg = trim(line_view.substr(std::string_view(":comments").size()));
+            const auto arg = trim(line_view.substr(std::string_view(":comments").size()));
             if (arg.empty()) {
                 load_comments_enabled = !load_comments_enabled;
             } else if (arg == "on") {
@@ -6806,7 +6810,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
 
         bool one_shot_timing = false;
         if (starts_with_command(line_view, ":time")) {
-            auto timed_input = trim(line_view.substr(std::string_view(":time").size()));
+            const auto timed_input = trim(line_view.substr(std::string_view(":time").size()));
             if (timed_input.empty()) {
                 ibex::formatting::print("usage: :time <command>\n");
                 continue;
@@ -6821,7 +6825,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (should_time) {
             timing_start = std::chrono::steady_clock::now();
         }
-        auto report_timing = [&]() {
+        const auto report_timing = [&]() {
             if (timing_start.has_value()) {
                 print_elapsed(std::chrono::steady_clock::now() - *timing_start);
             }
@@ -6832,7 +6836,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             break;
         }
         if (starts_with_command(line_view, ":tables")) {
-            auto arg = trim(line_view.substr(std::string_view(":tables").size()));
+            const auto arg = trim(line_view.substr(std::string_view(":tables").size()));
             if (!arg.empty()) {
                 ibex::formatting::print("usage: :tables\n");
                 continue;
@@ -6841,7 +6845,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (starts_with_command(line_view, ":scalars")) {
-            auto arg = trim(line_view.substr(std::string_view(":scalars").size()));
+            const auto arg = trim(line_view.substr(std::string_view(":scalars").size()));
             if (!arg.empty()) {
                 ibex::formatting::print("usage: :scalars\n");
                 continue;
@@ -6855,12 +6859,12 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 ibex::formatting::print("usage: :schema <table>\n");
                 continue;
             }
-            if (auto lazy = lazy_tables.find(std::string(arg)); lazy != lazy_tables.end()) {
+            if (const auto lazy = lazy_tables.find(std::string(arg)); lazy != lazy_tables.end()) {
                 // Known from the source's metadata — no column is decoded to answer this.
                 print_schema(lazy->second->schema());
                 continue;
             }
-            auto it = tables.find(std::string(arg));
+            const auto it = tables.find(std::string(arg));
             if (it == tables.end()) {
                 ibex::formatting::print("error: unknown table '{}'\n", arg);
                 continue;
@@ -6869,8 +6873,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (line_view.starts_with(":head")) {
-            auto rest = trim(line_view.substr(std::string_view(":head").size()));
-            auto space = rest.find(' ');
+            const auto rest = trim(line_view.substr(std::string_view(":head").size()));
+            const auto space = rest.find(' ');
             std::string_view name = rest;
             std::string_view count_text;
             if (space != std::string_view::npos) {
@@ -6891,7 +6895,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (starts_with_command(line_view, ":explain")) {
-            auto source = trim(line_view.substr(std::string_view(":explain").size()));
+            const auto source = trim(line_view.substr(std::string_view(":explain").size()));
             if (source.empty()) {
                 ibex::formatting::print("usage: :explain <expr>\n");
                 continue;
@@ -6923,7 +6927,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         const bool is_peak = line_view.starts_with(":peak") &&
                              (line_view.size() == 5 || line_view[5] == ' ' || line_view[5] == '\t');
         if (is_peek || is_peak) {
-            auto rest = std::string(trim(line_view.substr(5)));
+            const auto rest = std::string(trim(line_view.substr(5)));
             if (rest.empty()) {
                 ibex::formatting::print("usage: :peek <expr>\n");
                 continue;
@@ -6937,7 +6941,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 peek_table(table.value());
                 continue;
             }
-            auto normalized = normalize_input(rest);
+            const auto normalized = normalize_input(rest);
             auto parsed = parser::parse(normalized);
             if (!parsed) {
                 ibex::formatting::print("error: {}\n", parsed.error().format());
@@ -6962,9 +6966,9 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 ibex::formatting::print("error: {}\n", value.error());
                 continue;
             }
-            if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
+            if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
                 ibex::formatting::print("{}\n", format_scalar(*scalar));
-            } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+            } else if (const auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                 runtime::Table temp;
                 temp.add_column("column", *col);
                 peek_table(temp);
@@ -6974,8 +6978,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (line_view.starts_with(":describe")) {
-            auto rest = trim(line_view.substr(std::string_view(":describe").size()));
-            auto space = rest.find(' ');
+            const auto rest = trim(line_view.substr(std::string_view(":describe").size()));
+            const auto space = rest.find(' ');
             std::string_view name = rest;
             std::string_view count_text;
             if (space != std::string_view::npos) {
@@ -7001,7 +7005,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             // scope of its own (no bindings leak into or out of the session).
             // With :timing on this prints ONE time line for the whole script,
             // which is what the benchmark harness's whole-script mode reads.
-            auto arg_view = trim(line_view.substr(std::string_view(":run").size()));
+            const auto arg_view = trim(line_view.substr(std::string_view(":run").size()));
             const std::string path = parse_load_path(arg_view);
             if (path.empty()) {
                 ibex::formatting::print("usage: :run <file>\n");
@@ -7014,7 +7018,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (line_view.starts_with(":load")) {
-            auto arg_view = trim(line_view.substr(std::string_view(":load").size()));
+            const auto arg_view = trim(line_view.substr(std::string_view(":load").size()));
             if (arg_view.empty()) {
                 ibex::formatting::print("usage: :load <file>\n");
                 report_timing();
@@ -7040,8 +7044,9 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 report_timing();
                 continue;
             }
-            auto comments = collect_script_comment_lines(source);
-            auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
+            const auto comments = collect_script_comment_lines(source);
+            const auto doc_comment_groups =
+                build_statement_comment_groups(parsed->statements, comments);
             std::vector<std::vector<std::string>> print_comment_groups;
             const std::vector<std::vector<std::string>>* print_comment_groups_ptr = nullptr;
             if (load_comments_enabled) {
@@ -7065,7 +7070,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         // of falling through to the parser — `:peak trades` would otherwise
         // surface as `error: 1:1: expected expression`.
         if (line_view.starts_with(':')) {
-            auto cmd_end = line_view.find_first_of(" \t");
+            const auto cmd_end = line_view.find_first_of(" \t");
             auto cmd = cmd_end == std::string_view::npos ? line_view : line_view.substr(0, cmd_end);
             ibex::formatting::print("error: unknown REPL command '{}'\n", cmd);
             ibex::formatting::print(
@@ -7294,14 +7299,15 @@ class CallBindings {
     /// A binding the call left alone is removed; one it replaced stays.
     void put_back() {
         for (const auto& [name, column] : bound_tables_) {
-            if (auto it = tables_->find(name);
+            if (const auto it = tables_->find(name);
                 it != tables_->end() && identity(it->second) == column) {
                 tables_->erase(it);
                 restore(name);
             }
         }
         for (const auto& [name, value] : bound_scalars_) {
-            if (auto it = scalars_->find(name); it != scalars_->end() && it->second == value) {
+            if (const auto it = scalars_->find(name);
+                it != scalars_->end() && it->second == value) {
                 scalars_->erase(it);
                 restore(name);
             }
@@ -7324,19 +7330,19 @@ class CallBindings {
 
     void shadow(const std::string& name) {
         Shadowed saved;
-        if (auto it = tables_->find(name); it != tables_->end()) {
+        if (const auto it = tables_->find(name); it != tables_->end()) {
             saved.table = std::move(it->second);
             tables_->erase(it);
         }
-        if (auto it = lazy_tables_->find(name); it != lazy_tables_->end()) {
+        if (const auto it = lazy_tables_->find(name); it != lazy_tables_->end()) {
             saved.lazy = std::move(it->second);
             lazy_tables_->erase(it);
         }
-        if (auto it = scalars_->find(name); it != scalars_->end()) {
+        if (const auto it = scalars_->find(name); it != scalars_->end()) {
             saved.scalar = std::move(it->second);
             scalars_->erase(it);
         }
-        if (auto it = columns_->find(name); it != columns_->end()) {
+        if (const auto it = columns_->find(name); it != columns_->end()) {
             saved.column = std::move(it->second);
             columns_->erase(it);
         }
@@ -7344,7 +7350,7 @@ class CallBindings {
     }
 
     void restore(const std::string& name) {
-        auto it = shadowed_.find(name);
+        const auto it = shadowed_.find(name);
         if (it == shadowed_.end()) {
             return;
         }
@@ -7476,10 +7482,10 @@ auto ReplSession::erase(std::string_view name) -> bool {
 auto ReplSession::table_binding(std::string_view name)
     -> std::expected<runtime::Table, std::string> {
     const std::string key(name);
-    if (auto it = impl_->tables.find(key); it != impl_->tables.end()) {
+    if (const auto it = impl_->tables.find(key); it != impl_->tables.end()) {
         return it->second;
     }
-    if (auto it = impl_->lazy_tables.find(key); it != impl_->lazy_tables.end()) {
+    if (const auto it = impl_->lazy_tables.find(key); it != impl_->lazy_tables.end()) {
         return it->second->materialize(command_exec());
     }
     return std::unexpected("session has no table binding named '" + key + "'");

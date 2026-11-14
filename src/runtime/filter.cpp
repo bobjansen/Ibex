@@ -942,7 +942,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
             }
         }
     }
-    auto cmp_string_views = [&](auto&& lcol, auto&& rcol) {
+    const auto cmp_string_views = [&](auto&& lcol, auto&& rcol) {
         switch (op) {
             case ir::CompareOp::Eq:
                 for (std::size_t i = 0; i < n; ++i)
@@ -976,7 +976,7 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
                 break;
         }
     };
-    auto return_with_validity = [&] -> Mask {
+    const auto return_with_validity = [&] -> Mask {
         auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
         result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
         return std::move(result);
@@ -1426,9 +1426,9 @@ template <bool UseAnd, typename L, typename LLit, typename R, typename RLit>
 
 auto dispatch_cmp_pair_ops(ir::CompareOp lop, ir::CompareOp rop, const L* lhs_data, LLit lhs_lit,
                            const R* rhs_data, RLit rhs_lit, uint8_t* out, std::size_t n) -> void {
-    auto dispatch_right = [&](auto left_op_tag) {
+    const auto dispatch_right = [&](auto left_op_tag) {
         constexpr ir::CompareOp LOp = decltype(left_op_tag)::value;
-        auto apply_right = [&](auto right_op_tag) {
+        const auto apply_right = [&](auto right_op_tag) {
             constexpr ir::CompareOp ROp = decltype(right_op_tag)::value;
             cmp_pair_mask<LOp, ROp, UseAnd>(lhs_data, lhs_lit, rhs_data, rhs_lit, out, n);
         };
@@ -1484,8 +1484,8 @@ template <bool UseAnd>
 auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
                                       const NumericCmpSpec& rhs_spec, uint8_t* out, std::size_t n)
     -> void {
-    auto run_rhs = [&](auto* lhs_data, auto lhs_lit) {
-        auto apply_rhs = [&](auto* rhs_data, auto rhs_lit) {
+    const auto run_rhs = [&](auto* lhs_data, auto lhs_lit) {
+        const auto apply_rhs = [&](auto* rhs_data, auto rhs_lit) {
             dispatch_cmp_pair_ops<UseAnd>(lhs_spec.op, rhs_spec.op, lhs_data, lhs_lit, rhs_data,
                                           rhs_lit, out, n);
         };
@@ -1602,7 +1602,7 @@ auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                     return r;
                 }
                 if (scalars != nullptr) {
-                    auto it = scalars->find(node.name);
+                    const auto it = scalars->find(node.name);
                     if (it != scalars->end()) {
                         // A null scalar broadcasts as an all-invalid column; a
                         // comparison against it is null for every row, so the
@@ -2395,7 +2395,7 @@ auto build_filter_output_layout(const Table& input, const std::vector<ir::Column
     layout.output.columns.reserve(project->size());
     layout.src_of_dst.reserve(project->size());
     for (const auto& col : *project) {
-        auto it = input.index.find(col.name);
+        const auto it = input.index.find(col.name);
         if (it == input.index.end()) {
             return std::unexpected("select column not found: " + col.name);
         }
@@ -2958,11 +2958,11 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
     const auto add_set_conjunct = [&](const ir::ColumnRef& col,
                                       const std::vector<std::string_view>& values,
                                       bool negated) -> bool {
-        auto index = input.index.find(col.name);
+        const auto index = input.index.find(col.name);
         if (index == input.index.end()) {
             return false;
         }
-        auto existing = set_of_column.find(col.name);
+        const auto existing = set_of_column.find(col.name);
         std::size_t at = 0;
         if (existing != set_of_column.end()) {
             at = existing->second;
@@ -3014,14 +3014,14 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
             continue;
         }
 
-        auto index = input.index.find(col->name);
+        const auto index = input.index.find(col->name);
         if (index == input.index.end()) {
             plan.leftover.push_back(conjunct);
             continue;
         }
         const auto& entry = input.columns[index->second];
 
-        auto existing = spec_of_column.find(col->name);
+        const auto existing = spec_of_column.find(col->name);
         BoundsSpec candidate;
         if (existing != spec_of_column.end()) {
             candidate = plan.specs[existing->second];
@@ -3369,7 +3369,7 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
     if (selected.empty()) {
         return selected;
     }
-    auto referenced_names = [&](const ir::Expr& conjunct) {
+    const auto referenced_names = [&](const ir::Expr& conjunct) {
         robin_hood::unordered_set<std::string> referenced;
         ir::collect_expr_column_refs(conjunct, referenced);
         std::vector<std::string> names;
@@ -3447,9 +3447,9 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
             return std::unexpected(mask.error());
         }
         const auto* valid = mask->valid ? mask->valid->data() : nullptr;
-        auto end = std::ranges::remove_if(selected, [&](std::size_t row) {
-                       return mask->value[row] == 0 || (valid != nullptr && valid[row] == 0);
-                   }).begin();
+        const auto end = std::ranges::remove_if(selected, [&](std::size_t row) {
+                             return mask->value[row] == 0 || (valid != nullptr && valid[row] == 0);
+                         }).begin();
         selected.erase(end, selected.end());
         if (selected.empty()) {
             break;
@@ -3481,7 +3481,7 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
     // Range conjuncts fuse into one blocked pass that yields the selection
     // directly; whatever doesn't fuse runs against that selection instead of
     // against every row.
-    auto plan = build_bounds_plan(input, conjuncts);
+    const auto plan = build_bounds_plan(input, conjuncts);
     if (!plan.specs.empty() || !plan.sets.empty()) {
         auto selected = select_bounds(plan.specs, plan.sets, exec, input.rows());
         return filter_selection_impl(input, plan.leftover, exec, scalars, std::move(selected));

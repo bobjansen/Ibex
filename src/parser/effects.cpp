@@ -188,11 +188,11 @@ class EffectAnalyzer {
             deps.insert(callee);
             return;
         }
-        if (auto it = externs_.find(callee); it != externs_.end()) {
+        if (const auto it = externs_.find(callee); it != externs_.end()) {
             merge_effect_summary(direct, it->second.effects);
             return;
         }
-        if (auto it = builtin_summaries().find(callee); it != builtin_summaries().end()) {
+        if (const auto it = builtin_summaries().find(callee); it != builtin_summaries().end()) {
             merge_effect_summary(direct, it->second.effects);
         }
     }
@@ -360,9 +360,9 @@ class EffectAnalyzer {
             for (const auto& [name, _] : user_functions_) {
                 (void)_;
                 EffectSummary next = direct_effects_[name];
-                if (auto dep_it = dep_graph_.find(name); dep_it != dep_graph_.end()) {
+                if (const auto dep_it = dep_graph_.find(name); dep_it != dep_graph_.end()) {
                     for (const auto& dep_name : dep_it->second) {
-                        if (auto inferred_dep = inferred_effects_.find(dep_name);
+                        if (const auto inferred_dep = inferred_effects_.find(dep_name);
                             inferred_dep != inferred_effects_.end()) {
                             merge_effect_summary(next, inferred_dep->second);
                         }
@@ -428,13 +428,13 @@ class EffectAnalyzer {
 }  // namespace
 
 auto EffectAnalysis::find_callee(std::string_view name) const -> const CallableSummary* {
-    if (auto it = user_functions.find(std::string(name)); it != user_functions.end()) {
+    if (const auto it = user_functions.find(std::string(name)); it != user_functions.end()) {
         return &it->second;
     }
-    if (auto it = externs.find(std::string(name)); it != externs.end()) {
+    if (const auto it = externs.find(std::string(name)); it != externs.end()) {
         return &it->second;
     }
-    if (auto it = builtins.find(std::string(name)); it != builtins.end()) {
+    if (const auto it = builtins.find(std::string(name)); it != builtins.end()) {
         return &it->second;
     }
     return nullptr;

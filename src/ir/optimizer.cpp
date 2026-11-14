@@ -176,7 +176,7 @@ auto make_default_pass_manager() -> PassManager {
 
 auto optimize_plan(NodePtr root, const OptimizationContext& context, OptimizationStats* stats)
     -> NodePtr {
-    auto manager = make_default_pass_manager();
+    const auto manager = make_default_pass_manager();
     return manager.run(std::move(root), context, stats);
 }
 

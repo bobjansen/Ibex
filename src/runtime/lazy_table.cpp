@@ -171,7 +171,7 @@ auto LazyTable::project_uncached(const std::set<std::string>& names, const Execu
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
-        for (auto& entry : decoded->columns) {
+        for (const auto& entry : decoded->columns) {
             out.add_column_from(entry.name, entry);
         }
     }
@@ -395,7 +395,7 @@ auto membership_ranges(const ExecutionContext& exec, std::size_t n) -> std::size
         return 1;
     }
     const std::size_t min_rows = std::max<std::size_t>(exec.parallel_min_rows, 1);
-    auto& pool = process_worker_pool();
+    const auto& pool = process_worker_pool();
     const std::size_t budget = exec.compute_budget();
     return std::min({std::clamp<std::size_t>(n / min_rows, 1, kMaxRanges), budget, pool.size()});
 }
@@ -451,9 +451,9 @@ void apply_membership_filter(const KeyColumn<KeyAt>& key, const DynamicScanFilte
                                       [&](std::size_t i) { return selected[i]; });
         return;
     }
-    auto end = std::ranges::remove_if(selected, [&](std::size_t row) {
-                   return !key_passes(key, filter, row);
-               }).begin();
+    const auto end = std::ranges::remove_if(selected, [&](std::size_t row) {
+                         return !key_passes(key, filter, row);
+                     }).begin();
     selected.erase(end, selected.end());
 }
 
@@ -1043,7 +1043,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         if (!names.contains(field.name)) {
             continue;
         }
-        auto it = selected_columns.find(field.name);
+        const auto it = selected_columns.find(field.name);
         if (it == selected_columns.end()) {
             return std::unexpected("lazy source did not produce requested column '" + field.name +
                                    "'");
@@ -1430,7 +1430,7 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
         if (!names.contains(field.name)) {
             continue;
         }
-        auto it = selected_columns.find(field.name);
+        const auto it = selected_columns.find(field.name);
         if (it == selected_columns.end()) {
             return std::unexpected("lazy source did not produce requested column '" + field.name +
                                    "'");

@@ -368,7 +368,7 @@ auto resolve_callee(std::string_view callee, std::string_view scope, const Using
             candidates.push_back(std::move(name));
         }
     };
-    if (auto it = usings.names.find(std::string(callee)); it != usings.names.end()) {
+    if (const auto it = usings.names.find(std::string(callee)); it != usings.names.end()) {
         for (const auto& target : it->second) {
             add(target);
         }

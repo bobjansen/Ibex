@@ -1029,7 +1029,7 @@ auto substitute_params(const Expr& expr,
             using T = std::decay_t<decltype(node)>;
             auto out = std::make_unique<Expr>();
             if constexpr (std::is_same_v<T, IdentifierExpr>) {
-                if (auto it = subs.find(node.name); it != subs.end()) {
+                if (const auto it = subs.find(node.name); it != subs.end()) {
                     return clone_expr(*it->second);
                 }
                 out->node = node;
@@ -1187,7 +1187,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
                 return std::nullopt;
             }
             for (const auto& field : update.fields()) {
-                auto it = std::find(names->begin(), names->end(), field.alias);
+                const auto it = std::find(names->begin(), names->end(), field.alias);
                 if (it == names->end()) {
                     names->push_back(field.alias);
                 } else {
@@ -1310,7 +1310,7 @@ auto eval_compile_expr(const Expr& expr,
         [&](const auto& node) -> std::expected<CompileTimeValue, LowerError> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, IdentifierExpr>) {
-                auto it = env.find(node.name);
+                const auto it = env.find(node.name);
                 if (it == env.end()) {
                     return std::unexpected(
                         LowerError{.message = "unknown compile-time map variable: " + node.name});
@@ -1446,7 +1446,7 @@ auto render_alias_template(const std::string& alias_template,
                     LowerError{.message = "unterminated ${...} in map field alias"});
             }
             const std::string key = alias_template.substr(i + 2, end - (i + 2));
-            auto it = env.find(key);
+            const auto it = env.find(key);
             if (it == env.end()) {
                 return std::unexpected(
                     LowerError{.message = "unknown compile-time map variable in alias: " + key});
@@ -1509,7 +1509,7 @@ auto substitute_map_expr(const Expr& expr,
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 if (node.callee == "get" && node.args.size() == 1 && node.named_args.empty()) {
                     if (const auto* ident = std::get_if<IdentifierExpr>(&node.args[0]->node)) {
-                        auto it = env.find(ident->name);
+                        const auto it = env.find(ident->name);
                         if (it == env.end()) {
                             return std::unexpected(LowerError{
                                 .message =
@@ -2271,7 +2271,7 @@ class Lowerer {
                         }
                         continue;
                     }
-                    auto scalar = lower_expr_to_ir(*let_stmt.value);
+                    const auto scalar = lower_expr_to_ir(*let_stmt.value);
                     if (!scalar.has_value()) {
                         if (infer_compile_time_list(*let_stmt.value).has_value()) {
                             continue;
@@ -2904,7 +2904,7 @@ class Lowerer {
             return builder_.extern_call(call.callee, std::move(*args));
         }
         if (!table_externs_.contains(call.callee)) {
-            if (auto fn = functions_.find(call.callee); fn != functions_.end()) {
+            if (const auto fn = functions_.find(call.callee); fn != functions_.end()) {
                 return inline_table_udf(*fn->second, call);
             }
             return std::unexpected(LowerError{.message = "unknown table function: " + call.callee});
@@ -3122,7 +3122,7 @@ class Lowerer {
 
     auto lower_identifier(const IdentifierExpr& ident) -> LowerResult {
         if (bindings_ != nullptr) {
-            if (auto it = bindings_->find(ident.name); it != bindings_->end()) {
+            if (const auto it = bindings_->find(ident.name); it != bindings_->end()) {
                 return clone_node(*it->second);
             }
         }
@@ -3264,7 +3264,8 @@ class Lowerer {
         -> std::expected<std::vector<Field>, LowerError> {
         std::vector<Field> expanded;
         robin_hood::unordered_map<std::string, CompileTimeValue> env;
-        auto step = [&](auto&& self, std::size_t binding_idx) -> std::expected<void, LowerError> {
+        const auto step = [&](auto&& self,
+                              std::size_t binding_idx) -> std::expected<void, LowerError> {
             if (binding_idx == map_field.bindings.size()) {
                 if (map_field.where_expr) {
                     auto where_value = eval_compile_expr(*map_field.where_expr, env);
@@ -3293,7 +3294,7 @@ class Lowerer {
             }
 
             const auto& binding = map_field.bindings[binding_idx];
-            auto it = compile_time_lists_.find(binding.source_name);
+            const auto it = compile_time_lists_.find(binding.source_name);
             if (it == compile_time_lists_.end()) {
                 return std::unexpected(LowerError{
                     .message = "unknown compile-time string list in map: " + binding.source_name});
@@ -4130,7 +4131,7 @@ class Lowerer {
     /// then defaults). The recursion guard is managed by the caller so this
     /// helper has no side effects on `inlining_active_`.
     auto inline_agg_udf_body(const CallExpr& call) -> std::expected<ExprPtr, LowerError> {
-        auto it = functions_.find(call.callee);
+        const auto it = functions_.find(call.callee);
         const FunctionDecl& fn = *it->second;
         auto body_shape = inlinable_body_shape(fn);
         if (!body_shape.has_value()) {
@@ -4330,7 +4331,7 @@ class Lowerer {
         std::vector<std::string> installed_bindings;
         robin_hood::unordered_map<std::string, ir::NodePtr> shadowed;
         const auto shadow = [&](const std::string& name, ir::NodePtr node) {
-            if (auto it = bindings_->find(name);
+            if (const auto it = bindings_->find(name);
                 it != bindings_->end() && !shadowed.contains(name)) {
                 shadowed.emplace(name, std::move(it->second));
             }
@@ -4919,7 +4920,9 @@ class Lowerer {
             // generator or an extern must keep their independent evaluations.
             std::uint64_t unused_id = 0;
             if (ir::clone_replayable_subplan(*subplan->plan, unused_id) != nullptr) {
-                reusable.push_back({subquery->args.front().get(), alias, coalesce_count});
+                reusable.push_back({.argument = subquery->args.front().get(),
+                                    .alias = alias,
+                                    .coalesce_count = coalesce_count});
             }
 
             // Missing correlated groups are null (coalesced to 0 for counts).
@@ -5199,7 +5202,7 @@ class Lowerer {
             // (already-lowered) argument expression rather than a column.
             if (!inline_scopes_.empty()) {
                 const auto& scope = inline_scopes_.back();
-                if (auto it = scope.find(ident->name); it != scope.end()) {
+                if (const auto it = scope.find(ident->name); it != scope.end()) {
                     return it->second;
                 }
             }
@@ -5351,7 +5354,7 @@ class Lowerer {
             }
             // A call to a scalar user function is inlined: its body replaces the
             // call, with parameters substituted by the argument expressions.
-            if (auto it = functions_.find(call->callee); it != functions_.end()) {
+            if (const auto it = functions_.find(call->callee); it != functions_.end()) {
                 return inline_scalar_udf(*it->second, *call);
             }
             // Function-call form for null checks: `is_null(col)` and
@@ -5632,8 +5635,8 @@ class Lowerer {
             if (!right.has_value()) {
                 return std::unexpected(right.error());
             }
-            auto lhs = ir::make_expr_ptr(std::move(left.value()));
-            auto rhs = ir::make_expr_ptr(std::move(right.value()));
+            const auto lhs = ir::make_expr_ptr(std::move(left.value()));
+            const auto rhs = ir::make_expr_ptr(std::move(right.value()));
             if (is_compare_op(binary->op)) {
                 return ir::Expr{.node = ir::CompareExpr{
                                     .op = to_compare_op(binary->op), .left = lhs, .right = rhs}};
@@ -5657,7 +5660,7 @@ class Lowerer {
             if (!operand.has_value()) {
                 return std::unexpected(operand.error());
             }
-            auto operand_ptr = ir::make_expr_ptr(std::move(operand.value()));
+            const auto operand_ptr = ir::make_expr_ptr(std::move(operand.value()));
             if (unary->op == UnaryOp::Not) {
                 return ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::Not,
                                                         .left = operand_ptr,
@@ -6206,7 +6209,7 @@ class Lowerer {
     /// expression. This is the inference rule that distinguishes an aggregate
     /// UDF from an ordinary scalar UDF; see `plans/done/aggregate-udf-plan.md`.
     [[nodiscard]] auto aggregate_udf_body(const std::string& name) const -> const Expr* {
-        auto it = functions_.find(name);
+        const auto it = functions_.find(name);
         if (it == functions_.end()) {
             return nullptr;
         }
@@ -6653,10 +6656,10 @@ class Lowerer {
         if (unit_pos == 0 || unit_pos == text.size()) {
             return std::unexpected(LowerError{.message = "invalid duration literal"});
         }
-        auto number_part = text.substr(0, unit_pos);
-        auto unit_part = text.substr(unit_pos);
+        const auto number_part = text.substr(0, unit_pos);
+        const auto unit_part = text.substr(unit_pos);
         std::uint64_t value = 0;
-        auto result =
+        const auto result =
             std::from_chars(number_part.data(), number_part.data() + number_part.size(), value);
         if (result.ec != std::errc()) {
             return std::unexpected(LowerError{.message = "invalid duration literal"});
@@ -6822,7 +6825,7 @@ class Lowerer {
     }
 
     auto clone_node(const ir::Node& node) -> ir::NodePtr {
-        auto clone_tuple_fields = [&](const std::vector<ir::TupleFieldSpec>& tuple_fields) {
+        const auto clone_tuple_fields = [&](const std::vector<ir::TupleFieldSpec>& tuple_fields) {
             std::vector<ir::TupleFieldSpec> cloned;
             cloned.reserve(tuple_fields.size());
             for (const auto& tf : tuple_fields) {
@@ -6833,7 +6836,7 @@ class Lowerer {
             }
             return cloned;
         };
-        auto clone_construct_columns = [&](const std::vector<ir::ConstructColumn>& columns) {
+        const auto clone_construct_columns = [&](const std::vector<ir::ConstructColumn>& columns) {
             std::vector<ir::ConstructColumn> cloned;
             cloned.reserve(columns.size());
             for (const auto& col : columns) {

@@ -28,8 +28,8 @@ namespace ibex::runtime {
 namespace {
 
 auto normalize_float_text(std::string text) -> std::string {
-    auto trim_mantissa = [](std::string& mantissa) {
-        auto dot = mantissa.find('.');
+    const auto trim_mantissa = [](std::string& mantissa) {
+        const auto dot = mantissa.find('.');
         if (dot != std::string::npos) {
             while (!mantissa.empty() && mantissa.back() == '0') {
                 mantissa.pop_back();
@@ -43,7 +43,7 @@ auto normalize_float_text(std::string text) -> std::string {
         }
     };
 
-    auto exp_pos = text.find_first_of("eE");
+    const auto exp_pos = text.find_first_of("eE");
     if (exp_pos == std::string::npos) {
         trim_mantissa(text);
         return text;
@@ -87,9 +87,9 @@ auto format_date(Date date) -> std::string {
 auto format_timestamp(Timestamp ts) -> std::string {
     using namespace std::chrono;
     const sys_time<nanoseconds> tp{nanoseconds{ts.nanos}};
-    auto day = floor<days>(tp);
+    const auto day = floor<days>(tp);
     const year_month_day ymd{day};
-    auto tod = tp - day;
+    const auto tod = tp - day;
     const hh_mm_ss<nanoseconds> hms{tod};
     return ibex::formatting::format(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}", static_cast<int>(ymd.year()),
@@ -198,7 +198,7 @@ void render_table(const Table& table, std::ostream& out, std::size_t max_rows) {
         }
     }
 
-    auto print_sep = [&]() {
+    const auto print_sep = [&]() {
         ibex::formatting::print(out, "+");
         for (std::size_t c = 0; c < col_count; ++c) {
             ibex::formatting::print(out, "{:-<{}}+", "", widths[c] + 2);

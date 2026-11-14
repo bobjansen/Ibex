@@ -49,7 +49,7 @@ auto call_key(const ExternCallNode& call) -> std::optional<std::string> {
         if (literal == nullptr) {
             return std::nullopt;
         }
-        auto encoded = literal_key(*literal);
+        const auto encoded = literal_key(*literal);
         if (encoded.empty()) {
             return std::nullopt;
         }

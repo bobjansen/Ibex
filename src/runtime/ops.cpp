@@ -137,7 +137,7 @@ auto scalar_arg(const ir::Expr& expr) -> ScalarArg {
     return ScalarArg{eval_scalar(expr)};
 }
 
-void forward_cli_args(int argc, char** argv) {
+void forward_cli_args(int argc, char** argv) {  // NOLINT(misc-const-correctness)
     if (argc <= 1 || argv == nullptr) {
         return;
     }

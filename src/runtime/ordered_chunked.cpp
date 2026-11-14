@@ -10,6 +10,7 @@
 // whole-table `run_materialized_node` implementation with no streaming operator.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/compiler.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -34,7 +35,6 @@
 #include <vector>
 
 #include "chunk_conversion_internal.hpp"
-#include "ibex/core/compiler.hpp"
 #include "interpreter_internal.hpp"
 #include "physical_executor_internal.hpp"
 #include "runtime_internal.hpp"
@@ -230,7 +230,7 @@ class ChunkedOrderOperator final : public Operator {
 
         // Boundary check against last row of previous chunk.
         if (!prev_last_.empty()) {
-            auto cmp = compare_keys_cross(prev_last_, chunk, 0, key_idx);
+            const auto cmp = compare_keys_cross(prev_last_, chunk, 0, key_idx);
             if (cmp > 0) {
                 return false;
             }
@@ -348,8 +348,8 @@ class ChunkedOrderOperator final : public Operator {
                              const std::vector<std::size_t>& key_idx) -> int {
         for (std::size_t i = 0; i < resolved_keys_.size(); ++i) {
             const auto& col = *chunk.columns[key_idx[i]].column;
-            auto sa = scalar_from_column(col, a);
-            auto sb = scalar_from_column(col, b);
+            const auto sa = scalar_from_column(col, a);
+            const auto sb = scalar_from_column(col, b);
             const int c = compare_scalar_for_order(sa, sb);
             if (c != 0) {
                 return resolved_keys_[i].ascending ? c : -c;
@@ -365,7 +365,7 @@ class ChunkedOrderOperator final : public Operator {
                             std::size_t row, const std::vector<std::size_t>& key_idx) -> int {
         for (std::size_t i = 0; i < resolved_keys_.size(); ++i) {
             const auto& col = *chunk.columns[key_idx[i]].column;
-            auto sb = scalar_from_column(col, row);
+            const auto sb = scalar_from_column(col, row);
             const int c = compare_scalar_for_order(cached[i], sb);
             if (c != 0) {
                 return resolved_keys_[i].ascending ? c : -c;

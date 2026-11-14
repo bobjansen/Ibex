@@ -530,7 +530,8 @@ auto parse_decimal_format(std::string_view format)
         return std::nullopt;
     }
     const std::string text(format);
-    auto fail = [&](std::string why) -> std::optional<std::expected<DecimalFormat, std::string>> {
+    const auto fail =
+        [&](std::string why) -> std::optional<std::expected<DecimalFormat, std::string>> {
         return std::expected<DecimalFormat, std::string>{
             std::unexpected("unsupported Arrow decimal '" + text + "': " + std::move(why))};
     };
@@ -1494,7 +1495,7 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                     dictionary_offset = static_cast<std::int64_t>(col.dictionary_buffer_offset());
                     dictionary_length = static_cast<std::int64_t>(col.dictionary_size());
                 } else {
-                    auto dict_backing = build_dictionary_strings(col);
+                    const auto dict_backing = build_dictionary_strings(col);
                     dictionary_length = static_cast<std::int64_t>(dict_backing->offsets.size() - 1);
                     dict_state->extra_owner = dict_backing;
                     dict_state->buffers_storage = {
@@ -1785,7 +1786,7 @@ auto adopt_table_from_arrow(ArrowArray* array, const ArrowSchema& schema)
         return std::unexpected("Arrow table adoption requires a non-null array");
     }
 
-    auto owner = std::make_shared<AdoptedArrayOwner>(*array);
+    const auto owner = std::make_shared<AdoptedArrayOwner>(*array);
     auto imported = import_table_impl(owner->array, schema, owner);
     if (!imported) {
         return std::unexpected(imported.error());

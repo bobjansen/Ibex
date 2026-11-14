@@ -2813,10 +2813,10 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
     if (!route.has_plan() && fallback == nullptr) {
         return std::optional<ComputedColumn>{};
     }
-    // Reentrancy: a fused pipeline operator calls its update from a worker
-    // thread. Submitting from there deadlocks the pool (WorkerPool::submit
-    // aborts rather than let it happen), and that morsel is already one
-    // worker's share -- splitting it again would only oversubscribe.
+    // Nesting: a fused pipeline operator calls its update from a worker
+    // thread. A nested submit is safe (a waiting worker runs queued tasks),
+    // but that morsel is already one worker's share -- splitting it again
+    // would only add dispatch and merge overhead.
     if (!exec.can_fan_out() || on_worker_pool_thread()) {
         return std::optional<ComputedColumn>{};
     }

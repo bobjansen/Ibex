@@ -1558,8 +1558,8 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
                                                const std::vector<ir::FieldSpec>& fields)
     -> std::size_t {
     // `run_group` is reached from a worker only through this function, but the
-    // pipeline executor can call the whole update from a pool thread; submitting
-    // from there deadlocks the pool.
+    // pipeline executor can call the whole update from a pool thread. A nested
+    // submit is safe there, but an outer fan-out already owns the pool.
     if (on_worker_pool_thread() || !exec.can_fan_out() || remaining_groups < 2) {
         return 0;
     }
@@ -4297,11 +4297,11 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
                               .validity = std::move(*validity)};
     };
 
-    // Reentrancy: the pipeline's fused FilterUpdateProject operator calls
-    // update_table from a worker thread, so this can be reached on one.
-    // Submitting from there deadlocks the pool (WorkerPool::submit aborts
-    // rather than let it happen), and the morsel is already one worker's share
-    // of the table — splitting it again would only oversubscribe.
+    // Nesting: the pipeline's fused FilterUpdateProject operator calls
+    // update_table from a worker thread, so this can be reached on one. A
+    // nested submit is safe (a waiting worker runs queued tasks), but the
+    // morsel is already one worker's share of the table — splitting it again
+    // would only add dispatch and merge overhead.
     if (on_worker_pool_thread()) {
         return whole_categorical();
     }

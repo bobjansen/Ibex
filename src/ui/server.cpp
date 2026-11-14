@@ -239,23 +239,24 @@ auto new_session_id() -> std::string {
 }
 
 auto print_performance_environment() -> void {
-    constexpr std::array<std::string_view, 13> variables = {"IBEX_CORES",
+    constexpr std::array<std::string_view, 15> variables = {"IBEX_CORES",
                                                             "IBEX_DECODE_THREADS",
                                                             "IBEX_DECODE_SATURATION",
-                                                            "IBEX_PARALLEL",
                                                             "IBEX_CHUNK_ROWS",
                                                             "IBEX_MORSEL_ROWS",
                                                             "IBEX_STREAM_SCAN",
+                                                            "IBEX_STREAM_PROBES",
                                                             "IBEX_JOIN_PROBE",
+                                                            "IBEX_ALLOCATOR_POLICY",
                                                             "IBEX_NO_MALLOC_TUNING",
+                                                            "IBEX_NO_HUGEPAGES",
+                                                            "IBEX_HUGEPAGES_REEXEC",
                                                             "IBEX_PROFILE_OPERATORS",
                                                             "IBEX_PARALLEL_STATS",
-                                                            "IBEX_UNIQUE_KEY_STATS",
-                                                            "IBEX_THREADS (deprecated)"};
+                                                            "IBEX_UNIQUE_KEY_STATS"};
     std::cout << "Ibex UI performance environment:\n";
     for (const auto variable : variables) {
-        const auto name = variable.substr(0, variable.find(' '));
-        const char* value = std::getenv(std::string(name).c_str());
+        const char* value = std::getenv(std::string(variable).c_str());
         std::cout << "  " << variable << '='
                   << (value != nullptr && value[0] != '\0' ? value : "<unset>") << '\n';
     }

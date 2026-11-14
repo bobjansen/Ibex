@@ -125,14 +125,14 @@ struct TableRangeMorsel {
 
 /// A source over an OWNED table, emitted as successive `grain`-row chunks.
 ///
-/// Phase 0 of `plans/pipelined-execution-plan.md`. Production has never emitted
-/// more than one chunk from anything — `chunks=1` on every operator of every
-/// PDS-H query — so every cross-chunk path in every operator is dead code that
-/// has never executed: `KeyPartition::stored`, `partitioned_active_`, the
+/// Phase 0 of the retired `git show ec861712:plans/pipelined-execution-plan.md`.
+/// A materialized table reaches its consumer as one chunk, so the operators'
+/// cross-chunk paths (`KeyPartition::stored`, `partitioned_active_`, the
 /// distinct operator's pinned partition count, the pair path's dense-array
-/// rebuild, the categorical dictionary-identity check. All of it is written for
-/// multi-chunk input and none of it has run. This is the switch that wakes it
-/// up so it can be tested, ahead of anything being built on top.
+/// rebuild, the categorical dictionary-identity check) run only under a
+/// streamed scan, which emits a unit at a time. This source splits a
+/// materialized table too, so tests reach those paths from any input
+/// (`IBEX_CHUNK_ROWS`).
 ///
 /// It differs from `PartitionedTableSource` in owning its table rather than
 /// borrowing one: a pipeline's morsel sources sit under a table the pipeline

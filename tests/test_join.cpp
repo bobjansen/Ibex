@@ -957,7 +957,7 @@ TEST_CASE("join: dense integer intersection preserves semi and anti membership",
 TEST_CASE("join: dense right bitmap preserves membership when the buffered left is the bigger side",
           "[join]") {
     // Swapped build (right over 65,536), and the buffered left is NOT smaller
-    // than the right -- so `try_dense_intersection` is skipped and the right
+    // than the right -- so the dense left map (`build_swapped_left_map`) is skipped and the right
     // key column itself is turned into a bit-packed membership bitmap
     // (`try_build_dense_right`). Three spans: step 3 stays under the old 2M
     // byte-table cap; step 12 (~2.4M span) is only reachable now that the map

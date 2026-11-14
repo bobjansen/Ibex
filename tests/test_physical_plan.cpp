@@ -1332,7 +1332,7 @@ TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical
 
         const auto& build = nodes.build.parallelism;
         REQUIRE(build.strategy == runtime::physical::PartitionStrategy::HeadTable);
-        REQUIRE(build.row_floor == (1U << 17U));  // chunked.cpp build_partitions
+        REQUIRE(build.row_floor == (1U << 17U));  // join_chunked.cpp build_partitions
         REQUIRE(build.breaker_max_workers == 64);
 
         const auto& probe = nodes.probe.parallelism;

@@ -19323,7 +19323,7 @@ TEST_CASE("Table properties: fused filter+update overwriting the sort key clears
 
 // A lazy/deferred source used to disqualify a query from the morsel pipeline
 // outright. Phase 3b lifted that gate, and this pins the reason it is safe:
-// `build_morsel_pipeline` materializes its input subtree before it builds any
+// `build_materialized_map_run` materializes its input subtree before it builds any
 // morsel source, so the source decodes exactly once, on the building thread,
 // and no worker ever reaches the `LazyTable`.
 //

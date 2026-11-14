@@ -382,9 +382,10 @@ TEST_CASE("process worker pool can be shut down and recreated", "[runtime][worke
 TEST_CASE("on_worker_pool_thread distinguishes pool threads from the caller",
           "[runtime][worker_pool]") {
     // The guard against nested parallelism. Anything reachable from inside a
-    // morsel pipeline — update_table's field split, today — checks this before
-    // submitting work of its own, because submitting from a worker deadlocks
-    // the pool. A flag that is never observed to be true would silence that
+    // morsel pipeline — update_table's field split, for one — checks this
+    // before submitting work of its own: a nested submit is safe, but the
+    // morsel is already one worker's share, and splitting it again only adds
+    // dispatch. A flag that is never observed to be true would silence that
     // check rather than enforce it.
     runtime::WorkerPool pool(2);
 

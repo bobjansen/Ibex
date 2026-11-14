@@ -5,7 +5,7 @@
 // and the bounded-heap `TopK` select, plus their physical-plan construction
 // sites (`build_physical_order`, `build_physical_topk`). Split out of
 // chunked.cpp; the operators are fully private to this translation unit.
-// `build_physical_tail` stays in chunked.cpp (it materializes and calls
+// `build_physical_tail` stays in runtime_entry.cpp (it materializes and calls
 // `tail_table` rather than driving an ordering operator); `as_timeframe` is a
 // whole-table `run_materialized_node` implementation with no streaming operator.
 

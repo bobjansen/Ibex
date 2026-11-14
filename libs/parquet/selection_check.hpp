@@ -13,8 +13,9 @@
 // split form checks the same property in pieces: the slice of the selection
 // that falls in each row group is checked by that group's task, and the parts
 // before the first group and after the last (normally empty) by the caller.
-// `split_check_equals_whole_check` in tests/test_parquet_selection_check.cpp
-// pins that the two accept exactly the same selections.
+// The test "selection check: split check equals whole check on random
+// selections" (tests/test_parquet_selection_check.cpp) pins that the two
+// accept exactly the same selections.
 //
 // Arrow-free on purpose, so the unit tests can include it (as stats_range.hpp).
 

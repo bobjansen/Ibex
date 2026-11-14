@@ -176,7 +176,7 @@ struct JoinPlan {
     /// Deliberately NOT named build and probe. These fields used to be, and
     /// the claim was false whenever the operator swapped: which side is hashed
     /// is resolved when the build phase runs, from measured row counts
-    /// (`JoinOrientation`, `choose_and_build_single_key` in chunked.cpp). A
+    /// (`JoinOrientation`, `choose_and_build_single_key` in join_chunked.cpp). A
     /// plan that names a build side is a plan a scheduler would believe.
     /// Naming the inputs and leaving the orientation to the build is what
     /// lets both children be scheduled as pipelines without the plan
@@ -351,7 +351,7 @@ struct BreakerPhase {
 [[nodiscard]] auto distinct_dedup_parallelism(RowEstimate estimate) -> BreakerParallelism;
 
 /// `order`'s single `sort` phase. Unlike distinct, the fan-out already lives in
-/// `sort.cpp` (`radix_sort`, `gather_rows_parallel`) gated on the *shared*
+/// `sort.cpp` (`radix_sort_by_key`, `gather_rows_parallel`) gated on the *shared*
 /// `parallel_min_rows` / `parallel_min_cells` knobs, not a private constant --
 /// so `row_floor` is left 0, which `resolve_breaker_parallelism` fills from
 /// `exec.parallel_min_rows`. There is no per-breaker worker ceiling. The phase
@@ -361,7 +361,7 @@ struct BreakerPhase {
 
 /// A streaming join's two fan-out phases: the hash build's `1U << 17U` floor and
 /// `min(budget, pool, 64)` cap, and the probe's `1U << 14U` floor and matching
-/// cap. Both used to be private constants in `chunked.cpp`
+/// cap. Both used to be private constants in what was `chunked.cpp`
 /// (`ChunkedInnerJoinOperator::build_partitions`, `JoinProbe::probe_parallel_workers`);
 /// the operator now reads its resolved copy of each from the plan. The two
 /// checks that stay in the operator are the ones only it can make: the

@@ -14,7 +14,8 @@
 
 namespace ibex::ir {
 /// The kind of a built-in function — its shape and row-dependency. Single front
-/// door for the function taxonomy; see `plans/function-kind-registry-plan.md`.
+/// door for the function taxonomy; the retired plan is at
+/// `git show 80542c42:plans/function-kind-registry-plan.md`.
 ///
 ///   Scalar    — row-local: `out[i] = f(args[i])` (arithmetic, casts, math,
 ///               date parts, pmin/pmax, is_nan, round, ...).
@@ -77,7 +78,7 @@ struct BuiltinFunctionInfo {
     /// it reads neighbours (lag/lead/rolling), accumulates along the row order
     /// (cumsum/cumprod), or propagates through it (fill_forward/fill_backward).
     /// Such a function is only meaningful when the rows are in a meaningful
-    /// order, which is what `check_time_index_ordering` enforces.
+    /// order, which is what `check_row_order` (runtime/update.cpp) enforces.
     bool order_dependent = false;
 };
 

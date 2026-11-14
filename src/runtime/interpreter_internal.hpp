@@ -1361,7 +1361,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto rename_table(Table input, const std::vector<ir::RenameSpec>& renames)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto columns_table(const Table& input) -> std::expected<Table, std::string>;
-/// Whole-table `distinct`, implemented in `chunked.cpp` over
+/// Whole-table `distinct`, implemented in `distinct_chunked.cpp` over
 /// `ChunkedDistinctOperator` rather than a second time.
 ///
 /// The first I4 convergence: a whole-table SIGNATURE over the chunked

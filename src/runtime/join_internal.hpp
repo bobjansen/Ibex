@@ -39,8 +39,8 @@ using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Ex
 
 /// `pending_order` is what an `order` directly above this join will ask for
 /// (`ir::JoinNode::pending_order`), or empty. It can only shift which side is
-/// indexed, never the rows or their names -- see `choose_build_side` in
-/// join.cpp for the trade.
+/// indexed, never the rows or their names -- see `order_preserving_pays` in
+/// `join_table_impl` (join.cpp) for the trade.
 [[nodiscard]] auto join_table_impl(
     const Table& left, const Table& right, ir::JoinKind kind, const std::vector<ir::JoinKey>& keys,
     const ir::Expr* predicate, const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator,
@@ -59,7 +59,7 @@ using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Ex
 /// column it was derived from holds different values. Exactly one update shape
 /// is safe, and it is the one this fast path exists for -- `count(col)` lowers
 /// to `Update{alias = Int64(col is not null)} + sum(alias)`, a 0/1 flag whose
-/// grouped sum is what `left_join_count_table` computes from the join
+/// grouped sum is what `LeftJoinCounter` computes from the join
 /// structure itself. Anything else declines, and the ordinary path runs the
 /// whole chain.
 [[nodiscard]] auto fused_left_join_counted_column(

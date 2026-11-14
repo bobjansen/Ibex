@@ -311,7 +311,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 
     /// Build `dense_i64_hits_` directly from the right key column, for the
     /// swapped build whose buffered left is NOT the smaller side (so
-    /// `try_dense_intersection` does not apply) but whose right key span is
+    /// `build_swapped_left_map`'s dense branch does not apply) but whose right key span is
     /// still small and dense enough that a cache-resident bitmap beats a
     /// multi-million-entry hash probe. q21 (SF-10) builds two: 12.9M order
     /// keys spanning 60M values, and 2.0M keys over the same span -> a 7.5MB
@@ -598,7 +598,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         return std::nullopt;
     }
 
-    /// The swapped build with the right side streamed (`drain_left_first_`):
+    /// The swapped build with the right side streamed:
     /// the left is buffered and its key map built BEFORE the right is pulled
     /// at all, so the right's scan pipeline starts only then and every chunk
     /// it produces is probed on the worker that decoded it
@@ -1505,7 +1505,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// dense_i64_nbits_)`, used in place of `right_i64_` when the integer key
     /// span is boundable and dense enough for the bitmap to stay
     /// cache-resident. Populated by `try_build_dense_right` (probe the small
-    /// right against a bitmap of itself) or `try_dense_intersection` (probe the
+    /// right against a bitmap of itself) or `build_swapped_left_map` (probe the
     /// large right against a bitmap of the smaller buffered left).
     std::int64_t dense_i64_min_ = 0;
     std::size_t dense_i64_nbits_ = 0;

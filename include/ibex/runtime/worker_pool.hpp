@@ -24,7 +24,7 @@ inline constexpr auto kCoopPollInterval = std::chrono::microseconds(250);
 
 /// Process-owned worker pool for the runtime's morsel pipelines
 /// (the retired runtime-multithreading plan, Phase 1:
-/// `git show 587bc2e4:plans/runtime-multithreading-plan.md`).
+/// `git show c3876a24:plans/runtime-multithreading-plan.md`).
 ///
 /// Deliberately small and boring, as the plan requires: pre-spawned threads, a
 /// single mutex+condvar task queue, and a completion latch. There is no work
@@ -369,12 +369,12 @@ void stage_park_end() noexcept;
 
 /// Rows per SOURCE chunk from `IBEX_CHUNK_ROWS`, or 0 when unset/invalid.
 ///
-/// Zero means "one chunk", which is what production does today. A non-zero
+/// Zero means "one chunk", the default for a materialized source. A non-zero
 /// value makes every materialized source emit successive row ranges instead —
-/// see `make_table_source` and Phase 0 of `plans/pipelined-execution-plan.md`.
-/// It exists to EXERCISE the operators' cross-chunk paths, which no production
-/// query has ever reached, and is read fresh on every call so a test can change
-/// it between pipelines.
+/// see `make_table_source` and `ChunkedTableSource`. It exists to EXERCISE the
+/// operators' cross-chunk paths from inputs that would otherwise arrive whole
+/// (a streamed scan already emits a unit at a time), and is read fresh on every
+/// call so a test can change it between pipelines.
 [[nodiscard]] auto source_chunk_rows_from_env() -> std::size_t;
 
 /// Morsel row-grain override from `IBEX_MORSEL_ROWS`, or 0 when unset/invalid

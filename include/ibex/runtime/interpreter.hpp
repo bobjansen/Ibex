@@ -1065,7 +1065,8 @@ struct ExecutionContext {
     /// Whether a lazy source is streamed through its scan operator rather than
     /// decoded whole before the plan runs.
     ///
-    /// **On by default** (`plans/pipelined-execution-plan.md`, Phases 1-2):
+    /// **On by default** (Phases 1-2 of the retired
+    /// `git show ec861712:plans/pipelined-execution-plan.md`):
     /// streaming measures 7.8% faster than materializing on PDS-H at 8 cores
     /// and 5.7% faster on one, and it bounds how much of a source is decoded at
     /// once. `IBEX_STREAM_SCAN=0` (or `off`/`false`/`no`) turns it off, which is
@@ -1211,10 +1212,6 @@ using ModelRegistry = robin_hood::unordered_map<std::string, ModelResult>;
 class ExternRegistry;
 class ExternArgs;
 
-/// Interpret `node` under an ExecutionContext built from the environment
-/// (`IBEX_PARALLEL`, `IBEX_MORSEL_ROWS`, `IBEX_PARALLEL_STATS`) on top of the
-/// defaults. Use the overload below to supply a context directly — that is
-/// also how a caller opts OUT of the environment.
 /// `input` with only the columns named in `names`, in `input`'s order, the
 /// ordering / time index carried through as a projection would. What a
 /// declared table schema leaves of a table (SPEC.md 3.6): an unlisted column
@@ -1222,6 +1219,12 @@ class ExternArgs;
 /// ignored. Columns are shared, not copied.
 [[nodiscard]] auto keep_columns(const Table& input, const std::set<std::string>& names) -> Table;
 
+/// Interpret `node` under an ExecutionContext built from the environment
+/// (`configure_parallel_from_env`: `IBEX_CORES`, `IBEX_MORSEL_ROWS`,
+/// `IBEX_STREAM_SCAN`, `IBEX_JOIN_PROBE`, `IBEX_STREAM_PROBES`,
+/// `IBEX_PARALLEL_STATS`, `IBEX_PROFILE_OPERATORS`) on top of the defaults.
+/// Use the overload below to supply a context directly — that is also how a
+/// caller opts OUT of the environment.
 [[nodiscard]] auto interpret(const ir::Node& node, const TableRegistry& registry,
                              const ScalarRegistry* scalars = nullptr,
                              const ExternRegistry* externs = nullptr,

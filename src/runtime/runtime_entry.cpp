@@ -313,13 +313,12 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
 }
 
 void configure_parallel_from_env(ExecutionContext& exec) {
-    // The other two execution switches, applied the same way and for the same
-    // reason: one authority per setting. Both were `getenv` at their use sites
-    // until the seams that share them started to outnumber the settings —
-    // `stream_scans` is read at three build seams that must agree, and
-    // `parallel_join_probe` at three probe gates. An unset variable leaves the
-    // caller's choice alone, so a context built by hand still means "ignore the
-    // environment".
+    // The execution switches, applied here for one reason: one authority per
+    // setting. They were `getenv` at their use sites until the seams that share
+    // them started to outnumber the settings — `stream_scans` is read at three
+    // build seams that must agree, and `parallel_join_probe` at three probe
+    // gates. An unset variable leaves the caller's choice alone, so a context
+    // built by hand still means "ignore the environment".
     if (const auto want = stream_scans_from_env(); want.has_value()) {
         exec.stream_scans = *want;
     }
@@ -332,7 +331,7 @@ void configure_parallel_from_env(ExecutionContext& exec) {
     // Pin the COMPUTE budget to the core count. Every compute gate sizes itself
     // from `parallel_threads`, falling back to the pool size when it is 0 — and
     // the pool is now sized for decode, which wants more threads than cores
-    // (`decode_oversubscribe`). Without this, growing the pool would
+    // (`decode_thread_count`). Without this, growing the pool would
     // oversubscribe the compute paths too, and those measurably do not want it
     // (q01 +4.6%, q17 +3.2%). With a multiplier of 1 this is the same number the
     // fallback produced, so the default configuration is unchanged.
@@ -357,7 +356,7 @@ void configure_parallel_from_env(ExecutionContext& exec) {
         // threshold would silently override the knob it was asked to honor.
         exec.parallel_min_rows = std::min(exec.parallel_min_rows, grain);
     }
-    // `parallel_threads` is set at the top of this function, not here: it is
+    // `parallel_threads` is set above, before the grain is read: it is
     // the COMPUTE budget and must track the core count, because the pool it
     // used to default to is now sized for decode instead.
 }

@@ -371,7 +371,8 @@ struct EmittedWorkerPartial {
 /// The aggregate's `ScanWorkerSink`: while active, each pipeline worker runs
 /// the dense accumulation over the chunk it just produced -- cache-hot, on the
 /// core that decoded it -- and the aggregate merges the result instead of
-/// accumulating the chunk itself. See `HashAggregateState::activate_scan_sink`.
+/// accumulating the chunk itself. `HashAggregateState::discover_chunk` turns it
+/// on from the first chunk, when `on_worker_partial_path` holds.
 class DenseAggregateScanSink final : public ScanWorkerSink {
    public:
     using Producer = std::function<std::unique_ptr<WorkerDensePartial>(const Chunk&)>;
@@ -947,7 +948,7 @@ class GroupKeyStore {
     /// Groups `first .. first + rows.size()` take the keys at `rows` of
     /// `entries` -- the packed discovery's new groups, which it numbers
     /// serially and so must not copy keys for while it does. Split like
-    /// `prepare_fill`: this (serial) sizes the store, then
+    /// `prepare_fill_from`: this (serial) sizes the store, then
     /// `fill_null_masks_rows_range`, `prepare_column_rows` and
     /// `fill_column_rows_range` write the masks and keys.
     void prepare_fill_rows(std::size_t first, const std::vector<const ColumnEntry*>& entries,
@@ -1734,8 +1735,8 @@ class HashAggregateState final {
     };
 
     /// Per-chunk ownership transfer from Discovery to Accumulation. Column
-    /// pointers remain valid because `consume_input` keeps the owning Chunk
-    /// alive until `accumulate_discovered_chunk` consumes this value. The gid
+    /// pointers remain valid because `next_discovery` keeps the owning Chunk
+    /// alive (`active_chunk_`) until `accumulate_discovered_chunk` consumes this value. The gid
     /// buffer is operator-owned and cannot be reused until the transfer resets.
     struct AggregateDiscoveryTransfer {
         DiscoveryTransferKind kind = DiscoveryTransferKind::None;
@@ -8016,10 +8017,10 @@ class HashAggregateState final {
             exec_ != nullptr && par_.accumulation.decline == physical::FanOutDecline::None
                 ? std::min(morsels, par_.accumulation.worker_cap)
                 : std::size_t{1};
-        // Submitting from a pool thread would deadlock (`WorkerPool::submit`
-        // aborts rather than allow it), and one worker gains nothing from a
-        // round trip, so both run the morsels here. The arithmetic is unchanged
-        // either way.
+        // On a pool thread an outer fan-out already owns the pool (a nested
+        // submit is safe, but would only re-divide it), and one worker gains
+        // nothing from a round trip, so both run the morsels here. The
+        // arithmetic is unchanged either way.
         if (threads >= 2 && !on_worker_pool_thread()) {
             auto& pool = process_worker_pool();
             std::atomic<std::size_t> cursor{0};
@@ -9079,12 +9080,12 @@ class HashAggregateState final {
     std::uint64_t rows_seen_ = 0;
 
     // --- Partition-owned aggregation (step 2 of the partition-owned
-    // aggregate API): the PairIntKey path only, admitted
-    // by `try_owned_pair`'s gates.
+    // aggregate API): the PairIntKey and single Int64 key paths, admitted
+    // by `try_owned`'s gates.
 
     /// A partition's group discovery AND its own final aggregate state --
     /// no global gid, no global `flat_slots_` entry, until
-    /// `finalize_owned_pair` walks every partition once at
+    /// `finalize_owned` walks every partition once at
     /// final emission to restore first-occurrence order (plans doc: "moves
     /// that merge... does not eliminate the ordered merge itself").
     template <typename Key, typename Hash, typename Eq = std::equal_to<Key>>

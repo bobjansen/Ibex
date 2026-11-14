@@ -7,40 +7,13 @@ CompileFlags:
     - "-I/usr/share/R/include"
 
 Diagnostics:
-  ClangTidy:
-    Add:
-      - bugprone-*
-      - cert-*
-      - cppcoreguidelines-*
-      - misc-*
-      - modernize-*
-      - performance-*
-      - readability-*
-    Remove:
-      - cppcoreguidelines-pro-bounds-avoid-unchecked-container-access
-      - cppcoreguidelines-pro-bounds-pointer-arithmetic
-      - cppcoreguidelines-pro-bounds-constant-array-index
-      - cppcoreguidelines-avoid-do-while
-      - readability-trailing-comma
-      - misc-non-private-member-variables-in-classes
-      - cppcoreguidelines-non-private-member-variables-in-classes
-      - readability-implicit-bool-conversion
-      - misc-no-recursion
-      - readability-function-cognitive-complexity
-      - readability-avoid-nested-conditional-operator
-      - modernize-use-trailing-return-type
-      - readability-identifier-length
-      - cppcoreguidelines-avoid-magic-numbers
-      - readability-magic-numbers
-      - readability-braces-around-statements
-      - cppcoreguidelines-avoid-non-const-global-variables
-      - cppcoreguidelines-owning-memory
-      - bugprone-easily-swappable-parameters
-      - cppcoreguidelines-pro-type-union-access
-      - cppcoreguidelines-pro-type-vararg
-      - misc-use-internal-linkage
-    CheckOptions:
-      misc-include-cleaner.IgnoreHeaders: '(^|.*/)bits/.*'
+  # The clang-tidy checks come from .clang-tidy, which clangd reads too. A
+  # second list here drifted from it (it still enabled checks .clang-tidy
+  # turns off), so the editor showed lints CI never reports.
+  # clangd's own include diagnostics stand in for misc-include-cleaner in the
+  # editor; ignore the same libstdc++ implementation headers it ignores.
+  Includes:
+    IgnoreHeader: ['bits/.*']
   UnusedIncludes: Strict
 
 InlayHints:

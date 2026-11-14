@@ -656,7 +656,7 @@ class JoinKeyBitmap {
         if (first == end) {
             return static_cast<std::size_t>(std::popcount(words_[first] & low_mask & high_mask));
         }
-        std::size_t n = static_cast<std::size_t>(std::popcount(words_[first] & low_mask));
+        auto n = static_cast<std::size_t>(std::popcount(words_[first] & low_mask));
         for (std::size_t w = first + 1; w < end; ++w) {
             n += static_cast<std::size_t>(std::popcount(words_[w]));
         }

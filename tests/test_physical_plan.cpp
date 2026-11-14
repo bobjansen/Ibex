@@ -6,6 +6,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/pipeline.hpp>
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -1903,6 +1905,118 @@ TEST_CASE("The hot Int64 sum splits one big chunk into row-range jobs and stays 
         parts *= 2;
     }
     CHECK(discovery->pool_tasks >= parts + 4);  // 4 jobs, not 1
+}
+
+TEST_CASE("Sorted Int64 keys are numbered in parallel exactly as the serial loop does",
+          "[physical][breaker][execute]") {
+    // Three aggregates keep the hot sum path out, and keys spaced 2 apart keep
+    // the dense path out, so a sorted chunk reaches the parallel sorted
+    // numbering. Runs of 7 cross the ranges' and the 300k-row chunks'
+    // boundaries; in the chunked section the last chunk revisits earlier keys,
+    // so the later paths must pick up the groups the sorted path numbered.
+    // `first(v)` reads each new group's first row.
+    const auto check = [](std::int64_t rows, bool unsorted_tail) {
+        runtime::TableRegistry registry;
+        runtime::Table t;
+        Column<std::int64_t> k;
+        Column<double> v;
+        for (std::int64_t r = 0; r < rows; ++r) {
+            const bool tail = unsorted_tail && r >= rows - 300'000;
+            k.push_back(tail ? ((r * 7919) % 50'000) * 2 : (r / 7) * 2);
+            v.push_back(static_cast<double>(r % 101) * 0.25);
+        }
+        t.add_column("k", std::move(k));
+        t.add_column("v", std::move(v));
+        registry.emplace("t", t);
+        auto ir = require_ir("t[select { s = sum(v), c = count(), f = first(v) }, by k];");
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(s.has_value());
+        REQUIRE(p.has_value());
+        REQUIRE(s->rows() == p->rows());
+        for (const char* name : {"k", "c"}) {
+            const auto& a = std::get<Column<std::int64_t>>(*s->find_entry(name)->column);
+            const auto& b = std::get<Column<std::int64_t>>(*p->find_entry(name)->column);
+            for (std::size_t i = 0; i < s->rows(); ++i) {
+                REQUIRE(a[i] == b[i]);
+            }
+        }
+        for (const char* name : {"s", "f"}) {
+            const auto& a = std::get<Column<double>>(*s->find_entry(name)->column);
+            const auto& b = std::get<Column<double>>(*p->find_entry(name)->column);
+            for (std::size_t i = 0; i < s->rows(); ++i) {
+                REQUIRE(a[i] == b[i]);
+            }
+        }
+    };
+    SECTION("one chunk") {
+        check(1'200'000, false);
+    }
+    SECTION("300k-row chunks, the last one unsorted") {
+        const char* saved = std::getenv("IBEX_CHUNK_ROWS");
+        const std::optional<std::string> restore =
+            saved == nullptr ? std::nullopt : std::optional<std::string>(saved);
+        runtime::set_env("IBEX_CHUNK_ROWS", "300000");
+        check(1'500'000, true);
+        if (restore.has_value()) {
+            runtime::set_env("IBEX_CHUNK_ROWS", *restore);
+        } else {
+            runtime::unset_env("IBEX_CHUNK_ROWS");
+        }
+    }
+}
+
+TEST_CASE("Partitioned discovery over run heads matches serial on clustered keys",
+          "[physical][breaker][execute]") {
+    // Two aggregates keep the hot sum path out, so this one-chunk table goes
+    // through the radix partitioned discovery, which now hashes only a run's
+    // first row and copies its gid along the run. Runs of varying length
+    // cross every range boundary, and the middle third revisits keys from
+    // the first, so a later run of a known key must find its group again.
+    constexpr std::int64_t kRows = 900'000;
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        Column<std::int64_t> k;
+        Column<double> v;
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            const std::int64_t run = r / (1 + (r % 7 == 0 ? 0 : 3));
+            const std::int64_t key = (r / 300'000 == 1) ? (run % 5'000) * 4 : run * 4;
+            k.push_back(key);
+            v.push_back(static_cast<double>(r % 101) * 0.25);
+        }
+        t.add_column("k", std::move(k));
+        t.add_column("v", std::move(v));
+        registry.emplace("t", t);
+    }
+    auto ir = require_ir("t[select { s = sum(v), c = count() }, by k];");
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+    parallel.parallel_stats = &stats;
+    const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(s.has_value());
+    REQUIRE(p.has_value());
+    REQUIRE(stats.parallel_aggregate_partitions.load() > 0);  // the radix path ran
+    REQUIRE(s->rows() == p->rows());
+    const auto& sk = std::get<Column<std::int64_t>>(*s->find_entry("k")->column);
+    const auto& pk = std::get<Column<std::int64_t>>(*p->find_entry("k")->column);
+    const auto& sv = std::get<Column<double>>(*s->find_entry("s")->column);
+    const auto& pv = std::get<Column<double>>(*p->find_entry("s")->column);
+    const auto& sc = std::get<Column<std::int64_t>>(*s->find_entry("c")->column);
+    const auto& pc = std::get<Column<std::int64_t>>(*p->find_entry("c")->column);
+    for (std::size_t i = 0; i < s->rows(); ++i) {
+        REQUIRE(sk[i] == pk[i]);
+        REQUIRE(sv[i] == pv[i]);
+        REQUIRE(sc[i] == pc[i]);
+    }
 }
 
 TEST_CASE("A known input size below the radix floor still lets the owned discovery fan out",

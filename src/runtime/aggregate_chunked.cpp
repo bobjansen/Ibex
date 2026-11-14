@@ -2316,6 +2316,20 @@ class HashAggregateState final {
             // `int_order_` holds the raw key whatever `int_key_kind_` is; the emit
             // side reconstructs Date/Timestamp/Categorical from it exactly as it
             // does for the ordinary int path, so this needs no kind-specific arm.
+            // A sorted chunk (TPC-H's l_orderkey) needs no hash at all: the
+            // serial loop below numbers it by comparison alone, and every
+            // hashed fan-out (owned, partitioned) would only add work. Numbered
+            // in parallel here when it is big enough to split.
+            if (try_discover_sorted_int(key_at, rows, gids,
+                                        has_discovery_first ? &first_rows : nullptr)) {
+                if (has_discovery_first) {
+                    seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
+                }
+                publish_discovered(agg_entries, rows,
+                                   has_discovery_first ? &discovery_first : nullptr);
+                return std::nullopt;
+            }
+
             if (try_owned<std::int64_t, robin_hood::hash<std::int64_t>>(
                     key_at, rows, gids, agg_entries, owned_int_partitions_, kIntOwnedMinRows)) {
                 publish_fused_accumulation();
@@ -4519,6 +4533,149 @@ class HashAggregateState final {
     /// Set once the one-core sample (`sample_mostly_distinct`) said no.
     mutable bool single_core_sample_declined_ = false;
 
+    /// Rows below which a sorted chunk is left to the serial loop, which
+    /// handles it with comparisons alone; under this the fan-out costs more.
+    static constexpr std::size_t kSortedIntParallelRows = std::size_t{1} << 18;
+    /// Rows per range of the sorted-chunk numbering, at least.
+    static constexpr std::size_t kSortedIntRangeRows = std::size_t{1} << 16;
+    /// Set once a chunk was found not sorted, so later chunks skip the check.
+    bool sorted_int_declined_ = false;
+
+    /// Number a chunk whose Int64 keys never decrease, in parallel, exactly as
+    /// the serial loop's deferred-index branch would: a group per run, ids in
+    /// row order, continuing the previous chunk's last group when the chunk
+    /// starts on its key. No hash is computed. Pass 1 checks each range is
+    /// non-decreasing and counts its runs (stopping at the first decrease);
+    /// the ranges' first and last keys must join up and the chunk must start
+    /// at or above `int_max_key_`. Pass 2 hands each range its first id from
+    /// a prefix over the ranges and writes gids, `int_order_` and (when
+    /// `first_rows` is given) each new group's first row. False, with nothing
+    /// written, when the chunk is not sorted, too small, the deferred index is
+    /// no longer valid, or Discovery may not fan out -- the serial loop and
+    /// the hashed paths then run as before.
+    template <typename KeyAt>
+    auto try_discover_sorted_int(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
+                                 std::vector<std::size_t>* first_rows) -> bool {
+        if (sorted_int_declined_ || rows < kSortedIntParallelRows || exec_ == nullptr ||
+            on_worker_pool_thread() || !int_index_deferred_ || n_groups_ != int_serial_groups_ ||
+            partitioned_active_ || owned_mode_ ||
+            par_.discovery.decline != physical::FanOutDecline::None ||
+            par_.discovery.worker_cap < 2) {
+            return false;
+        }
+        const std::size_t ranges =
+            std::clamp<std::size_t>(rows / kSortedIntRangeRows, 1, par_.discovery.worker_cap * 4);
+        const auto range_begin = [&](std::size_t r) { return rows * r / ranges; };
+        struct RangeInfo {
+            std::int64_t first = 0;
+            std::int64_t last = 0;
+            std::size_t runs = 0;
+        };
+        std::vector<RangeInfo> info(ranges);
+        std::atomic<bool> unsorted{false};
+        auto& pool = process_worker_pool();
+        const std::size_t workers = std::min(ranges, par_.discovery.worker_cap);
+        {
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(workers, [&](std::size_t) {
+                for (std::size_t r = cursor.fetch_add(1, std::memory_order_relaxed); r < ranges;
+                     r = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                    const std::size_t begin = range_begin(r);
+                    const std::size_t end = range_begin(r + 1);
+                    std::int64_t prev = key_at(begin);
+                    std::size_t runs = 1;
+                    for (std::size_t row = begin + 1; row < end; ++row) {
+                        const std::int64_t key = key_at(row);
+                        if (key < prev) {
+                            unsorted.store(true, std::memory_order_relaxed);
+                            return;
+                        }
+                        runs += key != prev ? 1 : 0;
+                        prev = key;
+                        if ((row & 4095U) == 0 && unsorted.load(std::memory_order_relaxed)) {
+                            return;
+                        }
+                    }
+                    info[r] = {.first = key_at(begin), .last = prev, .runs = runs};
+                }
+            });
+            batch.wait();
+        }
+        if (unsorted.load(std::memory_order_relaxed)) {
+            sorted_int_declined_ = true;
+            return false;
+        }
+        // Join the ranges: each must start at or above where the last ended,
+        // and the chunk at or above every key already numbered. A range that
+        // starts on the previous range's (or chunk's) last key continues that
+        // group rather than opening one.
+        const std::size_t groups_before = n_groups_;
+        std::vector<std::size_t> first_gid(ranges + 1, groups_before);
+        bool continues_prior = false;
+        for (std::size_t r = 0; r < ranges; ++r) {
+            bool continues = false;
+            if (r == 0) {
+                if (groups_before != 0) {
+                    if (info[0].first < int_max_key_) {
+                        sorted_int_declined_ = true;
+                        return false;
+                    }
+                    continues = info[0].first == int_max_key_;
+                    continues_prior = continues;
+                }
+            } else {
+                if (info[r].first < info[r - 1].last) {
+                    sorted_int_declined_ = true;
+                    return false;
+                }
+                continues = info[r].first == info[r - 1].last;
+            }
+            first_gid[r + 1] = first_gid[r] + info[r].runs - (continues ? 1 : 0);
+        }
+        const std::size_t total = first_gid[ranges];
+        n_groups_ = total;
+        int_serial_groups_ = total;
+        int_max_key_ = info[ranges - 1].last;
+        int_order_.resize(total);
+        size_group_arrays();
+        if (first_rows != nullptr) {
+            first_rows->resize(total - groups_before);
+        }
+        {
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(workers, [&](std::size_t) {
+                for (std::size_t r = cursor.fetch_add(1, std::memory_order_relaxed); r < ranges;
+                     r = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                    const std::size_t begin = range_begin(r);
+                    const std::size_t end = range_begin(r + 1);
+                    // The id the range's first run continues, or one before
+                    // its first new id; either way `next` is the next new id.
+                    const bool continues =
+                        r == 0 ? continues_prior : info[r].first == info[r - 1].last;
+                    auto gid = static_cast<std::uint32_t>(first_gid[r] - (continues ? 1 : 0));
+                    std::size_t next = first_gid[r];
+                    std::int64_t prev = 0;
+                    for (std::size_t row = begin; row < end; ++row) {
+                        const std::int64_t key = key_at(row);
+                        const bool opens = row == begin ? !continues : key != prev;
+                        if (opens) {
+                            gid = static_cast<std::uint32_t>(next++);
+                            int_order_[gid] = key;
+                            if (first_rows != nullptr) {
+                                (*first_rows)[gid - groups_before] = row;
+                            }
+                        }
+                        gids[row] = gid;
+                        prev = key;
+                    }
+                }
+            });
+            batch.wait();
+        }
+        note_partition_fanout();
+        return true;
+    }
+
     /// Discovery runs on the calling core alone: the plan declined fan-out
     /// for want of cores (not for want of rows), or left one worker.
     [[nodiscard]] auto discovery_single_core() const -> bool {
@@ -4731,6 +4888,22 @@ class HashAggregateState final {
         if constexpr (kKeepKeys) {
             row_keys.resize(rows);
         }
+        // Run heads: with the keys kept, only a row whose key differs from the
+        // previous row's (or that starts its range) is hashed, scattered and
+        // probed; the rest of its run copies its gid in pass 4. That is the
+        // serial path's run shortcut, kept across the fan-out. Clustered keys
+        // (sorted l_orderkey: four rows a run) otherwise cost this path ~10x
+        // the serial path's work, which hashes once per run; on unclustered
+        // keys every row is a head and nothing changes. A row that is not a
+        // head has no partition written in `part_of_row_`: nothing reads it.
+        constexpr bool kRunHeads = kKeepKeys && std::equality_comparable<Probe>;
+        const auto is_head = [&](std::size_t row, std::size_t range_begin) {
+            if constexpr (kRunHeads) {
+                return row == range_begin || !(row_keys[row] == row_keys[row - 1]);
+            } else {
+                return true;
+            }
+        };
         {
             auto batch = pool.submit(ranges, [&](std::size_t r) {
                 const std::size_t begin = r * grain;
@@ -4741,6 +4914,11 @@ class HashAggregateState final {
                     const auto key = key_at(row);
                     if constexpr (kKeepKeys) {
                         row_keys[row] = key;
+                    }
+                    if constexpr (kRunHeads) {
+                        if (row != begin && key == row_keys[row - 1]) {
+                            continue;
+                        }
                     }
                     const auto part = static_cast<std::uint8_t>(hasher(key) & part_mask);
                     part_of_row_[row] = part;
@@ -4774,9 +4952,11 @@ class HashAggregateState final {
         // bytes.
         // NOLINTNEXTLINE(misc-const-correctness) -- written when kScatterKeys, below
         ::ibex::detail::NoInitVector<Probe> scattered_keys;
-        scatter_rows_.resize(rows);
+        // Sized by the heads, which is every row unless kRunHeads found runs.
+        const std::size_t scattered = part_begin[part_count];
+        scatter_rows_.resize(scattered);
         if constexpr (kScatterKeys) {
-            scattered_keys.resize(rows);
+            scattered_keys.resize(scattered);
         }
         {
             auto batch = pool.submit(ranges, [&](std::size_t r) {
@@ -4784,6 +4964,9 @@ class HashAggregateState final {
                 const std::size_t end = std::min(rows, begin + grain);
                 std::size_t* cursor = offsets.data() + (r * part_count);
                 for (std::size_t row = begin; row < end; ++row) {
+                    if (!is_head(row, begin)) {
+                        continue;
+                    }
                     const std::size_t at = cursor[part_of_row_[row]]++;
                     scatter_rows_[at] = row;
                     if constexpr (kKeepKeys) {
@@ -4999,6 +5182,12 @@ class HashAggregateState final {
                 const std::size_t begin = r * grain;
                 const std::size_t end = std::min(rows, begin + grain);
                 for (std::size_t row = begin; row < end; ++row) {
+                    if constexpr (kRunHeads) {
+                        if (!is_head(row, begin)) {
+                            gids[row] = gids[row - 1];  // global already: row - 1 is earlier
+                            continue;
+                        }
+                    }
                     gids[row] = partitions[part_of_row_[row]].gids[gids[row]];
                 }
             });

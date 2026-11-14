@@ -26,8 +26,9 @@ parser AST → logical IR → physical plan → pipelines → morsel executor �
   selection and execution capability.** Its nodes are data, and each declares
   rather than implies: schema and `TableProperties` transfer, streaming or
   blocking, partitioning and output-order rule, state ownership, fan-out
-  policy, and a decline reason. `explain physical` prints it. A plan that
-  cannot say why it materialized is not acceptable.
+  policy, and a decline reason. `explain_physical` renders it (the REPL's
+  `:explain <expr>`). A plan that cannot say why it materialized is not
+  acceptable.
 - **A pipeline** runs from a partitionable source or a breaker's output to the
   next breaker. A breaker owns its build state and starts the next pipeline
   when its build completes. The executor runs numbered morsels on the one
@@ -40,8 +41,9 @@ parser AST → logical IR → physical plan → pipelines → morsel executor �
   kernels serve filter output, join assembly, sort and aggregate emission).
 - **Breakers follow state ownership, not universal streaming.** Hash join: one
   build, immutable once built (`JoinHashIndex`), probed by source-order
-  morsels. Hash aggregate: partitions own key maps and slots, with a
-  data-derived partition count. Order and distinct are explicit barriers.
+  chunks — on the consumer, or on the scan workers that produced them. Hash
+  aggregate: partitions own key maps and slots, with a data-derived partition
+  count. Order and distinct are explicit barriers.
 - **`MaterializedCall` is the accepted end state for the rest**, not a
   way-station: honest, profiled, named in `explain physical`, its inputs built
   through `materialize_plan` (`build_materialized_fallback`,
@@ -79,9 +81,14 @@ Owner: `include/ibex/runtime/operator.hpp`.
   bug recorded in the plans was exactly a lost carrier).
 * Categorical columns across chunks of one stream **share one backing
   dictionary**; codes are copied verbatim, never re-interned. This is what
-  `append_column_values` and `gather_range` rely on. *Known hardening debt*
-  (Phase 2): extern chunked sources with independent per-chunk dictionaries
-  violate this silently.
+  `append_column_values` and `gather_range` rely on. A streamed scan decodes
+  each unit over that unit's own dictionary, so `PipelinedScanOperator`
+  remaps onto a shared one as it emits (`normalize_categorical_dictionaries`).
+  The one sanctioned exception is a `ScanWorkerSink` consumer that names
+  `untranslated_columns`: it receives the remap and owns the translation
+  before anything reads those codes as shared ones. *Known hardening debt*:
+  extern chunked sources with independent per-chunk dictionaries violate the
+  rule silently.
 * Validity is `optional<ValidityBitmap>`; `nullopt` means all rows valid.
   Concat widens lazily: the result stays `nullopt` until some chunk carries
   nulls, backfilling the accumulated prefix as valid
@@ -107,7 +114,7 @@ Owner: `operator.hpp` (fields), `morsel.hpp` (construction).
   be mutated while any is live — guaranteed by the one-query-at-a-time lease
   (`query_lease.hpp`), not by the type.
 * `make_morsel_chunk` is the single construction point: the serial
-  `PartitionedTableSource` and the parallel island's workers must produce
+  `PartitionedTableSource` and the morsel pipeline's workers must produce
   byte-identical chunks for the same range, so neither builds its own.
 * Source-global *selections* (survivor masks, deferred-scan row indices,
   dynamic-filter keep lists) are expressed in the **source's** row space,
@@ -132,20 +139,29 @@ Owner: `operator.hpp`.
   outputs agree in rows, order and non-float values (floats within
   tolerance, §7), which is what lets every threshold in the engine move
   without a correctness argument.
-* Per-chunk interruption boundaries: long *pipelines* check
-  `interrupt_requested()` between chunks; intra-operator fan-outs
-  historically do not (documented gap, I13 in `PARALLELISM.md`).
+* Per-chunk interruption boundaries: the pipeline executors (morsel
+  pipeline, streamed scan, stage) and the streaming join and semi/anti
+  operators check `interrupt_requested()` between chunks; intra-operator
+  fan-outs do not (documented gap, I13 in `PARALLELISM.md`).
 * An operator normally degrades to serial under `on_worker_pool_thread()` —
   "outermost wins" — to avoid needless nested fan-out. A necessary nested
   `WorkerPool::submit` is safe: workers cooperatively execute queued tasks
   while waiting for their child batch, so saturation cannot deadlock it.
+* **Work done on a scan worker is a hint, not a second protocol.** A consumer
+  may hook the workers of the streamed scan directly beneath it
+  (`ScanWorkerSink`, `scan_worker_sink_internal.hpp`) or append a step to
+  every worker chain (`try_attach_worker_step`). Either way the chunks still
+  arrive through `next()` in unit order, and a sink that stored nothing
+  leaves the chunk to its ordinary path.
 
 ## 4. Materialization — the sink
 
 Owner: `operator.hpp` (`MaterializeOperator`, `append_column_values`).
 
 * The sink drains incrementally: peak memory is `result + 1 chunk`, each
-  chunk released before the next pull.
+  chunk released before the next pull. `materialize_operator` first switches
+  off a streaming pipeline's output batching (`unbatch_pipeline_output`): a
+  drain takes every chunk, so batching would only copy each row once more.
 * Per-column capacity grows **geometrically**. Reserving exactly
   `size + chunk` per chunk is the recorded trap: the concat goes quadratic
   in chunk count (93% of runtime in `memmove` on a 20M-row island at 64k
@@ -161,11 +177,13 @@ Owner: `operator.hpp` (`MaterializeOperator`, `append_column_values`).
 
 Owner: `table_properties.hpp`.
 
-* `ordering`, `time_index`, `grouped_by`, `logical_rows` are **derived
-  claims about row layout**, transfered by `RowTransform` (`Preserve`,
-  `Subset`, and the fate-tracked key forms), never asserted by the operator
-  that wishes them true. `normalized()` enforces the TimeFrame invariant at
-  the single mutator.
+* `ordering`, `time_index` and `grouped_by` are **derived claims about row
+  layout**, transferred by `RowTransform` (`Preserve`, `Subset`, `Reorder`,
+  `Recombine`) together with each key's `KeyFate`, never asserted by the
+  operator that wishes them true. Every caller must name its transform; there
+  is no default. `normalized()` enforces the TimeFrame invariant at the
+  single mutator. (`logical_rows` is not a property: it lives on the `Table`
+  and the `Chunk`, §1.)
 * `grouped_by` is the hazard flag that stops an unpartitioned
   order-dependent call (`lag`, `rolling_*`) from reading across a group
   boundary; slicing a group-major table into morsels does not make those
@@ -186,16 +204,23 @@ Owner: `table_properties.hpp`.
   registrations via `register_chunked_table`) own their own decode timing.
   A deferred **probe** scan's decode belongs to the join above it — its
   filter slot is published from the build side first — which is why bare-scan
-  streaming declines it (`chunked.cpp`'s Scan branch draws the same line).
+  streaming declines it (the `deferred->filter == nullptr` tests in
+  `runtime_entry.cpp` and `pipeline_executor.cpp` draw the same line).
+* A streamed scan on either side of a join may likewise be filtered by the
+  other side's keys once that side is built (`publish_build_filter_column`,
+  `streamed_left_scan_of`): inner and semi joins only — a left join keeps the
+  rows such a filter would drop. A filter the unit's footer statistics prove
+  rejects nothing is dropped rather than evaluated.
+* Parsed Parquet footers are cached per process and validated against the
+  file (`fstat`) on every open; a stale entry is re-read, never trusted.
 * Column demand is computed once per plan (`ir::required_columns` /
   `scan_predicates`) against the whole-script DAG; a column is decoded only
   if it participates in the result. Predicate-only columns are never
-  materialized (`decode-fusion`, stage 1).
+  materialized.
 * The extern chunked-source **contract** (stable schema, ownership/lifetime,
   dictionary expectations, EOF/error signalling) is the one source contract
   still documented only by its implementations (`csv::read`, ADBC, Parquet);
-  writing it down is Phase 2 contract work alongside the kernel APIs
-  (tracked from the removed chunked-execution-plan).
+  writing it down is outstanding.
 
 ## 7. Determinism bar (the contract behind every contract)
 

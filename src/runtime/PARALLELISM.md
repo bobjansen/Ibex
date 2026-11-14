@@ -15,8 +15,9 @@ time**. There is no `Exchange` operator, no partitioned re-distribution between
 operators, no plan-level degree-of-parallelism. Parallelism is **operator-internal**:
 each operator decides for itself whether to fan its own row range out over a
 shared worker pool, and rejoins before it returns. Two coarser layers sit on top
-— **pipeline overlap** between a scan and its consumer, and a **morsel pipeline**
-over a maximal chain of row-local operators. Scheduling is **dynamic
+— **pipeline overlap** between a scan and its consumer (which may hand part of
+its own work to the scan's workers), and a **morsel pipeline** over a maximal
+chain of row-local operators. Scheduling is **dynamic
 self-scheduling** off a shared atomic cursor: no work stealing, no deques, no
 priorities, no DAG. Every parallel path produces the **same rows, in the same
 order, with the same non-float values** as its serial counterpart at any core
@@ -58,7 +59,7 @@ Three properties the rest of the design depends on:
   merger's consumer and must stay free.
 - **Nested `submit` is safe.** A pool worker blocked in `wait_for_batch`
   _cooperatively runs queued tasks_ while it waits, so a saturated set of
-  parents forking child batches cannot deadlock. Therefore the
+  parents forking child batches cannot deadlock. Therefore, the
   `on_worker_pool_thread()` check at the ~70 call sites is a **performance
   gate, not a correctness gate**: it declines to re-divide a pool an outer
   fan-out already saturated, because that only adds dispatch and merge overhead.
@@ -87,7 +88,12 @@ memory system saturates; compute is not and measurably regresses under it
 (q01 +4.6%, q17 +3.2% when a compute path accidentally used the pool size).
 **Every compute fan-out sizes itself from `compute_budget()`**; only
 `scan_pipeline_worker_count` draws on the whole pool.
-`IBEX_THREADS` (which used to conflate the two) is read only to warn once.
+Both default from the CPUs the process may run on (`available_cpu_count()`: the
+affinity mask on Linux, so `taskset`, cpusets and container CPU sets count;
+cgroup CPU quotas are not seen). Plugins share the host's pool: the CSV reader's
+parallel eager read sizes itself from `compute_thread_count()` and the pool
+size, never from its own thread count.
+`IBEX_THREADS` (which used to conflate the two) is no longer read.
 
 ## The three layers of parallelism
 
@@ -104,7 +110,11 @@ compute across a **pipeline breaker** (join build, aggregate, sort).
   in `scan_pipeline_worker_count`), and the consumer decodes units in its place
   whenever it would otherwise park (`run_consumer_unit`, under a serial
   context); the ring carries one extra round so the workers do not park behind
-  it. Before this, q06 at 8 cores kept 7 of 8 cores busy.
+  it. Before this, q06 at 8 cores kept 7 of 8 cores busy. Each unit decodes
+  over its own Categorical dictionary; the consumer remaps onto a shared one
+  as it emits. Row-local updates directly above or below the run join the
+  worker chains when the run streams (`Plan::stream_only_updates`,
+  `stream_only_bottom_updates`) and are composed serially when it does not.
 - **`PipelinedStageOperator`** — a two-slot double buffer running its child on a
   raw thread, so a breaker's probe input is produced concurrently with the
   breaker consuming it. Admitted only when the child can publish more than one
@@ -112,14 +122,36 @@ compute across a **pipeline breaker** (join build, aggregate, sort).
 
 `IBEX_STREAM_SCAN=0` opts out. On by default (measured ~6–8% faster on PDS-H).
 
+**Consumer work on the scan workers.** A breaker directly above a streamed scan
+can move its per-chunk work onto the worker that decoded the unit, while the
+unit is still in that core's cache. Output still arrives in unit order, so
+none of this changes an answer. Two mechanisms:
+
+- **`ScanWorkerSink`** (`scan_worker_sink_internal.hpp`) — a hook the consumer
+  offers (`ScanWorkerSinkOffer`) to the one pipeline built beneath it, admitted
+  only when its input is a row-local chain directly over a lazy scan.
+  `on_worker_chunk` runs on the worker, `on_emit` on the consumer; both are
+  hints. Two users, both on by default: the grouped aggregate's dense
+  accumulation (`DenseAggregateScanSink` — per-unit partials merged by the
+  aggregate; the q01 shape) and the swapped semi/anti join's probe of its
+  streamed right side (`SemiAntiScanSink`; the q04 shape, offered only when
+  the left source is the smaller).
+- **Attached worker steps and unit pipelines** (`try_attach_worker_step`,
+  `build_unit_pipeline`) — a join probe appended to every worker chain of a
+  streaming left input, or a deferred probe scan run per unit (key scan, probe,
+  selected decode and assembly on one worker). **Opt-in**:
+  `IBEX_STREAM_PROBES=1` (`ExecutionContext::stream_probes`), off by default.
+  A unit pipeline batches its output to ~1M rows for the per-chunk breakers
+  above it; a drain switches that off (`unbatch_pipeline_output`).
+
 ### Layer B — the morsel pipeline (was "parallel island")
 
 A maximal bottom-up chain of **row-local, chunk-preserving** operators (filter /
 project / rename / row-local update / their fused forms) run as **one
-independent task per morsel**, with an **order-preserving merge** that makes the
+independent task per morsel**, with an **order-preserving merge**. This makes the
 output identical in rows and order to the serial chain regardless of completion
-order (a row-local chain does no cross-row float reduction, so this one is exact
-in floats too).
+order. A row-local chain does no cross-row float reduction, so this one is exact
+in floats too.
 
 `MorselPipelineOperator` (`pipeline_executor.cpp`) is the executor. Key rules:
 
@@ -128,7 +160,11 @@ in floats too).
    exists — morsel sources take `const Table&`, so the signature enforces it.
 2. **Grain** (`morsel_grain`): aim for ~4 morsels per thread, clamped to
    `[4096, 65536]`. Derived, not tuned — a 1000× sweep found no grain in that
-   band that loses to serial.
+   band that loses to serial. **Workers** (`morsel_worker_count`):
+   `min(compute budget, pool, morsels)`, less one when that would take the
+   whole pool on a run longer than three rounds — a downstream stage may submit
+   a batch while these workers are parked on the bounded ring (the same rule
+   as the streamed scan).
 3. **Whether to morselize at all** is a two-dimensional gate on rows _and_
    cells (`parallel_min_rows` + `parallel_min_cells`), because a morsel's cost
    is dominated by copying rows out, which scales with table _width_. A refusal
@@ -155,12 +191,22 @@ private gate. Summarized by parallel axis:
 | Group discovery (`try_discover_partitioned`)  | radix/hash partitioning by key hash                                | partition-local ids, then a serial first-occurrence merge assigns global ids in row order                  |
 | Grouped / ungrouped aggregation               | partial pre-aggregation into per-morsel private slots, then merge  | morsel count derived from **rows**, merged in ascending morsel order → machine-independent float reduction |
 | Owned aggregation (single-Int64 / PairIntKey) | partition-owned key maps + slots                                   | merge-path co-ranking on globally-unique `first_rows` (parallel finalize)                                  |
-| Hash join probe                               | probe rows; build side is a shared read-only index, never threaded | per-worker `(li, ri)` pairs concatenated in range order                                                    |
-| Semi/anti predicate                           | probe rows against a frozen set                                    | ascending concat                                                                                           |
+| Hash join build                               | head table partitioned by key hash, one worker per partition       | partitions are disjoint; no merge                                                                          |
+| Hash join probe                               | probe rows against the built, read-only index                      | per-worker `(li, ri)` pairs concatenated in range order                                                    |
+| Semi/anti join                                | dense right build; probe rows against the frozen set               | keep-bit words per row range                                                                               |
 | Distinct                                      | packed-key partitions                                              | workers record a keep-flag at a row, never a position                                                      |
+| Sort — radix                                  | fixed contiguous row chunks, same chunks to count and to scatter   | prefix-summed bucket offsets; stable                                                                       |
 | Sort — gather                                 | (column × row range) tasks, 64-row-aligned                         | permutation already fixed; disjoint writes                                                                 |
 | Sort — per-group slice sort / rank            | one group per task                                                 | groups own disjoint row spans                                                                              |
 | Parquet decode                                | (column × row group) tasks, one `FileReader` per worker            | tasks write disjoint output ranges                                                                         |
+| Aggregate emission                            | (output column × 64-group range) tasks                             | pre-sized destination, groups written by index                                                             |
+| Row-local update fields                       | row ranges of one expression                                       | disjoint output slices                                                                                     |
+| CSV eager read                                | byte ranges split at record boundaries                             | ranges concatenated in file order                                                                          |
+
+The table lists the families, not every site. Top-k (grouped and ungrouped),
+rank setup, melt, dcast, resample, `fill_forward`/`fill_backward`, as-of join,
+global and grouped cov/corr, count_distinct shards and median/quantile collect
+all fan out the same way, each with its own gate.
 
 Recurring idioms: **private-state-then-merge** wherever a reduction exists;
 **disjoint-slice writes** wherever one does not; **count → prefix-sum →
@@ -185,12 +231,12 @@ several remaining breaker internals do not.
 | Category                                                                                                                                     | Whether parallel + how                                                                                                                                                                                                                                                                                                                                                                                                                                              | Represented in `physical::Plan`?                       | `explain physical` shows it?                     |
 | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------ |
 | **Map chains** (Filter/Project/Rename/row-local Update, fused)                                                                               | **The physical planner owns it end to end.** `plan.mode` (`Serial`/`MorselParallel`), `parallel_begin`/`parallel_end` (which steps run over morsels), and per-step `MapStep` (capability + kernel factory + column signature).                                                                                                                                                                                                                                      | **Yes, fully.**                                        | Yes.                                             |
-| **Join**                                                                                                                                     | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`) — and **both** fan-out phases: `build_partitions` reads `par_.build`, `probe_parallel_workers` reads `par_.probe` (slices 4–5). What stays in the operator is the kill switch / nesting / per-chunk floor. Output assembly is inside `ChunkedInnerJoinOperator`.                                                                                      | **Yes** (structure + both phases, both authoritative). | Structure + both phases.                         |
+| **Join** (streaming inner, one key or two Int64 keys; streaming left, one key)                                                              | The plan owns the **structure** — `JoinPlan` names the `JoinBranch` and leaves orientation to run time (`49188c71`); typed `HashBuild` / `HashProbe` nodes carry the edge — and **both** fan-out phases: `build_partitions` reads `par_.build`, `probe_parallel_workers` reads `par_.probe`. What stays in the operator is the kill switch / nesting / per-chunk floor. Output assembly is inside `ChunkedInnerJoinOperator`, which the left join shares. Semi/anti streams through its own operator with private gates; every other join shape materializes both sides and names its `JoinDeclineReason`. | **Yes** (structure + both phases, both authoritative). | Structure + both phases.                         |
 | **Aggregate**                                                                                                                                | The plan owns the adaptive strategy, positional `AggregateColumnMapping`, and four typed hash-fallback nodes (discovery → accumulation → final ordering → emission). Each node carries and authoritatively supplies its own fan-out policy. A serial coordinator invokes every node: discovery transfers one bounded chunk of group IDs/column bindings to accumulation, or marks a one-pass kernel explicitly fused; final ordering and emission are separate. | **Yes, structural and authoritative.**                 | Strategy + typed chain + all four node policies. |
 | **Distinct**                                                                                                                                 | The plan owns the `dedup` policy (floor, ceiling, packed-key strategy, optional estimate); the builder resolves it and the operator reads it. Nesting, the first concrete chunk's row count, and the derived partition count remain runtime decisions.                                                                                                                                                                                                              | **Yes, authoritative.**                                | Yes.                                             |
 | **Order**                                                                                                                                    | The plan describes one `sort` phase. The actual radix-sort/gather fan-out reads shared `ExecutionContext` knobs in `sort.cpp`, so this phase is descriptive rather than authoritative.                                                                                                                                                                                                                                                                              | **Yes, descriptive.**                                  | Yes.                                             |
 | **TopK / Head / Tail / FilterHead / FilterTail**                                                                                             | Plan-built serial breaker operators. They have no current fan-out point; TopK deliberately uses a bounded streaming heap rather than a full sort.                                                                                                                                                                                                                                                                                                                   | **Yes; no parallel policy.**                           | Serial-by-design reason.                         |
-| **Remaining Layer C fan-out inside operators** (sort gather, decode, semi/anti predicate, and data-dependent aggregate specialization gates) | The operator owns decisions not yet promoted. Migrated Distinct, Join, and Aggregate paths instead read their resolved plan policy and retain only runtime/data-dependent admission checks.                                                                                                                                                                                                                                                                         | Mixed.                                                 | Only promoted phases.                            |
+| **Remaining Layer C fan-out inside operators** (sort, decode, semi/anti build and predicate, the materialized fallbacks, and data-dependent aggregate specialization gates) | The operator owns decisions not yet promoted. Migrated Distinct, Join, and Aggregate paths instead read their resolved plan policy and retain only runtime/data-dependent admission checks.                                                                                                                                                                                                                                                                         | Mixed.                                                 | Only promoted phases.                            |
 
 **There is not yet one owner for every breaker's parallelism.** The physical
 plan owns map chains and the promoted Distinct, Join, and Aggregate policies;
@@ -214,7 +260,8 @@ still combine these halves at their use sites.
    column demand (`g`, `v`), nothing about execution.
 2. **`plan_physical`** — records a migrated `Breaker(Distinct)` with one
    `dedup` phase: packed-key strategy, 32768-row floor, worker ceiling, and any
-   available row estimate. `explain physical` renders that unresolved policy.
+   available row estimate. `:explain t[distinct { g, v }]` renders that
+   unresolved policy.
 3. **`build_physical_distinct`** — resolves the policy against the
    `ExecutionContext` and worker pool, then passes it to
    `ChunkedDistinctOperator`.
@@ -249,7 +296,7 @@ The devices:
    this device nor an exception.
 3. Group ids assigned by **first occurrence in row order**, after the parallel
    phase, so ids do not vary with thread count.
-4. Errors selected by **lowest sequence / lowest worker id**; an interrupt
+4. Errors selected by **lowest sequence or lowest worker id**; an interrupt
    outranks a data error.
 
 A different row, row order, key, count, integer, string or decimal is a bug;
@@ -273,29 +320,35 @@ required-ordering property propagated down the plan. Not built.
 
 | Variable                 | Reads                            | Meaning                                                                                                                              |
 | ------------------------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `IBEX_CORES`             | `compute_thread_count()`         | compute budget (`auto` = `hardware_concurrency`; **parallel is on whenever this is ≥ 2**, which is the default on any multicore box) |
+| `IBEX_CORES`             | `compute_thread_count()`         | compute budget (unset or `auto` = `available_cpu_count()`, the affinity mask; **parallel is on whenever this is ≥ 2**, which is the default on any multicore box) |
 | `IBEX_DECODE_THREADS`    | `decode_thread_count()`          | absolute pool-size override                                                                                                          |
 | `IBEX_DECODE_SATURATION` | `decode_thread_count()`          | memory-system saturation point (default 8)                                                                                           |
 | `IBEX_MORSEL_ROWS`       | `morsel_rows_from_env()`         | morsel grain override; also lowers `parallel_min_rows` to it                                                                         |
 | `IBEX_STREAM_SCAN`       | `stream_scans_from_env()`        | Layer A streaming scan on/off (default on)                                                                                           |
 | `IBEX_JOIN_PROBE`        | `parallel_join_probe_from_env()` | parallel join probe on/off (default on)                                                                                              |
+| `IBEX_STREAM_PROBES`     | `stream_probes_from_env()`       | join probes on the workers of a streaming pipeline (default **off**)                                                                 |
 | `IBEX_CHUNK_ROWS`        | `source_chunk_rows_from_env()`   | force multi-chunk sources (test-only)                                                                                                |
 | `IBEX_PARALLEL_STATS`    | `process_pipeline_stats()`       | print `ParallelPipelineStats` at exit — the only way to tell "ran parallel" from "silently fell back to serial"                      |
 | `IBEX_PROFILE_OPERATORS` | `execution_profile_requested()`  | per-operator phase profile (barrier wait, ring wait, occupancy)                                                                      |
-| `IBEX_THREADS`           | —                                | **ignored**, warns once (split into `IBEX_CORES` + `IBEX_DECODE_THREADS`)                                                            |
+| ~~`IBEX_THREADS`~~       | removed                          | no longer read (split into `IBEX_CORES` + `IBEX_DECODE_THREADS`)                                                                     |
 | ~~`IBEX_PARALLEL`~~      | removed                          | serial is `IBEX_CORES=1` — a budget of one _is_ parallelism off, with no second spelling that can disagree                           |
 
-The decoder and the operators **must never read the environment directly** —
-`ExecutionContext` is the single authority, so there is no second copy free to
-disagree.
+The decoder and the operators **must never read the environment directly** for
+any of these — `ExecutionContext` is the single authority, so there is no second
+copy free to disagree. The I/O plugins keep a few experiment-only switches of
+their own that do not touch the budget (`IBEX_CSV_SERIAL`,
+`IBEX_CSV_PARALLEL_MIN_BYTES`, `IBEX_CSV_PARALLEL_RANGE_BYTES`,
+`IBEX_PARQUET_STRING_CHUNK_BYTES`).
 
 ## Where the model is still muddy
 
 **The structural owner now exists for migrated breakers.** Distinct, streaming
 Join, and streaming Aggregate take their fan-out policies from explicit
 physical nodes and expose those decisions through `explain physical`.
-Aggregate's four phases, streaming inner join, migrated-plan dispatch, and the
-generic map/morsel executor now live outside `chunked.cpp`. Remaining
+Aggregate's four phases, the streaming joins, migrated-plan dispatch, and the
+generic map/morsel executor each live in their own file (`aggregate_chunked.cpp`,
+`join_chunked.cpp`, `runtime_entry.cpp`, `pipeline_executor.cpp`); `chunked.cpp`
+is gone. Remaining
 operator-private decisions belong to breaker families that have not completed
 that migration; do not generalize their local thresholds into a second policy
 system.
@@ -319,8 +372,9 @@ bugs: each new operator copies whichever neighbour it was written next to.
 - **I7** — `parallel_min_cells` (width) is consulted by 2 sites (`pipeline_executor.cpp`, `sort.cpp`) against ~20 for `parallel_min_rows`, though
   "131k rows won at 6 columns, lost at 2" applies equally to filter gather,
   join concat and aggregate emission.
-- **I9** — worker-count caps differ arbitrarily (`min(…, 64)`, `min(…, 16)`,
-  uncapped), undocumented.
+- **I9** — worker-count caps differ: the plan-owned phases and the join /
+  semi-anti probes cap at 64, every other site is bounded only by budget and
+  pool, undocumented.
 - **I10** — aggregate emission gates a group count against a _row_ threshold.
 - **I12** — two thread species: the long-lived stage thread of
   `PipelinedStageOperator` (parks on consumer backpressure; hosting it on the
@@ -351,8 +405,10 @@ bugs: each new operator copies whichever neighbour it was written next to.
 - **Multiple producers per staged breaker.** Decoding two sibling scans
   concurrently was worth ~15% synthetically and ~8% on q10 alone (~3%
   in-suite), but every widening measured worse: semi/anti overlap q04 +19%,
-  `build_binary_materializing_operator` q09 +57% (both sides materialize, so
-  overlapping them contends for bandwidth instead of filling idle cores).
+  `build_binary_materializing_operator` (since removed) q09 +57% (both sides
+  materialize, so overlapping them contends for bandwidth instead of filling
+  idle cores). The semi/anti scan sink is the narrow form that survived: it
+  drains the smaller left first and only then starts the right's pipeline.
   Removed 2026-08-21; recover from `38d6b307` / `190235b2` / `a3b39c6d` only
   with a cost-aware gate (skip when both sides are large).
 
@@ -369,7 +425,8 @@ _who decides_ and _where the tunable lives_, not _how the work is done_.
 ## The principle
 
 **Every fan-out point in the engine is described by the physical plan.** The
-planner computes the policy; `explain physical` prints it; a test asserts it; a
+planner computes the policy; `explain_physical` prints it (`:explain <expr>` in
+the REPL); a test asserts it; a
 benchmark gates it. The operator becomes an executor of that policy plus two
 runtime-only checks it alone can make.
 
@@ -385,19 +442,20 @@ depends on measured row counts a plan cannot know):
 | Decided by the **planner**, at plan time                                                                                                                                      | Decided by the **operator**, at run time                                                                 |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Is this fan-out permitted by the query's budget? (`exec.can_fan_out()`)                                                                                                       | Am I running nested under another fan-out? (`on_worker_pool_thread()`)                                   |
-| The worker **cap** — `min(compute_budget, pool_size, this-breaker's-own-max)`, computed **once, here**, not open-coded per operator                                           | Did this input clear the row floor? (`rows >= floor`, checked on the first chunk of a streaming source)  |
-| The row **floor** — a named constant per breaker category, in `physical_plan.hpp`, not in `chunked.cpp`                                                                       | The partition count, when the plan left it "derive": `min(cap, …)` from the actual first-chunk row count |
-| The partition **strategy** (packed-key / radix-hash / owned)                                                                                                                  | —                                                                                                        |
-| A row **estimate** when one is available (footer stats for a bare scan; child's exact count for `Distinct(Distinct(…))`), and the fan-out **prediction** that follows from it | —                                                                                                        |
+| The worker **cap** — `min(compute_budget, pool_size, breaker_max_workers)`, computed **once**, in `resolve_breaker_parallelism`, not open-coded per operator                  | Did this input clear the row floor? (`rows >= floor`, checked on the first chunk of a streaming source)  |
+| The row **floor** — a named constant per breaker category, in `physical_plan.cpp`, not in the operator                                                                        | The partition count — always derived: `min(cap, …)` from the actual first-chunk row count               |
+| The partition **strategy** (`PartitionStrategy`: packed-key, radix-hash, owned, row-range, head-table, range, morsel, column-range)                                           | —                                                                                                        |
+| A row **estimate** when one is available (a registered table's exact count, footer stats for a bare scan, a child's exact count), and the fan-out **prediction** that follows from it | —                                                                                                        |
 
 `on_worker_pool_thread()` cannot move to the plan: the plan is built once, but
 the same operator can be constructed and pulled from a nested context (a join's
 build side). It stays a runtime check. So does "did this chunk clear the floor",
 because a streaming source's row count is not known until it arrives.
 
-Everything else that is currently inside a breaker's `next()` — the `32768`
-hardcoded twice in `ChunkedDistinctOperator`, the `min(budget, pool, 64)`
-repeated at ~10 sites with three different caps — moves to the planner.
+Everything else that used to sit inside a migrated breaker's `next()` — the
+`32768` hardcoded twice in `ChunkedDistinctOperator`, the `min(budget, pool, 64)`
+repeated at ~10 sites — now lives on the plan. Unmigrated sites (I6, I9) still
+carry their own.
 
 ## The descriptor
 
@@ -405,7 +463,8 @@ repeated at ~10 sites with three different caps — moves to the planner.
 // physical_plan.hpp
 struct RowEstimate {
     std::size_t rows = 0;
-    enum class Source { None, Footer, ChildExact, Guess } source = Source::None;
+    enum class Source : std::uint8_t { None, Footer, TableExact, ChildExact } source = Source::None;
+    auto confident() const noexcept -> bool;  // source != None; the planner never guesses
 };
 
 enum class FanOutDecline : std::uint8_t {
@@ -416,83 +475,119 @@ enum class FanOutDecline : std::uint8_t {
 };
 
 struct BreakerParallelism {
-    FanOutDecline decline = FanOutDecline::None;
-    std::size_t   worker_cap = 1;        // the ONE place this is computed
-    std::size_t   partition_count = 0;   // 0 = operator derives from first-chunk rows, ≤ cap
-    std::size_t   row_floor = 0;         // the plan value; default from a named constant
+    // Capability half: set by plan_physical, which has no ExecutionContext.
+    std::size_t row_floor = 0;            // 0 = inherit exec.parallel_min_rows
+    std::size_t breaker_max_workers = 0;  // 0 = no per-breaker ceiling
     PartitionStrategy strategy = PartitionStrategy::PackedKey;
-    RowEstimate   estimate{};
+    RowEstimate estimate{};
+
+    // Resolved half: filled by resolve_breaker_parallelism at build time.
+    FanOutDecline decline = FanOutDecline::None;
+    std::size_t worker_cap = 0;           // 0 = not resolved yet
 };
 
-// Untyped breakers retain named phases. Join and Aggregate instead carry the
-// same descriptor directly on their typed HashBuild/HashProbe and
-// Discovery/Accumulation/FinalOrdering/Emission nodes.
+// Untyped breakers (Distinct, Order) carry named phases in
+// Plan::breaker_phases. Join and Aggregate carry the same descriptor directly
+// on their typed HashBuild/HashProbe and
+// Discovery/Accumulation/FinalOrdering/Emission nodes
+// (Plan::streaming_join, Plan::hash_aggregate), resolved together as
+// JoinParallelism / AggregateParallelism.
 struct BreakerPhase {
     std::string_view    name;
     BreakerParallelism  parallelism;
 };
-
-// Hangs off physical::Plan for a breaker root; JoinPlan/AggregatePlan gain a
-// `std::vector<BreakerPhase> phases` beside their existing structural fields
-// rather than a second parallel struct.
 ```
 
 ## `explain physical` output
 
 `explain_physical(plan)` renders the **unresolved** capability (a `Plan` off
-`plan_physical` has no `ExecutionContext`); the builder resolves a local copy at
-construction, so a future `explain physical <query>` command with an exec in
-hand would show `cap≤N` / `serial (…)` in place of `cap=unresolved`.
+`plan_physical` has no `ExecutionContext`), which is what the REPL's
+`:explain <expr>` prints under the heading "Physical plan (capability; runtime
+fan-out may differ)". The builder resolves a local copy at construction; a
+resolved phase renders `cap<=N` or `serial (…)` in place of `cap=unresolved`.
 
-Distinct, off `plan_physical` (unresolved):
-
-```
-Breaker(Distinct)
-  dedup: parallel-capable  cap=unresolved  floor 32768  partitions=derived  packed-key
-         no row estimate -> decided on first chunk
-```
-
-Distinct with a footer estimate (bare `Distinct(Scan)`) — the estimate line:
+Distinct over a registered table (the estimate is the table's exact count):
 
 ```
 Breaker(Distinct)
   dedup: parallel-capable  cap=unresolved  floor 32768  partitions=derived  packed-key
-         estimate 3200000 rows (footer)
+         input estimate 4 rows (table)
 ```
 
-Distinct, resolved single-core:
+Without an estimate the second line reads `no row estimate -> decided on first
+chunk`; a footer estimate reads `input estimate N rows (footer)`.
+
+Distinct, resolved:
 
 ```
-Breaker(Distinct)
   dedup: serial (single core)
+  dedup: serial (estimate 4 < floor 32768)
+  dedup: parallel-capable  cap<=8  floor 32768  partitions=derived  packed-key
 ```
 
-Order (done): one descriptive phase, no per-breaker ceiling, floor inherited:
+Order: one descriptive phase, no per-breaker ceiling, floor inherited:
 
 ```
 Breaker(Order)
   sort: parallel-capable  cap=unresolved  floor (shared parallel_min_rows)  partitions=derived  row-range (sort + gather)
-        no row estimate -> decided on first chunk
+         no row estimate -> decided on first chunk
 ```
 
-Head / Tail / TopK — a serial single-operator breaker:
+Head / Tail / TopK / FilterHead / FilterTail — a serial single-operator breaker:
 
 ```
 Breaker(Head)
   serial (single-operator breaker, no fan-out point)
 ```
 
-Join — the strategy line, then one line per fan-out phase. Both floors
-(`build_partitions`'s `1U << 17U`, `probe_parallel_workers`'s `1U << 14U`) and
-the shared `min(budget, pool, 64)` cap live on the plan now;
-`resolved_join_parallelism` fills a `physical::JoinParallelism` at build time and
-the operator reads it (slices 4–5).
+Join — the strategy line, the typed edge, the resolved key columns, then one
+line per fan-out node. Both floors (`kJoinBuildRowFloor` = `1U << 17U`,
+`kJoinProbeRowFloor` = `1U << 14U`) and the shared `min(budget, pool, 64)` cap
+live on the plan; `resolved_join_parallelism` fills a
+`physical::JoinParallelism` at build time and the operator reads it. A streaming
+left join prints the same with `branch=SingleKeyLeft`.
 
 ```
 Breaker(Join)
-  Join(StreamingProbe branch=SingleKeyInner) keys=1
-  hash-build: parallel-capable  cap=unresolved  floor 131072  partitions=derived  head-table (partition by key hash)
-  probe:      parallel-capable  cap=unresolved  floor 16384  partitions=derived  range (contiguous probe-row slices)
+  Join(StreamingProbe branch=SingleKeyInner keys=1 left=Scan right=Scan orientation=runtime)
+  edge: HashBuild.RuntimeOrientedBuildOutput -> HashProbe.build_input
+  columns: resolved  left[0]=right[0]  output=3
+  HashBuild: parallel-capable  cap=unresolved  floor 131072  partitions=derived  head-table (partition by key hash)
+         no row estimate -> decided on first chunk
+  HashProbe: parallel-capable  cap=unresolved  floor 16384  partitions=derived  range (contiguous probe-row slices)
+         no row estimate -> decided on first chunk
+```
+
+Aggregate — the strategy, the typed chain and its edges, then the four nodes:
+
+```
+Breaker(Aggregate)
+  Aggregate(StreamingSorted)
+  hash-fallback: Discovery -> Accumulation -> FinalOrdering -> Emission
+    edge: InputChunks -> DiscoveredGroups -> AccumulatedGroups -> OrderedGroups -> OutputChunks
+  Discovery: parallel-capable  cap=unresolved  floor 262144  partitions=derived  radix-hash
+         input estimate 4 rows (table)
+  Accumulation: parallel-capable  cap=unresolved  floor 131072  partitions=derived  morsel (deterministic row ranges)
+         input estimate 4 rows (table)
+  FinalOrdering: parallel-capable  cap=unresolved  floor 131072  partitions=derived  owned
+         input estimate 4 rows (table)
+  Emission: parallel-capable  cap=unresolved  floor (shared parallel_min_rows)  partitions=derived  column-range (output column x group range)
+         input estimate 4 rows (table)
+```
+
+(`StreamingSorted` is the adaptive strategy's name: group-at-a-time when the
+chunks arrive sorted on the keys, the hash fallback otherwise.)
+
+A map chain and a fallback, for contrast:
+
+```
+MapPipeline
+  Filter+Project(fused)
+  source: TableScan(t)
+  mode: morsel-parallel(steps 0..1 of 1)
+  source signature: fixed-width/all-valid fixed-width/all-valid
+
+MaterializedCall(Melt: root is not a row-local map)
 ```
 
 (Distinct/Order do not print their key list — `DistinctNode`/`OrderNode` do not
@@ -518,9 +613,9 @@ Every slice:
   first-chunk floor check are the operator's, permanently.
 - **Not ownership of the `chunked.cpp` split.** This contract enabled it; the
   split finished 2026-08-31 (`runtime_entry.cpp` plus one file per family).
-- **Not a row-count estimator project.** The estimate is opportunistic (footer
-  stats, exact child counts). `partition_count = 0 / derive` is the
-  default and preserves today's behavior exactly.
+- **Not a row-count estimator project.** The estimate is opportunistic (exact
+  table counts, footer stats, exact child counts). The partition count is
+  always derived by the operator, never planned.
 
 ## Sequence and blockers
 
@@ -558,13 +653,18 @@ Every slice:
    `ExecutionContext` is in hand (every join construction site shares it, as one
    `physical::JoinParallelism`). `ChunkedInnerJoinOperator::build_partitions`
    reads `par_.build` and `JoinProbe::probe_parallel_workers` reads `par_.probe`,
-   neither re-deriving the floor or the `min(budget, pool, 64)` cap. The checks
+   neither re-deriving the floor nor the `min(budget, pool, 64)` cap. The checks
    that stay in the operator are the ones only it can make: the
    `parallel_join_probe` toggle (probe only), nesting
    (`on_worker_pool_thread`), and whether this side/chunk cleared the floor. Both
    fan-outs now have a `ParallelPipelineStats` counter (`parallel_hash_builds`,
    `parallel_probes`) so a gate that silently stopped matching is a red test, not
    a slow query.
+
+   The streaming single-key **left** join (2026-11-13, `35baed71`) reuses the
+   inner join's operator and both resolved phases (`JoinBranch::SingleKeyLeft`):
+   the right side is always the indexed one, and it takes neither a deferred
+   probe nor a streamed-left key filter.
 
    **Not a speed slice.** The hash build's parallel fill landed earlier
    (`2458bfda` + `36e93fbd`, measured q21 −8.5%); slices 3–5 moved the _decision_

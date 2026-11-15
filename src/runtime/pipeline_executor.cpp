@@ -42,8 +42,10 @@
 //     an empty morsel is still emitted because a skipped sequence is a lost slot.
 //   - Errors are deterministic: the lowest-sequence failure wins, regardless
 //     of which thread failed first.
-//   - A worker never deadlocks the pool it runs on. A pool worker parked on a
-//     ring runs queued pool tasks while it waits (cooperative_ring_wait), so
+//   - A worker never deadlocks the pool it runs on. A scan pipeline's workers
+//     never park on their ring at all (elastic workers, `run_elastic`). A pool
+//     worker parked on any other ring runs queued pool tasks while it waits
+//     (cooperative_ring_wait), so
 //     nested fan-out under it cannot be stranded. Inner parallel paths that
 //     check on_worker_pool_thread() run serially inside a task.
 //   - Per-worker operators are private copies. IR nodes, registries and the
@@ -395,6 +397,11 @@ struct MorselWorkerChain {
     }
     return worker;
 }
+auto ring_producer_parks() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
 /// Wait on `cv` (holding `lock`) until `pred()`, cooperatively running queued
 /// pool tasks while parked when the caller is a pool worker.
 ///
@@ -489,10 +496,14 @@ class OrderedChunkRing {
     /// Park until this sequence's slot is free. Called with no lock held.
     [[nodiscard]] auto acquire(std::uint64_t sequence) -> Acquire {
         std::unique_lock lock(mutex_);
-        cooperative_ring_wait(space_, lock, [&] {
+        const auto may_proceed = [&] {
             return cancelled_ || sequence < released_ + window_ ||
                    (has_error_ && error_sequence_ < sequence);
-        });
+        };
+        if (!may_proceed()) {
+            ring_producer_parks().fetch_add(1, std::memory_order_relaxed);
+        }
+        cooperative_ring_wait(space_, lock, may_proceed);
         // Only ever abandons sequences above the reported failure, so the
         // consumer still receives everything below it.
         return (cancelled_ || (has_error_ && error_sequence_ < sequence)) ? Acquire::Abandon
@@ -564,6 +575,7 @@ class OrderedChunkRing {
                 chunk = std::move(ring_[slot]);
                 ring_[slot].reset();
                 ++released_;
+                released_mirror_.store(released_);
             }
         }
         if (chunk.has_value()) {
@@ -571,6 +583,15 @@ class OrderedChunkRing {
         }
         return chunk;
     }
+
+    /// Sequences taken so far, read without the lock: a producer may claim a
+    /// sequence below `released() + window()` knowing its slot is free.
+    /// Sequentially consistent, for the elastic workers' exit handshake
+    /// (`PipelinedScanOperator::run_elastic`).
+    [[nodiscard]] auto released() const noexcept -> std::uint64_t {
+        return released_mirror_.load();
+    }
+    [[nodiscard]] auto window() const noexcept -> std::size_t { return window_; }
 
     [[nodiscard]] auto failure() const -> std::optional<std::string> {
         const std::scoped_lock lock(mutex_);
@@ -611,6 +632,7 @@ class OrderedChunkRing {
     std::condition_variable space_;  // producers wait for ring space
     std::vector<std::optional<Chunk>> ring_;
     std::uint64_t released_ = 0;
+    std::atomic<std::uint64_t> released_mirror_{0};
     std::size_t active_producers_ = 0;
     bool cancelled_ = false;
     // The failure channel is split so it can be written without allocating.
@@ -1910,10 +1932,14 @@ class PipelinedScanOperator final : public Operator {
           consumer_exec_(std::move(consumer_exec)),
           consumer_worker_(std::move(consumer_worker)),
           // A helping consumer gets one more round of slack (see
-          // `run_consumer_unit`); without it the workers park behind it.
+          // `run_consumer_unit`); without it the workers find no free slot
+          // behind it.
           window_(std::max<std::size_t>(workers_.size() * 2, 2) +
                   (consumer_worker_.has_value() ? workers_.size() : 0)),
-          ring_(window_, workers_.size()) {}
+          // One producer stands for all the elastic workers: it exits when every
+          // unit is claimed and no worker runs (`last_out`).
+          ring_(window_, workers_.empty() ? 0 : 1),
+          slot_busy_(workers_.size()) {}
 
     ~PipelinedScanOperator() override { cancel_and_join(); }
 
@@ -1946,6 +1972,8 @@ class PipelinedScanOperator final : public Operator {
                                                   : "scan pipeline: missing output unit");
             }
             ++next_sequence_;
+            // The take freed a slot: bring the workers back up to strength.
+            top_up();
             Chunk chunk = std::move(*produced);
             if (!chunk.columns.empty() && chunk.rows() == 0) {
                 if (!empty_schema_carrier_.has_value()) {
@@ -2038,46 +2066,144 @@ class PipelinedScanOperator final : public Operator {
             plan_ = plan_deferred_scan(*scan_);
         }
         if (!workers_.empty()) {
-            batch_ = pool_->submit(workers_.size(), [this](std::size_t id) { run_worker(id); });
+            group_.emplace(pool_->task_group());
+            top_up();
         }
     }
 
-    void run_worker(std::size_t worker_id) noexcept {
-        // However this worker leaves, it must stop counting as a producer, or
-        // the consumer waits for a unit that is never coming.
-        // One-shot scope guard: aggregate-initialised, never copied or moved.
-        // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
-        struct ExitGuard {
-            OrderedChunkRing* ring;
-            ~ExitGuard() { ring->producer_exited(); }
-        } const guard{&ring_};
+    // Elastic workers. A worker never parks on the ring holding a pool thread:
+    // it claims a unit only when the unit's ring slot is already free, and when
+    // none is it leaves, giving its thread back to the pool. The consumer
+    // submits workers again, up to `workers_.size()`, each time a take frees a
+    // slot. Parked workers used to hold 7 of 8 pool threads whenever the
+    // consumer was the bottleneck, so its own fan-outs (an aggregate's
+    // discovery and accumulation batches) ran on about two threads.
+    //
+    // No wakeup is lost. A leaving worker decrements `running_` and then
+    // re-checks for a claimable unit; the consumer advances the ring's
+    // `released()` and then reads `running_`. Both sides are sequentially
+    // consistent, so at least one of them sees the other's write: either the
+    // worker sees the new space and stays, or the consumer sees it gone and
+    // submits another.
 
+    /// A unit whose ring slot is free: below `released() + window()`.
+    [[nodiscard]] auto claimable() const noexcept -> bool {
+        const std::size_t sequence = cursor_.load();
+        return sequence < units_.size() && sequence < ring_.released() + ring_.window();
+    }
+
+    /// Claim the next unit if it is claimable.
+    [[nodiscard]] auto try_claim() noexcept -> std::optional<std::size_t> {
+        std::size_t sequence = cursor_.load();
+        do {
+            if (sequence >= units_.size() || sequence >= ring_.released() + ring_.window()) {
+                return std::nullopt;
+            }
+        } while (!cursor_.compare_exchange_weak(sequence, sequence + 1));
+        return sequence;
+    }
+
+    /// Consumer side: submit workers while a unit is claimable and fewer than
+    /// `workers_.size()` run.
+    void top_up() noexcept {
+        if (!group_.has_value() || group_closed_) {
+            return;
+        }
+        while (claimable()) {
+            std::size_t running = running_.load();
+            if (running >= workers_.size()) {
+                return;
+            }
+            if (!running_.compare_exchange_weak(running, running + 1)) {
+                continue;
+            }
+            try {
+                group_->submit([this] { run_elastic(); });
+            } catch (...) {
+                running_.fetch_sub(1);
+                ring_.record_fault(next_sequence_, "scan pipeline: could not submit a worker");
+                return;
+            }
+        }
+    }
+
+    /// One elastic worker's task; its `running_` count was taken by the
+    /// submitter. Runs units on a free worker slot (`workers_[slot]`, a private
+    /// chain) until none is claimable, then leaves or, if space opened after
+    /// all, carries on.
+    void run_elastic() noexcept {
+        for (;;) {
+            const std::size_t slot = take_slot();
+            const bool stopped = run_worker(slot);
+            slot_busy_[slot].store(false);
+            const std::size_t left = running_.fetch_sub(1) - 1;
+            if (stopped || !claimable()) {
+                if (left == 0 && cursor_.load() >= units_.size()) {
+                    last_out();
+                }
+                return;
+            }
+            std::size_t running = running_.load();
+            do {
+                if (running >= workers_.size()) {
+                    return;  // the consumer already sent one for this space
+                }
+            } while (!running_.compare_exchange_weak(running, running + 1));
+        }
+    }
+
+    /// Every unit claimed and no worker left: the ring's one producer exits,
+    /// so a consumer waiting for a unit nobody produced is told, not parked.
+    void last_out() noexcept {
+        if (!producers_exited_.exchange(true)) {
+            ring_.producer_exited();
+        }
+    }
+
+    /// A free worker slot. `running_` never exceeds `workers_.size()` and
+    /// each running task holds one slot, so one is always free.
+    [[nodiscard]] auto take_slot() noexcept -> std::size_t {
+        for (std::size_t slot = 0; slot < workers_.size(); ++slot) {
+            bool busy = false;
+            if (slot_busy_[slot].compare_exchange_strong(busy, true)) {
+                return slot;
+            }
+        }
+        invariant_violation("scan pipeline: more elastic workers than worker slots");
+    }
+
+    /// Run claimable units on `workers_[slot]`. True when this worker must
+    /// stop for good (failure, cancellation, interrupt); false when no unit
+    /// is claimable now.
+    [[nodiscard]] auto run_worker(std::size_t slot) noexcept -> bool {
         std::size_t claimed = 0;
         try {
-            auto& worker = workers_[worker_id];
+            auto& worker = workers_[slot];
             while (true) {
-                const std::size_t sequence = cursor_.fetch_add(1, std::memory_order_relaxed);
-                if (sequence >= units_.size()) {
-                    return;
+                const auto sequence = try_claim();
+                if (!sequence.has_value()) {
+                    return false;
                 }
-                claimed = sequence;
-                if (ring_.acquire(sequence) == OrderedChunkRing::Acquire::Abandon) {
-                    return;
+                claimed = *sequence;
+                // The slot is free (`try_claim`), so this cannot park; it only
+                // reports a cancelled run or a lower failure.
+                if (ring_.acquire(*sequence) == OrderedChunkRing::Acquire::Abandon) {
+                    return true;
                 }
                 if (interrupt_requested()) {
                     ring_.cancel();
-                    return;
+                    return true;
                 }
 
-                auto result = run_unit(worker, sequence, *exec_);
+                auto result = run_unit(worker, *sequence, *exec_);
                 if (!result.has_value()) {
-                    ring_.record_error(sequence, std::move(result.error()));
-                    return;
+                    ring_.record_error(*sequence, std::move(result.error()));
+                    return true;
                 }
                 if (sink_ != nullptr && result->rows() != 0) {
-                    sink_->on_worker_chunk(sequence, *result);
+                    sink_->on_worker_chunk(*sequence, *result);
                 }
-                ring_.publish(sequence, std::move(*result));
+                ring_.publish(*sequence, std::move(*result));
             }
         } catch (const std::exception& error) {
             // Sequence-tagged like any other failure, so the reported message
@@ -2094,6 +2220,7 @@ class PipelinedScanOperator final : public Operator {
         } catch (...) {
             ring_.record_fault(claimed, "scan pipeline: worker threw a non-standard exception");
         }
+        return true;
     }
 
     /// The consumer, about to park on the next unit, runs one unclaimed unit
@@ -2255,9 +2382,10 @@ class PipelinedScanOperator final : public Operator {
     }
 
     void finish_workers() {
-        if (batch_.has_value()) {
-            batch_->wait();
-            batch_.reset();
+        group_closed_ = true;
+        if (group_.has_value()) {
+            group_->wait();
+            group_.reset();
         }
         if (validated_) {
             return;
@@ -2317,7 +2445,14 @@ class PipelinedScanOperator final : public Operator {
     OrderedChunkRing ring_;
     std::vector<std::optional<Column<Categorical>>> cat_states_;
     std::optional<Chunk> empty_schema_carrier_;
-    std::optional<WorkerPool::Batch> batch_;
+    /// The elastic workers' tasks, joined by `finish_workers`.
+    std::optional<WorkerPool::TaskGroup> group_;
+    /// Set by `finish_workers`: no worker may be submitted after the join.
+    bool group_closed_ = false;
+    /// Elastic workers running (each holding one `slot_busy_` slot).
+    std::atomic<std::size_t> running_{0};
+    std::vector<std::atomic<bool>> slot_busy_;
+    std::atomic<bool> producers_exited_{false};
     std::size_t emit_batch_rows_ = 0;
     std::vector<Chunk> batch_chunks_;
     std::size_t batch_rows_ = 0;
@@ -2536,10 +2671,13 @@ class PipelinedStageOperator final : public Operator {
 }
 
 /// Whether a scan of `unit_count` units over `workers` pool threads must leave
-/// one spare. A spare thread is only necessary when every pool thread could
-/// remain parked behind ring backpressure. The ring holds 2W results and workers
-/// have already claimed at most another W units, so a source of at most 3W
-/// units necessarily lets one worker exit after the first chunk is released.
+/// one spare. The rule began as a deadlock guard for when every pool thread
+/// could remain parked behind ring backpressure: the ring holds 2W results and
+/// workers had claimed at most another W units, so a source of at most 3W
+/// units let one worker exit after the first chunk was released. Elastic
+/// workers (`PipelinedScanOperator::run_elastic`) never park, so that hazard
+/// is gone; the spare remains the thread a downstream batch starts on and the
+/// slot the helping consumer fills. Dropping it is unmeasured.
 [[nodiscard]] auto scan_pipeline_needs_spare(std::size_t workers, std::size_t pool_size,
                                              std::size_t unit_count) -> bool {
     return workers == pool_size && unit_count > workers * 3;

@@ -19,6 +19,7 @@
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_compare.hpp>
 #include <ibex/runtime/table_properties.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_message.hpp>
@@ -52,6 +53,7 @@
 
 #include "interpreter_internal.hpp"
 #include "physical_plan.hpp"
+#include "pipeline_executor_internal.hpp"
 #include "runtime_internal.hpp"
 #include "welford.hpp"
 
@@ -18779,6 +18781,82 @@ auto many_unit_exec(const runtime::DeferredScanRegistry& deferred,
     exec.parallel_min_cells = 0;
     exec.parallel_stats = &stats;
     return exec;
+}
+
+/// Cheap units of distinct keys: decoding one costs far less than grouping it,
+/// so a grouped aggregate over them is consumer-bound.
+class CheapDistinctUnitReader final : public runtime::LazySourceReader {
+   public:
+    static constexpr std::size_t kRows = 20'000;
+    static constexpr std::size_t kUnits = 64;
+
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        std::vector<runtime::SourceUnit> units;
+        units.reserve(kUnits);
+        for (std::size_t u = 0; u < kUnits; ++u) {
+            units.push_back({.start = u * kRows, .rows = kRows});
+        }
+        return units;
+    }
+
+    auto decode(const std::vector<std::string>& /*names*/, const runtime::Selection* /*selection*/,
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/)
+        -> std::expected<runtime::Table, std::string> override {
+        if (unit == nullptr) {
+            return std::unexpected("cheap-unit reader expected a source unit");
+        }
+        std::vector<std::int64_t> values(unit->rows);
+        for (std::size_t i = 0; i < unit->rows; ++i) {
+            // Spread out, so the dense-int path stays out and every row hashes.
+            values[i] = static_cast<std::int64_t>((unit->start + i) * 7919 % 1'000'003) * 4;
+        }
+        runtime::Table out;
+        out.add_column("x", Column<std::int64_t>{std::move(values)});
+        out.logical_rows = unit->rows;
+        return out;
+    }
+};
+
+TEST_CASE("Scan pipeline workers never park on the ring holding a pool thread",
+          "[runtime][parallel][pipeline]") {
+    // A consumer-bound stream: workers used to fill the ring and park in
+    // `acquire` on their pool threads, leaving the consumer's own fan-outs
+    // about two threads. They now claim only a unit whose slot is free and
+    // otherwise leave, to be submitted again as the consumer takes.
+    runtime::Table schema;
+    schema.add_column("x", Column<std::int64_t>{});
+    auto lazy = std::make_shared<runtime::LazyTable>(
+        std::move(schema), CheapDistinctUnitReader::kUnits * CheapDistinctUnitReader::kRows,
+        [] -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<CheapDistinctUnitReader>()};
+        });
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace("df", runtime::DeferredScan{.lazy = std::move(lazy),
+                                                 .conjuncts = {},
+                                                 .demand = {"x"},
+                                                 .demand_all = false,
+                                                 .key_column = {},
+                                                 .filter = nullptr});
+    const runtime::TableRegistry empty;
+    auto ir =
+        require_ir("df[select { n = count() }, by x][select { groups = count(), rows = sum(n) }];");
+    runtime::ParallelPipelineStats stats;
+    auto exec = many_unit_exec(deferred, stats);
+    exec.parallel_threads = 8;
+    const auto before = runtime::pipeline_executor_detail::ring_producer_parks().load();
+    auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+    const auto parks = runtime::pipeline_executor_detail::ring_producer_parks().load() - before;
+    REQUIRE(out.has_value());
+    const auto& groups = std::get<Column<std::int64_t>>(*out->find("groups"));
+    const auto& rows = std::get<Column<std::int64_t>>(*out->find("rows"));
+    // 1'280'000 rows over (r * 7919) mod 1'000'003: every residue at most twice.
+    CHECK(rows[0] == static_cast<std::int64_t>(CheapDistinctUnitReader::kUnits *
+                                               CheapDistinctUnitReader::kRows));
+    CHECK(groups[0] == 1'000'003);
+    if (runtime::process_worker_pool().size() >= 2) {
+        CHECK(stats.pipelined_scans.load() == 1);
+    }
+    CHECK(parks == 0);
 }
 
 TEST_CASE("Scan pipeline consumer decodes units in place of the spare thread",

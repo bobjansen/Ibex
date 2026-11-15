@@ -7,6 +7,7 @@
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <expected>
 #include <functional>
@@ -38,6 +39,10 @@ namespace ibex::runtime::pipeline_executor_detail {
                                            ExecutionProfileEntry* entry) -> OperatorPtr;
 
 [[nodiscard]] auto scan_pipeline_worker_count(std::size_t unit_count) -> std::size_t;
+
+/// How many times, process-wide, a producer parked on an `OrderedChunkRing`
+/// waiting for a slot. For tests: a scan pipeline's workers never should.
+[[nodiscard]] auto ring_producer_parks() -> std::atomic<std::uint64_t>&;
 [[nodiscard]] auto make_deferred_scan_source(const DeferredScan& scan,
                                              std::vector<SourceUnit> units,
                                              const ExecutionContext& exec) -> OperatorPtr;

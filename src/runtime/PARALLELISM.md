@@ -105,12 +105,22 @@ compute across a **pipeline breaker** (join build, aggregate, sort).
 - **`PipelinedScanOperator`** — the streaming scan. The source publishes units
   (Parquet row groups); N workers each run a private copy of the row-local
   chain over one unit into a **bounded ring indexed by unit sequence**; the
-  consumer releases them in order. A source longer than three rounds of the
-  pool leaves one pool thread spare for downstream batches (the deadlock rule
-  in `scan_pipeline_worker_count`), and the consumer decodes units in its place
-  whenever it would otherwise park (`run_consumer_unit`, under a serial
-  context); the ring carries one extra round so the workers do not park behind
-  it. Before this, q06 at 8 cores kept 7 of 8 cores busy. Each unit decodes
+  consumer releases them in order. The workers are **elastic**: one claims a
+  unit only when that unit's ring slot is already free, and otherwise leaves,
+  returning its pool thread; the consumer submits workers again, up to N, as
+  each take frees a slot (`run_elastic`, `top_up`). So no scan worker ever
+  parks holding a pool thread. Before (2026-11-15), workers parked in
+  `acquire` whenever the consumer was the bottleneck, and the consumer's own
+  fan-outs (an aggregate's discovery and accumulation batches) found about two
+  threads: streamed `sum + count by l_orderkey` over SF-10 lineitem went
+  0.45 -> 0.34 s at 8 cores. A source longer than three rounds of the pool
+  still leaves one pool thread spare for downstream batches
+  (`scan_pipeline_worker_count`; once a deadlock guard against every thread
+  parking, which elastic workers rule out), and the consumer decodes units in
+  its place whenever it would otherwise wait (`run_consumer_unit`, under a
+  serial context); the ring carries one extra round so the workers are not
+  starved of slots behind it. Before this, q06 at 8 cores kept 7 of 8 cores
+  busy. Each unit decodes
   over its own Categorical dictionary; the consumer remaps onto a shared one
   as it emits. Row-local updates directly above or below the run join the
   worker chains when the run streams (`Plan::stream_only_updates`,

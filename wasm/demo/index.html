@@ -131,7 +131,7 @@ let prices = gen::walk(2000, 100.0, 1.0);`;
           outEl.append(p);
         }
         const names = (res.environment?.tables ?? [])
-          .map((t) => `${t.name} (${t.rows})`)
+          .map((t) => (t.rows === undefined ? t.name : `${t.name} (${t.rows})`))
           .join("  ·  ");
         envEl.textContent = names ? `environment: ${names}` : "";
       }

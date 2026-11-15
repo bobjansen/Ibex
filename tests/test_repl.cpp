@@ -145,8 +145,9 @@ TEST_CASE("REPL session preserves bindings and returns structured results", "[re
     REQUIRE(result.tables.size() == 1);
 
     const auto environment = session.environment();
-    REQUIRE(std::ranges::any_of(
-        environment, [](const auto& entry) { return entry.name == "numbers" && entry.rows == 3; }));
+    REQUIRE(std::ranges::any_of(environment, [](const auto& entry) {
+        return entry.name == "numbers" && entry.rows == 3U;
+    }));
     REQUIRE(session.erase("numbers"));
     REQUIRE_FALSE(session.erase("numbers"));
 }
@@ -200,7 +201,7 @@ TEST_CASE("REPL collect materializes a lazy source where a plain let keeps it la
     CHECK(find("lz")->lazy);
     REQUIRE(find("kept") != environment.end());
     CHECK_FALSE(find("kept")->lazy);
-    CHECK(find("kept")->rows == 3);
+    CHECK(find("kept")->rows == 3U);
     // Only the selected column was decoded and kept.
     REQUIRE(find("kept")->columns.size() == 1);
     CHECK(find("kept")->columns[0].first == "a");
@@ -1199,7 +1200,8 @@ TEST_CASE("REPL let of a table expression binds a plan, run where it is read", "
     CHECK(decode_calls.empty());  // nothing ran at the `let`
     const auto entry = environment_entry(session, "t");
     CHECK(entry.lazy);
-    CHECK(entry.rows == 0);  // not known before it runs
+    CHECK_FALSE(entry.rows.has_value());  // it has run nothing: no count to report
+    CHECK(entry.plan);
     REQUIRE(entry.columns.size() == 2);
     CHECK(entry.columns[0] == std::pair<std::string, std::string>{"a", "Int64"});
 

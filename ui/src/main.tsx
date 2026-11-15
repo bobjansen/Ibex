@@ -29,8 +29,10 @@ type Page = {
 };
 type EnvironmentTable = {
   name: string;
-  rows: number;
+  /** Absent for a plan binding, which has run nothing. */
+  rows?: number;
   lazy: boolean;
+  plan?: boolean;
   columns: Column[];
 };
 type Environment = { tables: EnvironmentTable[] };
@@ -1258,7 +1260,11 @@ function App() {
             ...environmentRef.current.map((table) => ({
               label: table.name,
               kind: K.Struct,
-              detail: `${table.lazy ? "lazy source" : `${table.rows} rows`}`,
+              detail: table.plan
+                ? "plan"
+                : table.lazy
+                  ? "lazy source"
+                  : `${table.rows ?? 0} rows`,
               insertText: table.name,
               range,
             })),
@@ -1449,9 +1455,11 @@ function App() {
               </button>
             </div>
             <small>
-              {table.lazy
-                ? "lazy source"
-                : `${table.rows.toLocaleString()} rows`}
+              {table.plan
+                ? "plan"
+                : table.lazy
+                  ? "lazy source"
+                  : `${(table.rows ?? 0).toLocaleString()} rows`}
             </small>
             {table.columns.map((column) => (
               <button

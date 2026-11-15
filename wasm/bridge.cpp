@@ -138,10 +138,13 @@ class Bridge {
             json columns = json::array();
             for (const auto& [name, type] : table.columns)
                 columns.push_back({{"name", name}, {"type", type}});
-            tables.push_back({{"name", table.name},
-                              {"rows", table.rows},
-                              {"lazy", table.lazy},
-                              {"columns", std::move(columns)}});
+            json entry = {{"name", table.name},
+                          {"lazy", table.lazy},
+                          {"plan", table.plan},
+                          {"columns", std::move(columns)}};
+            if (table.rows.has_value())  // a plan has none to report
+                entry["rows"] = *table.rows;
+            tables.push_back(std::move(entry));
         }
         return {{"tables", std::move(tables)}};
     }

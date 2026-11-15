@@ -7934,9 +7934,10 @@ auto ReplSession::environment() const -> std::vector<EnvironmentTable> {
         }
         result.push_back(std::move(entry));
     }
-    // A plan binding has run nothing, so its row count is not known (0).
+    // A plan binding has run nothing, so it reports no row count at all.
     for (const auto& [name, binding] : impl_->lazy_tables.plans) {
-        EnvironmentTable entry{.name = name, .columns = {}, .rows = 0, .lazy = true};
+        EnvironmentTable entry{
+            .name = name, .columns = {}, .rows = std::nullopt, .lazy = true, .plan = true};
         entry.columns.reserve(binding.schema.fields().size());
         for (const auto& field : binding.schema.fields()) {
             entry.columns.emplace_back(field.name, schema_field_type_name(field));

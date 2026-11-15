@@ -69,8 +69,12 @@ struct ExecutionResult {
 struct EnvironmentTable {
     std::string name;
     std::vector<std::pair<std::string, std::string>> columns;
-    std::size_t rows = 0;
+    /// Absent for a plan binding: it has run nothing, so it has no row count
+    /// to report. A lazy source knows its rows from the source's metadata.
+    std::optional<std::size_t> rows;
     bool lazy = false;
+    /// A `let` of a table expression held as its plan (lazy as well).
+    bool plan = false;
 };
 
 /// Stateful programmatic facade over the same evaluator used by an interactive

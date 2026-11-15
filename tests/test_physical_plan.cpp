@@ -29,6 +29,7 @@
 #include <variant>
 #include <vector>
 
+#include "aggregate_chunked_internal.hpp"
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "physical_plan.hpp"
@@ -2055,6 +2056,72 @@ TEST_CASE("Sorted Int64 pair keys group exactly, serial and parallel, against a 
         } else {
             runtime::unset_env("IBEX_CHUNK_ROWS");
         }
+    }
+}
+
+TEST_CASE("Streamed sorted keys accumulate across workers, bit-identical to one thread",
+          "[physical][breaker][execute]") {
+    // 300k-row chunks of a sorted key with runs of 1-5 rows. Per chunk the
+    // private-partials accumulation sizes its state by every group so far and
+    // the owned-ranges one needs a 1M-row chunk, so these chunks accumulated
+    // on one thread. The sorted numbering's gids never decrease, so each chunk
+    // now splits into row ranges cut where the gid changes. The sum's values
+    // are not dyadic, so a group split across workers, or summed out of row
+    // order, would not match the one-thread run bit for bit.
+    constexpr std::int64_t kRows = 1'200'000;
+    runtime::Table t;
+    {
+        Column<std::int64_t> k;
+        Column<double> v;
+        std::int64_t key = 0;
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            if (r % 5 == 0 || r % 7 == 0) {
+                key += 4;  // spaced 4 apart: keeps the dense-int path out
+            }
+            k.push_back(key);
+            v.push_back(static_cast<double>(r % 1013) * 0.1);
+        }
+        t.add_column("k", std::move(k));
+        t.add_column("v", std::move(v));
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+    const auto ir = require_ir("t[select { s = sum(v), c = count() }, by k];");
+    const char* saved = std::getenv("IBEX_CHUNK_ROWS");
+    const std::optional<std::string> restore =
+        saved == nullptr ? std::nullopt : std::optional<std::string>(saved);
+    runtime::set_env("IBEX_CHUNK_ROWS", "300000");
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+    parallel.parallel_stats = &stats;
+    const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    const auto before = runtime::ascending_gid_accumulations().load();
+    const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    const auto ascending = runtime::ascending_gid_accumulations().load() - before;
+    if (restore.has_value()) {
+        runtime::set_env("IBEX_CHUNK_ROWS", *restore);
+    } else {
+        runtime::unset_env("IBEX_CHUNK_ROWS");
+    }
+    REQUIRE(s.has_value());
+    REQUIRE(p.has_value());
+    REQUIRE(s->rows() == p->rows());
+    const auto& sk = std::get<Column<std::int64_t>>(*s->find_entry("k")->column);
+    const auto& pk = std::get<Column<std::int64_t>>(*p->find_entry("k")->column);
+    const auto& ss = std::get<Column<double>>(*s->find_entry("s")->column);
+    const auto& ps = std::get<Column<double>>(*p->find_entry("s")->column);
+    const auto& sc = std::get<Column<std::int64_t>>(*s->find_entry("c")->column);
+    const auto& pc = std::get<Column<std::int64_t>>(*p->find_entry("c")->column);
+    for (std::size_t i = 0; i < s->rows(); ++i) {
+        REQUIRE(sk[i] == pk[i]);
+        REQUIRE(ss[i] == ps[i]);
+        REQUIRE(sc[i] == pc[i]);
+    }
+    if (std::min<std::size_t>(8, runtime::process_worker_pool().size()) >= 2) {
+        CHECK(ascending >= 4);  // every 300k-row chunk split by ascending gid
     }
 }
 

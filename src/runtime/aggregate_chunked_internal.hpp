@@ -43,6 +43,11 @@ namespace ibex::runtime {
 /// the map gives the same answer, only slower, so only this tells them apart.
 [[nodiscard]] auto deferred_int_index_builds() -> std::atomic<std::uint64_t>&;
 
+/// How many chunks, process-wide, an aggregate accumulated across workers by
+/// row ranges cut where an ascending gid changes (`try_accumulate_ascending`).
+/// For tests: the serial loop gives the same answer.
+[[nodiscard]] auto ascending_gid_accumulations() -> std::atomic<std::uint64_t>&;
+
 /// How many times, process-wide, the radix group discovery started part-way
 /// through a stream and seeded the groups found so far into its partitions.
 /// For tests: the serial loop gives the same answer.

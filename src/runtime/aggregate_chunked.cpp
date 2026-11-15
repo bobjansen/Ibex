@@ -1744,14 +1744,19 @@ class HashAggregateState final {
         std::vector<const ColumnEntry*> aggregate_entries;
         std::vector<std::uint8_t> skip_fields;
         std::size_t rows = 0;
+        /// The chunk's gids never decrease (the sorted numbering wrote them),
+        /// so a row range cut where the gid changes owns its groups outright.
+        bool gids_ascending = false;
     };
 
     void publish_discovered(const std::vector<const ColumnEntry*>& aggregate_entries,
                             std::size_t rows,
-                            const std::vector<std::uint8_t>* skip_fields = nullptr) {
+                            const std::vector<std::uint8_t>* skip_fields = nullptr,
+                            bool gids_ascending = false) {
         discovery_transfer_.kind = DiscoveryTransferKind::NeedsAccumulation;
         discovery_transfer_.aggregate_entries = aggregate_entries;
         discovery_transfer_.rows = rows;
+        discovery_transfer_.gids_ascending = gids_ascending;
         discovery_transfer_.skip_fields =
             skip_fields == nullptr ? std::vector<std::uint8_t>{} : *skip_fields;
     }
@@ -1775,7 +1780,7 @@ class HashAggregateState final {
         const auto* skip =
             discovery_transfer_.skip_fields.empty() ? nullptr : &discovery_transfer_.skip_fields;
         accumulate_gids(gids_buf_.data(), discovery_transfer_.aggregate_entries,
-                        discovery_transfer_.rows, skip);
+                        discovery_transfer_.rows, skip, discovery_transfer_.gids_ascending);
         discovery_transfer_ = {};
         return std::nullopt;
     }
@@ -2330,7 +2335,8 @@ class HashAggregateState final {
                     seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
                 }
                 publish_discovered(agg_entries, rows,
-                                   has_discovery_first ? &discovery_first : nullptr);
+                                   has_discovery_first ? &discovery_first : nullptr,
+                                   /*gids_ascending=*/true);
                 return std::nullopt;
             }
 
@@ -3932,7 +3938,7 @@ class HashAggregateState final {
                 [&](std::uint32_t gid, const std::pair<std::int64_t, std::int64_t>& key) {
                     pair_order_[gid] = key;
                 })) {
-            publish_discovered(agg_entries, rows);
+            publish_discovered(agg_entries, rows, nullptr, /*gids_ascending=*/true);
             return std::nullopt;
         }
 
@@ -7108,12 +7114,72 @@ class HashAggregateState final {
         return true;
     }
 
+    /// Accumulate a chunk whose gids never decrease across workers, each over
+    /// a row range whose ends are moved forward to where the gid changes: a
+    /// group's rows then all fall in one range, on one thread, in row order,
+    /// so the result is the serial one bit for bit, nothing is merged, and no
+    /// partial is allocated. The other two parallel paths size their state by
+    /// EVERY group so far or need a 1M-row chunk, so a streamed sorted key
+    /// (lineitem's l_orderkey, 983k-row row groups, 15M groups by the end)
+    /// accumulated every chunk on one thread. Text aggregates share a boxed
+    /// store and decline, as in `try_accumulate_owned_ranges`.
+    auto try_accumulate_ascending(const std::uint32_t* gids,
+                                  const std::vector<const ColumnEntry*>& agg_entries,
+                                  std::size_t rows, const std::vector<std::uint8_t>* skip) -> bool {
+        if (rows < kSortedIntParallelRows || exec_ == nullptr ||
+            par_.accumulation.decline != physical::FanOutDecline::None ||
+            par_.accumulation.worker_cap < 2 || on_worker_pool_thread()) {
+            return false;
+        }
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if ((skip != nullptr && (*skip)[a] != 0U) || plan_[a].func == ir::AggFunc::Count ||
+                plan_[a].func == ir::AggFunc::CountDistinct) {
+                continue;
+            }
+            if (plan_[a].kind != ExprType::Int && plan_[a].kind != ExprType::Double) {
+                return false;
+            }
+        }
+        const std::size_t workers = par_.accumulation.worker_cap;
+        const std::size_t ranges = std::min(workers * 4, rows / kSortedIntRangeRows);
+        if (ranges < 2) {
+            return false;
+        }
+        std::vector<std::size_t> cut(ranges + 1, rows);
+        cut[0] = 0;
+        for (std::size_t r = 1; r < ranges; ++r) {
+            std::size_t at = std::max(cut[r - 1], rows * r / ranges);
+            while (at > 0 && at < rows && gids[at] == gids[at - 1]) {
+                ++at;
+            }
+            cut[r] = at;
+        }
+        std::atomic<std::size_t> cursor{0};
+        auto batch = process_worker_pool().submit(std::min(workers, ranges), [&](std::size_t) {
+            for (std::size_t r = cursor.fetch_add(1, std::memory_order_relaxed); r < ranges;
+                 r = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                if (cut[r] < cut[r + 1]) {
+                    accumulate_columns_into(gids, agg_entries, cut[r], cut[r + 1],
+                                            flat_slots_.data(), scratch_.data(), skip);
+                }
+            }
+        });
+        batch.wait();
+        ascending_gid_accumulations().fetch_add(1, std::memory_order_relaxed);
+        if (exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
     /// Accumulate `gids` either across workers or, when that is not worth it,
     /// serially — the one call every gid-assigning fast path ends with.
     void accumulate_gids(const std::uint32_t* gids,
                          const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows,
-                         const std::vector<std::uint8_t>* skip = nullptr) {
-        if (!try_accumulate_parallel(gids, agg_entries, rows, skip) &&
+                         const std::vector<std::uint8_t>* skip = nullptr,
+                         bool gids_ascending = false) {
+        if (!(gids_ascending && try_accumulate_ascending(gids, agg_entries, rows, skip)) &&
+            !try_accumulate_parallel(gids, agg_entries, rows, skip) &&
             !try_accumulate_owned_ranges(gids, agg_entries, rows, skip)) {
             accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data(), scratch_.data(),
                                     skip);
@@ -10509,6 +10575,11 @@ auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>& {
 }
 
 auto single_core_partitioned_discoveries() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
+auto ascending_gid_accumulations() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};
     return count;
 }

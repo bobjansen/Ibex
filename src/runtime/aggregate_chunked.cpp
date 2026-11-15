@@ -5830,17 +5830,22 @@ class HashAggregateState final {
     // care, and it survives dictionary growth without a rebuild.
     static auto hash_codes(const Column<Categorical>::code_type* codes, std::size_t n)
         -> std::uint64_t {
+        // Each code is folded in by a multiply, not boost's `hash_combine`
+        // (`key_hash_mix`) over the code itself: over small dense integers that
+        // combine collides EXACTLY, not just in the low bits, so no finalizer
+        // can separate the keys. h2o's {id1, id3} (100 x 100k codes) gave
+        // 106k distinct hashes for 6.3M groups -- ~90 probes a row, 10.6 s for
+        // 10M rows, 60% of it comparing codes. The multiply keeps every key
+        // distinct (6.3M hashes, 2.5 probes a row). Finalized because this
+        // index masks the LOW bits to pick a slot and probes linearly. Nothing
+        // outside this index consumes the value, so unlike the three in
+        // `interpreter_internal.hpp` it has no agreement to maintain.
         std::uint64_t seed = 0;
         for (std::size_t i = 0; i < n; ++i) {
-            key_hash_mix(seed, std::hash<std::int64_t>{}(static_cast<std::int64_t>(codes[i])));
+            seed = ((seed ^ static_cast<std::uint64_t>(static_cast<std::uint32_t>(codes[i]))) *
+                    0x9e3779b97f4a7c15ULL) +
+                   0x632be59bd9b4e019ULL;
         }
-        // Finalized for the same reason `hash_key_row` is: this index masks the
-        // LOW bits to pick a slot and probes linearly, and the combine above
-        // never diffuses into them. Categorical codes are small dense integers,
-        // which is precisely the input that makes the unfinalized combine a
-        // near-linear function of the key and turns the probe into one long
-        // cluster. Nothing outside this index consumes the value, so unlike the
-        // three in `interpreter_internal.hpp` it has no agreement to maintain.
         return key_hash_finalize(seed);
     }
 

@@ -4247,3 +4247,81 @@ TEST_CASE("chunked int aggregate keeps sorted keys unindexed across chunk bounda
         CHECK(int_column(out, "n") == std::vector<std::int64_t>{2, 3, 1, 1});
     }
 }
+
+TEST_CASE("a small last chunk of sorted keys does not start the radix discovery late",
+          "[runtime][chunked][aggregate]") {
+    // Streamed lineitem: 61 sorted l_orderkey chunks numbered by comparison,
+    // then a 20k-row last chunk, too small for the sorted numbering. It fell
+    // to the radix path, which first seeded all 15M groups so far into its
+    // partitions on one thread (1.4 s); the serial loop continues it by
+    // comparison. Two sorted 300k-row chunks (the second starting on the
+    // first's last key) and a 1000-row tail, Int64 and Int64 pair keys, two
+    // aggregates so the hot sum path stays out. Same groups, counts and sums
+    // as a hand reference, at 1 and 8 threads, and no late seeding.
+    constexpr std::int64_t kChunkRows = 300'000;
+    std::vector<std::vector<std::int64_t>> parts;
+    std::int64_t row = 0;
+    for (const std::int64_t rows : {kChunkRows, kChunkRows, std::int64_t{1000}}) {
+        auto& part = parts.emplace_back();
+        for (std::int64_t i = 0; i < rows; ++i, ++row) {
+            part.push_back((row / 3) * 4);  // runs of 3, spaced 4 apart
+        }
+    }
+    const std::int64_t total_rows = row;
+    const auto groups = static_cast<std::size_t>((total_rows + 2) / 3);
+    const auto run = [](const std::string& source, const runtime::ExternRegistry& externs,
+                        std::size_t threads) {
+        auto program = parser::parse(source);
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        const runtime::TableRegistry registry;
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = threads;
+        auto result = runtime::interpret(*ir.value(), registry, nullptr, &externs, nullptr, exec);
+        REQUIRE(result.has_value());
+        return std::move(*result);
+    };
+    const auto check = [&](const runtime::Table& out, bool pair) {
+        REQUIRE(out.rows() == groups);
+        const auto k = int_column(out, "k");
+        const auto n = int_column(out, "n");
+        const auto c = int_column(out, "c");
+        const auto k2 = pair ? int_column(out, "k2") : std::vector<std::int64_t>{};
+        for (std::size_t g = 0; g < groups; ++g) {
+            const std::int64_t rows_in =
+                std::min<std::int64_t>(3, total_rows - (static_cast<std::int64_t>(g) * 3));
+            REQUIRE(k[g] == static_cast<std::int64_t>(g) * 4);
+            REQUIRE(n[g] == rows_in);
+            REQUIRE(c[g] == rows_in);
+            if (pair) {
+                REQUIRE(k2[g] == 7);
+            }
+        }
+    };
+    SECTION("Int64 key") {
+        runtime::ExternRegistry externs;
+        register_int_key_chunks(externs, parts);
+        const auto query = std::string{
+            "extern fn int_key_chunks() -> DataFrame from \"x.hpp\"; "
+            "int_key_chunks()[select { n = sum(v), c = count() }, by k];"};
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            const auto before = runtime::late_partitioned_seeds().load();
+            check(run(query, externs, threads), false);
+            CHECK(runtime::late_partitioned_seeds().load() == before);
+        }
+    }
+    SECTION("Int64 pair key") {
+        runtime::ExternRegistry externs;
+        register_int_key_chunks(externs, parts);
+        const auto query = std::string{
+            "extern fn int_key_chunks() -> DataFrame from \"x.hpp\"; "
+            "int_key_chunks()[update { k2 = v * 7 }][select { n = sum(v), c = count() }, "
+            "by { k, k2 }];"};
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            const auto before = runtime::late_partitioned_seeds().load();
+            check(run(query, externs, threads), true);
+            CHECK(runtime::late_partitioned_seeds().load() == before);
+        }
+    }
+}

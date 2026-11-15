@@ -43,6 +43,11 @@ namespace ibex::runtime {
 /// the map gives the same answer, only slower, so only this tells them apart.
 [[nodiscard]] auto deferred_int_index_builds() -> std::atomic<std::uint64_t>&;
 
+/// How many times, process-wide, the radix group discovery started part-way
+/// through a stream and seeded the groups found so far into its partitions.
+/// For tests: the serial loop gives the same answer.
+[[nodiscard]] auto late_partitioned_seeds() -> std::atomic<std::uint64_t>&;
+
 /// How many Categorical key columns, process-wide, an aggregate's key store
 /// began holding as codes alone, its text read through the dictionary. For
 /// tests: storing the text too gives the same answer.

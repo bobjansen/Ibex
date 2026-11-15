@@ -2340,7 +2340,16 @@ class HashAggregateState final {
                 return std::nullopt;
             }
 
-            if (try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
+            // While every group so far was numbered in increasing key order
+            // (the deferred index still holds), a chunk too small for the
+            // sorted numbering goes to the serial loop, which continues it by
+            // comparison. Starting the radix path late would first seed every
+            // group so far into its partitions, on this thread: lineitem's
+            // 20k-row last chunk after 15M sorted l_orderkey groups took 1.4 s.
+            const bool sorted_so_far = int_index_deferred_ && n_groups_ > 0 &&
+                                       n_groups_ == int_serial_groups_ && !sorted_int_declined_;
+            if (!sorted_so_far &&
+                try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
                     key_at, rows, gids, int_partitions_,
                     [&](std::size_t n) {
                         int_order_.resize(n);
@@ -3942,7 +3951,12 @@ class HashAggregateState final {
             return std::nullopt;
         }
 
-        if (!pair_dense_active_ &&
+        // As on the Int64 path: a small chunk continuing pairs numbered in
+        // increasing order stays on the serial loop rather than seeding every
+        // pair so far into the radix partitions.
+        const bool pairs_sorted_so_far = pair_index_deferred_ && n_groups_ > 0 &&
+                                         n_groups_ == pair_serial_groups_ && !sorted_pair_declined_;
+        if (!pair_dense_active_ && !pairs_sorted_so_far &&
             try_discover_partitioned<PairIntKey, PairIntKeyHash>(
                 [&](std::size_t row) { return pack(key_a_at(row), key_b_at(row)); }, rows, gids,
                 pair_partitions_, [&](std::size_t n) { pair_order_.resize(n); },
@@ -4939,6 +4953,7 @@ class HashAggregateState final {
         // chunk follow another.
         if constexpr (can_seed) {
             if (!partitioned_active_ && n_groups_ > 0) {
+                late_partitioned_seeds().fetch_add(1, std::memory_order_relaxed);
                 Hash hasher;
                 for (std::uint32_t gid = 0; gid < static_cast<std::uint32_t>(n_groups_); ++gid) {
                     const auto key = key_of_group(gid);
@@ -10494,6 +10509,11 @@ auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>& {
 }
 
 auto single_core_partitioned_discoveries() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
+auto late_partitioned_seeds() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};
     return count;
 }

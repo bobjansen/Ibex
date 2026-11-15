@@ -11,6 +11,7 @@
 #                    prompt. Only the interactive `ibex` binary links it.
 add_library(ibex_repl_core OBJECT
     eager_projection.cpp
+    lazy_head.cpp
     repl.cpp
 )
 

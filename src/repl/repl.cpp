@@ -95,6 +95,7 @@
 #include <variant>
 
 #include "eager_projection.hpp"
+#include "lazy_head.hpp"
 #include "line_editing.hpp"
 
 namespace ibex::repl {
@@ -6884,12 +6885,22 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 ibex::formatting::print("usage: :head <table> [n]\n");
                 continue;
             }
+            const std::size_t count = parse_optional_size(count_text, 10);
+            // A lazy binding shows its leading rows without decoding the rest.
+            if (const auto lazy = lazy_tables.find(std::string(name)); lazy != lazy_tables.end()) {
+                auto head = detail::format_lazy_head(*lazy->second, count, command_exec());
+                if (!head) {
+                    ibex::formatting::print("error: {}\n", head.error());
+                    continue;
+                }
+                std::cout << *head;
+                continue;
+            }
             auto table = resolve_table(std::string(name), tables, lazy_tables);
             if (!table) {
                 ibex::formatting::print("error: {}\n", table.error());
                 continue;
             }
-            const std::size_t count = parse_optional_size(count_text, 10);
             print_table(table.value(), count);
             continue;
         }

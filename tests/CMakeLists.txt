@@ -68,6 +68,7 @@ set(IBEX_TEST_SOURCES
     test_repl.cpp
     test_repl_resources.cpp
     test_repl_eager_projection.cpp
+    test_repl_lazy_head.cpp
     test_lower.cpp
     test_null_keys.cpp
     test_interpreter.cpp

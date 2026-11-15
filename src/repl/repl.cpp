@@ -22,6 +22,7 @@
 #include <ibex/ir/null_flag_aggregates.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/probed_key_restriction.hpp>
+#include <ibex/ir/replayable.hpp>
 #include <ibex/ir/required_columns.hpp>
 #include <ibex/ir/scan_predicates.hpp>
 #include <ibex/ir/schema.hpp>
@@ -123,13 +124,126 @@ auto equality_joins_as_keys(ir::NodePtr plan, const ir::SourceSchemas& schemas) 
     return std::move(rewritten.plan);
 }
 
-/// Table bindings whose source can decode columns selectively, held unread.
+/// A `let` of a table expression held as its plan rather than its value
+/// (SPEC.md 1.5): each statement that reads the name has the plan inlined, so
+/// the whole query is planned and streamed as one, and nothing runs until
+/// something reads it. The plan scans only `__let` aliases, captured when the
+/// `let` ran, so rebinding a name it read leaves it alone. See
+/// `try_bind_plan_let`.
+struct PlanBinding {
+    std::shared_ptr<const ir::Node> plan;
+    ir::SchemaInfo schema;
+};
+
+/// Table bindings held unread: sources that decode columns selectively (the
+/// map itself), and plan bindings (`plans`), which ride in the same registry
+/// because every evaluator already threads it.
 ///
 /// Kept beside `TableRegistry` rather than inside it: a lookup site that has
 /// not been taught about laziness then fails loudly with "unknown table"
 /// instead of quietly receiving a table missing the columns nobody asked for.
-/// A binding lives in exactly one of the two registries.
-using LazyTableRegistry = robin_hood::unordered_map<std::string, runtime::LazyTablePtr>;
+/// A binding lives in exactly one registry; `erase` drops a name from both
+/// halves of this one.
+class LazyTableRegistry : public robin_hood::unordered_map<std::string, runtime::LazyTablePtr> {
+   public:
+    using Sources = robin_hood::unordered_map<std::string, runtime::LazyTablePtr>;
+    using Sources::erase;
+    using Sources::Sources;
+    // Deliberately hides the map's own: a name must leave both halves.
+    // NOLINTNEXTLINE(bugprone-derived-method-shadowing-base-method)
+    auto erase(const std::string& name) -> std::size_t {
+        return plans.erase(name) + Sources::erase(name);
+    }
+
+    robin_hood::unordered_map<std::string, PlanBinding> plans;
+};
+
+/// Hidden names a plan binding's captured tables and sources live under.
+constexpr std::string_view kPlanAliasPrefix = "__let";
+
+[[nodiscard]] auto is_plan_alias(std::string_view name) -> bool {
+    return name.starts_with(kPlanAliasPrefix);
+}
+
+/// Every source name `node` scans, nested plans included (a Construct column,
+/// an Update tuple field: the set `splice_shared_plan` walks).
+// NOLINTNEXTLINE(misc-no-recursion)
+void collect_scan_names(const ir::Node& node, std::set<std::string>& out) {
+    if (node.kind() == ir::NodeKind::Scan) {
+        out.insert(ir::node_cast<ir::ScanNode>(node).source_name());
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            collect_scan_names(*child, out);
+        }
+    }
+    if (node.kind() == ir::NodeKind::Construct) {
+        for (const auto& column : ir::node_cast<ir::ConstructNode>(node).columns()) {
+            if (column.expr_node != nullptr) {
+                collect_scan_names(*column.expr_node, out);
+            }
+        }
+    }
+    if (node.kind() == ir::NodeKind::Update) {
+        for (const auto& field : ir::node_cast<ir::UpdateNode>(node).tuple_fields()) {
+            if (field.source != nullptr) {
+                collect_scan_names(*field.source, out);
+            }
+        }
+    }
+}
+
+/// Point every scan of a key of `to` at its value.
+// NOLINTNEXTLINE(misc-no-recursion)
+void rename_scans(ir::NodePtr& node, const std::map<std::string, std::string>& to) {
+    if (node == nullptr) {
+        return;
+    }
+    if (node->kind() == ir::NodeKind::Scan) {
+        if (const auto it = to.find(ir::node_cast<ir::ScanNode>(*node).source_name());
+            it != to.end()) {
+            node = std::make_unique<ir::ScanNode>(node->id(), it->second);
+        }
+        return;
+    }
+    for (auto& child : node->mutable_children()) {
+        rename_scans(child, to);
+    }
+    if (node->kind() == ir::NodeKind::Construct) {
+        for (auto& column : ir::node_cast<ir::ConstructNode>(*node).mutable_columns()) {
+            rename_scans(column.expr_node, to);
+        }
+    }
+    if (node->kind() == ir::NodeKind::Update) {
+        for (auto& field : ir::node_cast<ir::UpdateNode>(*node).mutable_tuple_fields()) {
+            rename_scans(field.source, to);
+        }
+    }
+}
+
+/// Between statements: drop the `__let` aliases no plan binding scans any
+/// more, and every lazy source's decoded columns. A source's column cache
+/// saves work within one statement (a key proof and the scan after it, two
+/// scans of one binding); across statements it was memory nobody asked for
+/// -- `collect(...)` is how a session keeps a table.
+void end_statement(runtime::TableRegistry& tables, LazyTableRegistry& lazy_tables) {
+    std::set<std::string> scanned;
+    for (const auto& [name, binding] : lazy_tables.plans) {
+        collect_scan_names(*binding.plan, scanned);
+    }
+    for (auto it = tables.begin(); it != tables.end();) {
+        it = is_plan_alias(it->first) && !scanned.contains(it->first) ? tables.erase(it)
+                                                                      : std::next(it);
+    }
+    for (auto it = lazy_tables.begin(); it != lazy_tables.end();) {
+        it = is_plan_alias(it->first) && !scanned.contains(it->first)
+                 ? lazy_tables.LazyTableRegistry::Sources::erase(it)
+                 : std::next(it);
+    }
+    for (const auto& [name, lazy] : lazy_tables) {
+        lazy->clear_cache();
+    }
+}
 /// Resource bindings (`let db = adbc::connect(...)`). Only statement-level code
 /// in `execute_statements` sees this registry, never the expression
 /// evaluators, which is what keeps resources out of query expressions and
@@ -710,20 +824,35 @@ void render_eval_value(const EvalValue& value, bool requested = false) {
     }
 }
 
-void print_tables(const runtime::TableRegistry& tables, const LazyTableRegistry& lazy_tables) {
-    if (tables.empty() && lazy_tables.empty()) {
-        ibex::formatting::print("tables: <none>\n");
-        return;
-    }
+/// Every table binding's name, sorted: materialized, lazy sources and plans,
+/// but not the hidden `__let` aliases plans read.
+auto visible_table_names(const runtime::TableRegistry& tables, const LazyTableRegistry& lazy_tables)
+    -> std::vector<std::string> {
     std::vector<std::string> names;
-    names.reserve(tables.size() + lazy_tables.size());
+    names.reserve(tables.size() + lazy_tables.size() + lazy_tables.plans.size());
     for (const auto& entry : tables) {
-        names.push_back(entry.first);
+        if (!is_plan_alias(entry.first)) {
+            names.push_back(entry.first);
+        }
     }
     for (const auto& entry : lazy_tables) {
+        if (!is_plan_alias(entry.first)) {
+            names.push_back(entry.first);
+        }
+    }
+    for (const auto& entry : lazy_tables.plans) {
         names.push_back(entry.first);
     }
     std::ranges::sort(names);
+    return names;
+}
+
+void print_tables(const runtime::TableRegistry& tables, const LazyTableRegistry& lazy_tables) {
+    const auto names = visible_table_names(tables, lazy_tables);
+    if (names.empty()) {
+        ibex::formatting::print("tables: <none>\n");
+        return;
+    }
     ibex::formatting::print("tables:");
     for (const auto& name : names) {
         ibex::formatting::print(" {}", name);
@@ -780,18 +909,10 @@ std::string format_scalar_names(const runtime::ScalarRegistry& scalars) {
 
 std::string format_table_names(const runtime::TableRegistry& tables,
                                const LazyTableRegistry& lazy_tables) {
-    if (tables.empty() && lazy_tables.empty()) {
+    const auto names = visible_table_names(tables, lazy_tables);
+    if (names.empty()) {
         return "<none>";
     }
-    std::vector<std::string> names;
-    names.reserve(tables.size() + lazy_tables.size());
-    for (const auto& entry : tables) {
-        names.push_back(entry.first);
-    }
-    for (const auto& entry : lazy_tables) {
-        names.push_back(entry.first);
-    }
-    std::ranges::sort(names);
     std::string out;
     for (std::size_t i = 0; i < names.size(); ++i) {
         if (i > 0) {
@@ -1729,6 +1850,42 @@ void print_schema(const runtime::Table& table) {
     }
 }
 
+/// A plan binding's column type as `column_type_name` spells a materialized
+/// one; "Unknown" when the plan does not fix it.
+auto schema_field_type_name(const ir::SchemaField& field) -> std::string {
+    if (!field.type.has_value()) {
+        return "Unknown";
+    }
+    switch (*field.type) {
+        case ir::ColumnType::Int32:
+        case ir::ColumnType::Int64:
+            return "Int64";
+        case ir::ColumnType::Float32:
+        case ir::ColumnType::Float64:
+            return "Float64";
+        case ir::ColumnType::Bool:
+            return "Bool";
+        case ir::ColumnType::String:
+            return "String";
+        case ir::ColumnType::Categorical:
+            return "Categorical";
+        case ir::ColumnType::Date:
+            return "Date";
+        case ir::ColumnType::Timestamp:
+            return "Timestamp";
+        case ir::ColumnType::Decimal:
+            return "Decimal";
+    }
+    return "Unknown";
+}
+
+void print_schema(const ir::SchemaInfo& schema) {
+    ibex::formatting::print("columns:\n");
+    for (const auto& field : schema.fields()) {
+        ibex::formatting::print("  {}: {}\n", field.name, schema_field_type_name(field));
+    }
+}
+
 void describe_table(const runtime::Table& table, std::size_t max_rows = 10) {
     print_schema(table);
     print_table(table, max_rows);
@@ -1995,6 +2152,11 @@ void print_doc(std::string_view name, const runtime::TableRegistry& tables,
         ibex::formatting::print("table {}\n", key);
         print_schema(it->second->schema());
         ibex::formatting::print("rows: {}\n", it->second->rows());
+        return;
+    }
+    if (const auto it = lazy_tables.plans.find(key); it != lazy_tables.plans.end()) {
+        ibex::formatting::print("table {} (a plan: runs where it is read)\n", key);
+        print_schema(it->second.schema);
         return;
     }
     if (const auto it = scalars.find(key); it != scalars.end()) {
@@ -3316,6 +3478,16 @@ auto build_lower_context(const runtime::TableRegistry& tables, const LazyTableRe
     for (const auto& [name, lazy] : lazy_tables) {
         context.source_schemas.insert_or_assign(name, table_schema_info(lazy->schema()));
     }
+    // A plan binding is inlined where it is read: the lowerer clones it at each
+    // reference, so the whole query is planned as one.
+    for (const auto& [name, binding] : lazy_tables.plans) {
+        context.lexical_names.insert(name);
+        std::uint64_t next = ir::max_node_id(*binding.plan) + 1;
+        if (auto clone = ir::clone_replayable_subplan(*binding.plan, next)) {
+            context.bindings.insert_or_assign(name, std::move(clone));
+        }
+        context.source_schemas.insert_or_assign(name, binding.schema);
+    }
     // Scalar user functions are inlined when called inside clause expressions.
     for (const auto& [name, decl] : functions) {
         context.functions.insert_or_assign(name, &decl);
@@ -3573,14 +3745,31 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (const auto it = lazy_tables.find(ident->name); it != lazy_tables.end()) {
             return it->second->materialize(command_exec());
         }
-        return std::unexpected("unknown table: " + ident->name +
-                               " (available: " + format_table_names(tables, lazy_tables) + ")");
+        // A plan binding named on its own is run: lowered below, where the
+        // name inlines its plan.
+        if (!lazy_tables.plans.contains(ident->name)) {
+            return std::unexpected("unknown table: " + ident->name +
+                                   " (available: " + format_table_names(tables, lazy_tables) + ")");
+        }
     }
     parser::LowerContext context = build_lower_context(
         tables, lazy_tables, scalars, columns, models, functions, compile_time_lists, extern_decls);
     auto lowered = parser::lower_expr(expr, context);
     if (!lowered) {
         return std::unexpected(lowered.error().message);
+    }
+    // A name that is no table binding lowers to a scan the runtime would
+    // report against its own registry, which holds plan aliases and knows no
+    // plans. Report it here, with the names a user can type.
+    {
+        std::set<std::string> scanned;
+        collect_scan_names(*lowered.value(), scanned);
+        for (const auto& name : scanned) {
+            if (!tables.contains(name) && !lazy_tables.contains(name)) {
+                return std::unexpected("unknown table: " + name + " (available: " +
+                                       format_table_names(tables, lazy_tables) + ")");
+            }
+        }
     }
     // Every earlier statement has run, so each `^name` holds its final value
     // here. Bound first, so the rewrites below see the literals too.
@@ -3694,6 +3883,218 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         *model_out = std::move(captured_model);
     }
     return std::move(evaluated.value());
+}
+
+/// Whether every table position in `expr` (block bases, join operands, the
+/// operands of the pure table built-ins) is a name or a pure table built-in.
+/// A call left there after `rewrite_inline_sources` -- a user `fn`, an
+/// extern, `collect`, `print` -- is something the REPL evaluates eagerly, so
+/// such a `let` is too.
+// NOLINTNEXTLINE(misc-no-recursion)
+auto table_positions_are_plans(const parser::Expr& expr) -> bool {
+    const auto slot = [](const parser::ExprPtr& e) {
+        return e != nullptr && table_positions_are_plans(*e);
+    };
+    if (std::holds_alternative<parser::IdentifierExpr>(expr.node)) {
+        return true;
+    }
+    if (const auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
+        return slot(block->base);
+    }
+    if (const auto* join = std::get_if<parser::JoinExpr>(&expr.node)) {
+        return slot(join->left) && slot(join->right);
+    }
+    if (const auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
+        return slot(group->expr);
+    }
+    if (const auto* ascribe = std::get_if<parser::AscribeExpr>(&expr.node)) {
+        return slot(ascribe->base);
+    }
+    if (const auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+        if (call->callee == "rbind") {
+            return call->named_args.empty() && std::ranges::all_of(call->args, slot);
+        }
+        if (call->callee == "as_timeframe" || call->callee == "columns") {
+            return !call->args.empty() && slot(call->args.front());
+        }
+    }
+    return false;
+}
+
+/// Whether an expression in `node`'s plan reads a bound scalar or Series by
+/// its bare name -- a reference that is not `^name` and not a column of the
+/// node's input. The runtime resolves such a name when the plan runs, so a
+/// plan holding one would read whatever the name is bound to then. Looks
+/// where `ir::check_column_refs` looks for expression references (filter,
+/// update -- which computed `select` fields and `by` keys lower to -- and
+/// map), and at join predicates. An input of unknown schema counts as not
+/// having the column.
+// NOLINTNEXTLINE(misc-no-recursion)
+auto reads_bare_binding(const ir::Node& node, const ir::SourceSchemas& sources,
+                        const runtime::ScalarRegistry& scalars, const ColumnRegistry& columns)
+    -> bool {
+    for (const auto& child : node.children()) {
+        if (child != nullptr && reads_bare_binding(*child, sources, scalars, columns)) {
+            return true;
+        }
+    }
+    if (node.kind() == ir::NodeKind::Update) {
+        for (const auto& field : ir::node_cast<ir::UpdateNode>(node).tuple_fields()) {
+            if (field.source != nullptr &&
+                reads_bare_binding(*field.source, sources, scalars, columns)) {
+                return true;
+            }
+        }
+    }
+    std::vector<ir::ColumnRef> refs;
+    switch (node.kind()) {
+        case ir::NodeKind::Filter:
+            ir::collect_expr_columns(ir::node_cast<ir::FilterNode>(node).predicate(), refs);
+            break;
+        case ir::NodeKind::Update:
+            for (const auto& field : ir::node_cast<ir::UpdateNode>(node).fields()) {
+                ir::collect_expr_columns(field.expr, refs);
+            }
+            break;
+        case ir::NodeKind::Map:
+            for (const auto& field : ir::node_cast<ir::MapNode>(node).fields()) {
+                ir::collect_expr_columns(field.expr, refs);
+            }
+            break;
+        case ir::NodeKind::Join:
+            if (const auto& predicate = ir::node_cast<ir::JoinNode>(node).predicate();
+                predicate.has_value()) {
+                ir::collect_expr_columns(*predicate, refs);
+            }
+            break;
+        default:
+            break;
+    }
+    if (refs.empty()) {
+        return false;
+    }
+    std::vector<ir::SchemaInfo> inputs;
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            inputs.push_back(ir::infer_schema(*child, sources));
+        }
+    }
+    const auto is_column = [&](const std::string& name) {
+        return std::ranges::any_of(inputs, [&](const ir::SchemaInfo& input) {
+            return input.is_known() && (input.is_open() || input.find(name) != nullptr);
+        });
+    };
+    return std::ranges::any_of(refs, [&](const ir::ColumnRef& ref) {
+        return !ref.lexical && (scalars.contains(ref.name) || columns.contains(ref.name)) &&
+               !is_column(ref.name);
+    });
+}
+
+/// Bind `let name = value` as a plan (`PlanBinding`) when its value is a
+/// table expression that may run later, and any number of times, with the
+/// same answer. Nullopt when it may not -- the caller then evaluates it now,
+/// as before -- and an error only for a failure the eager path would also
+/// report.
+///
+/// Evaluated now instead: a value whose table positions hold a call the REPL
+/// runs eagerly (`table_positions_are_plans`), `collect(...)`, a model fit, a
+/// plan that is not replayable (`rand_*`, an extern call: its effect may be
+/// the point), one whose schema is not fully known, and one that reads a
+/// bound scalar or Series by its bare name: a bare name is resolved when the
+/// plan runs, so a later `let x = ...` would change the plan. Such a name is
+/// one a source is asked for (`ir::required_columns`) but does not have.
+/// `^name` is bound now, as a literal.
+///
+/// The tables and sources the plan scans are captured under `__let` aliases,
+/// so rebinding their names later leaves the plan reading what it read here.
+auto try_bind_plan_let(const parser::LetStmt& let, runtime::TableRegistry& tables,
+                       LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                       ColumnRegistry& columns, ModelRegistry& models,
+                       const FunctionRegistry& functions,
+                       CompileTimeListRegistry& compile_time_lists,
+                       const ExternDeclRegistry& extern_decls,
+                       const runtime::ExternRegistry& externs)
+    -> std::optional<std::expected<void, std::string>> {
+    parser::Expr& value = *let.value;
+    if (!std::holds_alternative<parser::BlockExpr>(value.node) &&
+        !std::holds_alternative<parser::JoinExpr>(value.node) &&
+        !std::holds_alternative<parser::GroupExpr>(value.node) &&
+        !std::holds_alternative<parser::IdentifierExpr>(value.node)) {
+        return std::nullopt;
+    }
+    if (const auto* ident = std::get_if<parser::IdentifierExpr>(&value.node);
+        ident != nullptr && !tables.contains(ident->name) && !lazy_tables.contains(ident->name) &&
+        !lazy_tables.plans.contains(ident->name)) {
+        return std::nullopt;  // a scalar, a Series, a model, ...: not a table
+    }
+    InlineSourceRewrites inline_sources{&lazy_tables};
+    if (rewrite_inline_sources(value, inline_sources, tables, lazy_tables, scalars, columns, models,
+                               functions, compile_time_lists, extern_decls, externs)
+            .has_value()) {
+        return std::nullopt;  // the eager path reports it
+    }
+    if (!table_positions_are_plans(value)) {
+        return std::nullopt;
+    }
+    parser::LowerContext context = build_lower_context(
+        tables, lazy_tables, scalars, columns, models, functions, compile_time_lists, extern_decls);
+    auto lowered = parser::lower_expr(value, context);
+    if (!lowered.has_value()) {
+        return std::nullopt;
+    }
+    ir::NodePtr plan = runtime::bind_plan_constants(std::move(lowered.value()), scalars);
+    if (reads_bare_binding(*plan, context.source_schemas, scalars, columns)) {
+        return std::nullopt;
+    }
+    if (plan_fits_model(*plan)) {
+        return std::nullopt;
+    }
+    if (std::uint64_t next = ir::max_node_id(*plan) + 1;
+        ir::clone_replayable_subplan(*plan, next) == nullptr) {
+        return std::nullopt;
+    }
+    auto schema = ir::infer_schema(*plan, context.source_schemas);
+    if (!schema.is_known()) {
+        return std::nullopt;
+    }
+
+    std::set<std::string> scanned;
+    collect_scan_names(*plan, scanned);
+    static std::uint64_t alias_counter = 0;
+    std::map<std::string, std::string> aliases;
+    std::vector<std::pair<std::string, runtime::Table>> captured_tables;
+    std::vector<std::pair<std::string, runtime::LazyTablePtr>> captured_sources;
+    for (const auto& name : scanned) {
+        if (is_plan_alias(name)) {
+            continue;  // captured already, by the plan binding this one inlined
+        }
+        auto alias = std::string(kPlanAliasPrefix) + std::to_string(alias_counter++) + "_" + name;
+        if (const auto it = tables.find(name); it != tables.end()) {
+            captured_tables.emplace_back(alias, it->second);  // shares the column storage
+        } else if (const auto source = lazy_tables.find(name); source != lazy_tables.end()) {
+            captured_sources.emplace_back(alias, source->second);
+        } else {
+            return std::nullopt;
+        }
+        aliases.emplace(name, std::move(alias));
+    }
+    rename_scans(plan, aliases);
+    for (auto& [alias, table] : captured_tables) {
+        tables.insert_or_assign(alias, std::move(table));
+    }
+    for (auto& [alias, source] : captured_sources) {
+        lazy_tables.insert_or_assign(alias, std::move(source));
+    }
+    tables.erase(let.name);
+    lazy_tables.erase(let.name);
+    scalars.erase(let.name);
+    columns.erase(let.name);
+    models.erase(let.name);
+    compile_time_lists.erase(let.name);
+    lazy_tables.plans.insert_or_assign(
+        let.name, PlanBinding{.plan = std::shared_ptr<const ir::Node>(std::move(plan)),
+                              .schema = std::move(schema)});
+    return std::expected<void, std::string>{};
 }
 
 auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
@@ -5111,8 +5512,17 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             functions.insert_or_assign(fn.name, std::move(fn));
         }
     }
+    // Between statements, and once the batch ends however it ends: release
+    // plan aliases nothing reads and the sources' decoded columns.
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
+    struct EndOfBatch {
+        runtime::TableRegistry* tables;
+        LazyTableRegistry* lazy_tables;
+        ~EndOfBatch() { end_statement(*tables, *lazy_tables); }
+    } const end_of_batch{.tables = &tables, .lazy_tables = &lazy_tables};
     for (std::size_t stmt_index = 0; stmt_index < statements.size(); ++stmt_index) {
         auto& stmt = statements[stmt_index];
+        end_statement(tables, lazy_tables);
         // Statement-level interruption boundary: a Ctrl+C during a multi
         // statement batch (:load, script) stops before the next statement.
         if (runtime::interrupt_requested()) {
@@ -5296,6 +5706,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         ibex::formatting::print("error: {}\n", lazy->error());
                         return false;
                     }
+                    lazy_tables.erase(let_stmt.name);
                     lazy_tables.insert_or_assign(let_stmt.name, std::move(lazy->value()));
                     // A name lives in exactly one registry, so drop any binding
                     // this one shadows.
@@ -5304,6 +5715,16 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     columns.erase(let_stmt.name);
                     models.erase(let_stmt.name);
                     compile_time_lists.erase(let_stmt.name);
+                    continue;
+                }
+                // A table expression binds its plan; it runs where it is read.
+                if (auto planned =
+                        try_bind_plan_let(let_stmt, tables, lazy_tables, scalars, columns, models,
+                                          functions, compile_time_lists, extern_decls, externs)) {
+                    if (!*planned) {
+                        ibex::formatting::print("error: {}\n", planned->error());
+                        return false;
+                    }
                     continue;
                 }
             }
@@ -5356,6 +5777,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                             ibex::formatting::print("error: '{}': {}\n", let_stmt.name, *err);
                             return false;
                         }
+                        lazy_tables.erase(let_stmt.name);
                         lazy_tables.insert_or_assign(
                             let_stmt.name,
                             narrow_to_declared(std::move(lazy->value()), *let_stmt.type));
@@ -5480,6 +5902,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             } else {
                 auto table_value = std::get<runtime::Table>(std::move(value.value()));
                 auto compile_time_list = extract_compile_time_string_list(table_value);
+                lazy_tables.erase(let_stmt.name);
                 tables.insert_or_assign(let_stmt.name, std::move(table_value));
                 if (compile_time_list.has_value()) {
                     compile_time_lists.insert_or_assign(let_stmt.name,
@@ -6867,6 +7290,11 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 print_schema(lazy->second->schema());
                 continue;
             }
+            if (const auto plan = lazy_tables.plans.find(std::string(arg));
+                plan != lazy_tables.plans.end()) {
+                print_schema(plan->second.schema);  // inferred at the `let`; nothing runs
+                continue;
+            }
             const auto it = tables.find(std::string(arg));
             if (it == tables.end()) {
                 ibex::formatting::print("error: unknown table '{}'\n", arg);
@@ -6889,6 +7317,27 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 continue;
             }
             const std::size_t count = parse_optional_size(count_text, 10);
+            // A plan binding runs with the row limit on top of it, so a
+            // streamed plan stops reading once it has the rows.
+            if (lazy_tables.plans.contains(std::string(name))) {
+                auto parsed = parser::parse(ibex::formatting::format("{}[head {}];", name, count));
+                auto* stmt = parsed.has_value() && parsed->statements.size() == 1
+                                 ? std::get_if<parser::ExprStmt>(&parsed->statements.front())
+                                 : nullptr;
+                if (stmt == nullptr) {
+                    ibex::formatting::print("error: :head could not read '{}'\n", name);
+                    continue;
+                }
+                auto head =
+                    eval_table_expr(*stmt->expr, tables, lazy_tables, scalars, columns, models,
+                                    functions, compile_time_lists, extern_decls, registry, nullptr);
+                if (!head) {
+                    ibex::formatting::print("error: {}\n", head.error());
+                    continue;
+                }
+                print_table(head.value(), count);
+                continue;
+            }
             // A lazy binding shows its leading rows without decoding the rest.
             if (const auto lazy = lazy_tables.find(std::string(name)); lazy != lazy_tables.end()) {
                 auto head = detail::format_lazy_head(*lazy->second, count, command_exec());
@@ -7464,6 +7913,9 @@ auto ReplSession::environment() const -> std::vector<EnvironmentTable> {
     std::vector<EnvironmentTable> result;
     result.reserve(impl_->tables.size() + impl_->lazy_tables.size());
     for (const auto& [name, table] : impl_->tables) {
+        if (is_plan_alias(name)) {
+            continue;
+        }
         EnvironmentTable entry{.name = name, .columns = {}, .rows = table.rows()};
         entry.columns.reserve(table.columns.size());
         for (const auto& column : table.columns) {
@@ -7472,10 +7924,22 @@ auto ReplSession::environment() const -> std::vector<EnvironmentTable> {
         result.push_back(std::move(entry));
     }
     for (const auto& [name, table] : impl_->lazy_tables) {
+        if (is_plan_alias(name)) {
+            continue;
+        }
         EnvironmentTable entry{.name = name, .columns = {}, .rows = table->rows(), .lazy = true};
         entry.columns.reserve(table->schema().columns.size());
         for (const auto& column : table->schema().columns) {
             entry.columns.emplace_back(column.name, column_type_name(*column.column));
+        }
+        result.push_back(std::move(entry));
+    }
+    // A plan binding has run nothing, so its row count is not known (0).
+    for (const auto& [name, binding] : impl_->lazy_tables.plans) {
+        EnvironmentTable entry{.name = name, .columns = {}, .rows = 0, .lazy = true};
+        entry.columns.reserve(binding.schema.fields().size());
+        for (const auto& field : binding.schema.fields()) {
+            entry.columns.emplace_back(field.name, schema_field_type_name(field));
         }
         result.push_back(std::move(entry));
     }
@@ -7500,6 +7964,17 @@ auto ReplSession::table_binding(std::string_view name)
     }
     if (const auto it = impl_->lazy_tables.find(key); it != impl_->lazy_tables.end()) {
         return it->second->materialize(command_exec());
+    }
+    if (impl_->lazy_tables.plans.contains(key)) {
+        // Run it the way a statement reading the name would.
+        ExecuteOptions options;
+        options.render = false;
+        auto result = execute(key + ";", std::move(options));
+        if (!result.ok || !result.table.has_value()) {
+            return std::unexpected(result.ok ? "plan '" + key + "' produced no table"
+                                             : result.error);
+        }
+        return std::move(*result.table);
     }
     return std::unexpected("session has no table binding named '" + key + "'");
 }

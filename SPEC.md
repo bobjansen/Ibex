@@ -112,11 +112,20 @@ In interactive mode:
 - `:load <file>` loads and executes a script in the current REPL context.
 - A table expression statement is planned and streamed as a script is: a lazy
   source (`parquet::read(...)`) is read unit by unit with its filters and
-  column demand pushed down, never decoded whole first. A `let` of a bare
-  source binds it lazily and reads nothing; each statement that reads it reads
-  the columns and rows it needs again. `collect(...)` (Section 12.5.1)
-  materializes a value once, at the `let`, for statements that should not
-  re-read it.
+  column demand pushed down, never decoded whole first.
+- A `let` of a table expression binds its **plan** and runs nothing. It is
+  lowered and checked at the `let` (an unknown column is reported there, and
+  `:schema` answers without running it), and inlined into every statement that
+  reads the name, so `let t = h[filter ...]; t[select ...]` is planned and
+  streamed as one query. Each read runs it again; nothing is kept between
+  statements. The plan reads what its names meant at the `let`: rebinding a
+  table it reads, or a scalar it reads as `^name`, later does not change it.
+  Evaluated at the `let` instead, as a table: a value drawing on `rand_*` or
+  calling an extern or a user `fn` in a table position (the effect may be the
+  point), a model fit, one that reads a bound scalar or Series by its bare
+  name, and `collect(...)` (Section 12.5.1), which materializes a value once
+  for statements that should not re-run it. `:head t n` runs the plan with the
+  row limit on top.
 
 ---
 
@@ -4330,10 +4339,11 @@ collect(tf: TimeFrame<S>) -> TimeFrame<S>
 
 Evaluates its argument and holds the result as a materialized table. As a value
 it is its argument unchanged; what it changes is a `let`. A plain `let` of a
-table expression is a plan: in a script each reader of the name has it inlined
-(sharing it only when it is read more than once and costly to repeat), and a
-`let` of a bare lazy source (`let h = parquet::read(p);`) reads nothing until a
-statement reads `h`, then re-reads what that statement needs. `let t =
+table expression is a plan: each reader of the name has it inlined (in a
+script it is shared when it is read more than once and costly to repeat; in
+the REPL, which cannot see later statements, every read runs it, Section 1.5),
+and a `let` of a bare lazy source (`let h = parquet::read(p);`) reads nothing
+until a statement reads `h`, then re-reads what that statement needs. `let t =
 collect(e);` instead evaluates `e` once, where the `let` is, and every reader
 of `t` reads the held table.
 

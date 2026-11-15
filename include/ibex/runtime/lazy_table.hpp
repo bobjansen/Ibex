@@ -220,6 +220,11 @@ class LazyTable {
     [[nodiscard]] auto narrowed(const std::set<std::string>& names) const
         -> std::shared_ptr<LazyTable>;
     [[nodiscard]] auto rows() const noexcept -> std::size_t { return rows_; }
+
+    /// Forget every column decoded so far. The cache saves work while one
+    /// query runs (a key proof and the scan after it); a REPL session clears
+    /// it between statements, so it never holds memory nobody asked for.
+    void clear_cache() noexcept { cache_.clear(); }
     /// Per-column source metadata, for the planner. Read from the file's footer
     /// at bind time, so consulting it decodes nothing.
     [[nodiscard]] auto column_stats() const noexcept -> const SourceColumnStats& { return stats_; }

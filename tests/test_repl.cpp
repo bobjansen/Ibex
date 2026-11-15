@@ -1133,14 +1133,16 @@ result;
         // A typed scalar let is outside the batch planner's shape (it declines
         // a non-DataFrame annotation), so the same script runs through the
         // statement executor. An untyped `let x = 1;` no longer does: the
-        // batch planner takes those.
+        // batch planner takes those. A plain `let result = ...` there is a
+        // plan, run by each of the two statements that read it; `collect`
+        // runs it once, which is what this test counts.
         const char* src = R"(
 extern fn read_fake() -> DataFrame from "fake.hpp";
 extern fn capture(df: DataFrame) -> Int from "fake.hpp";
 
 let force_statement_path: Int64 = 1;
 let input = read_fake();
-let result = input[filter a > 1, select { n = count() }];
+let result = collect(input[filter a > 1, select { n = count() }]);
 capture(result);
 result;
 )";
@@ -1148,6 +1150,137 @@ result;
         REQUIRE(captured == std::vector<std::int64_t>{2});
         REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}});
     }
+}
+
+namespace {
+
+auto session_int(const ibex::repl::ExecutionResult& result, const char* column) -> std::int64_t {
+    REQUIRE(result.ok);
+    REQUIRE(result.table.has_value());
+    const auto* values =
+        std::get_if<ibex::Column<std::int64_t>>(result.table->find(column));  // NOLINT
+    REQUIRE(values != nullptr);
+    REQUIRE(values->size() == 1);
+    return (*values)[0];
+}
+
+auto has_table_binding(const ibex::repl::ReplSession& session, const std::string& name) -> bool {
+    return std::ranges::any_of(session.environment(),
+                               [&](const auto& entry) { return entry.name == name; });
+}
+
+auto environment_entry(const ibex::repl::ReplSession& session, const std::string& name)
+    -> ibex::repl::EnvironmentTable {
+    for (const auto& entry : session.environment()) {
+        if (entry.name == name) {
+            return entry;
+        }
+    }
+    FAIL("no table binding named " << name);
+    return {};
+}
+
+}  // namespace
+
+TEST_CASE("REPL let of a table expression binds a plan, run where it is read", "[repl][lazy]") {
+    ibex::runtime::ExternRegistry registry;
+    std::vector<std::vector<std::string>> decode_calls;
+    register_recording_lazy_source(registry, decode_calls);
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session
+                .execute("extern fn read_fake() -> DataFrame from \"fake.hpp\";\n"
+                         "let input = read_fake();")
+                .ok);
+    decode_calls.clear();
+
+    const auto bound = session.execute("let t = input[filter a > 1];");
+    CAPTURE(bound.error);
+    REQUIRE(bound.ok);
+    CHECK(decode_calls.empty());  // nothing ran at the `let`
+    const auto entry = environment_entry(session, "t");
+    CHECK(entry.lazy);
+    CHECK(entry.rows == 0);  // not known before it runs
+    REQUIRE(entry.columns.size() == 2);
+    CHECK(entry.columns[0] == std::pair<std::string, std::string>{"a", "Int64"});
+
+    CHECK(session_int(session.execute("t[select { n = count() }];"), "n") == 2);
+    CHECK_FALSE(decode_calls.empty());
+    // Every read runs it again: rows 2 and 3, b = 20 + 30.
+    decode_calls.clear();
+    CHECK(session_int(session.execute("t[select { s = sum(b) }];"), "s") == 50);
+    CHECK_FALSE(decode_calls.empty());
+
+    // A plan reading a plan inlines it.
+    REQUIRE(session.execute("let u = t[filter b > 20];").ok);
+    CHECK(session_int(session.execute("u[select { n = count() }];"), "n") == 1);
+
+    // The session API runs it on request, and erases it like any binding.
+    const auto table = session.table_binding("t");
+    REQUIRE(table.has_value());
+    CHECK(table->rows() == 2);
+    CHECK(session.erase("t"));
+    CHECK_FALSE(has_table_binding(session, "t"));
+    CHECK_FALSE(session.execute("t;").ok);
+}
+
+TEST_CASE("REPL plan binding reads what its names meant at the let", "[repl][lazy]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session
+                .execute("let src = Table { k = [1, 2, 3] };\n"
+                         "let cut = 1;\n"
+                         "let t = src[filter k > ^cut];")
+                .ok);
+    REQUIRE(environment_entry(session, "t").lazy);
+    // Rebinding the table and the scalar it read leaves the plan alone.
+    REQUIRE(session.execute("let src = Table { k = [9] };\nlet cut = 5;").ok);
+    CHECK(session_int(session.execute("t[select { n = count() }];"), "n") == 2);
+    // The tables it captured stay out of sight.
+    for (const auto& entry : session.environment()) {
+        CHECK_FALSE(entry.name.starts_with("__"));
+    }
+}
+
+TEST_CASE("REPL let stays eager for a bare scalar, randomness, or collect", "[repl][lazy]") {
+    // A bare name is resolved when a plan runs, so a plan reading a bound
+    // scalar by it would see a later rebinding; a draw from rand_uniform must
+    // not repeat per read; collect asks for the value now. All three bind a
+    // table at the `let`. `^cut` is bound as a literal, so that plan is lazy.
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    const auto setup = session.execute(
+        "let src = Table { k = [1, 2, 3] };\n"
+        "let cut = 1;\n"
+        "let bare = src[filter k > cut];\n"
+        "let drawn = src[update { u = rand_uniform(0.0, 1.0) }];\n"
+        "let kept = collect(src[filter k > 1]);\n"
+        "let caret = src[filter k > ^cut];");
+    CAPTURE(setup.error);
+    REQUIRE(setup.ok);
+    CHECK_FALSE(environment_entry(session, "bare").lazy);
+    CHECK_FALSE(environment_entry(session, "drawn").lazy);
+    CHECK_FALSE(environment_entry(session, "kept").lazy);
+    CHECK(environment_entry(session, "caret").lazy);
+    REQUIRE(session.execute("let cut = 2;").ok);
+    CHECK(session_int(session.execute("bare[select { n = count() }];"), "n") == 2);
+    CHECK(session_int(session.execute("caret[select { n = count() }];"), "n") == 2);
+}
+
+TEST_CASE("REPL forgets a lazy source's decoded columns between statements", "[repl][lazy]") {
+    // A source's column cache is for one statement; across statements it was
+    // memory nobody asked for. `collect` is how a session keeps a table.
+    ibex::runtime::ExternRegistry registry;
+    std::vector<std::vector<std::string>> decode_calls;
+    register_recording_lazy_source(registry, decode_calls);
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session
+                .execute("extern fn read_fake() -> DataFrame from \"fake.hpp\";\n"
+                         "let input = read_fake();")
+                .ok);
+    decode_calls.clear();
+    CHECK(session_int(session.execute("input[select { s = sum(a) }];"), "s") == 6);
+    CHECK(session_int(session.execute("input[select { s = sum(a) }];"), "s") == 6);
+    CHECK(decode_calls == std::vector<std::vector<std::string>>{{"a"}, {"a"}});
 }
 
 TEST_CASE("REPL statement path keeps an ascribed lazy source lazy", "[repl][lazy][ascribe]") {
@@ -1169,7 +1302,7 @@ extern fn capture(df: DataFrame) -> Int from "fake.hpp";
 
 let force_statement_path: Int64 = 1;
 let input = read_fake() as DataFrame<{ a: Int64, b: Int64 }>;
-let result = input[filter a > 1, select { n = count() }];
+let result = collect(input[filter a > 1, select { n = count() }]);
 capture(result);
 result;
 )";
@@ -1210,7 +1343,7 @@ extern fn capture(df: DataFrame) -> Int from "fake.hpp";
 
 let force_statement_path: Int64 = 1;
 let input: DataFrame<{ a: Int64 }> = read_fake();
-let result = input[filter a > 1, select { n = count() }];
+let result = collect(input[filter a > 1, select { n = count() }]);
 capture(result);
 result;
 )";
@@ -2534,7 +2667,12 @@ TEST_CASE("REPL narrows an in-memory table to the columns a plan reads, on both 
                 "() -> DataFrame from \"fake.hpp\";\n"
                 "extern fn capture(df: DataFrame) -> Int from \"fake.hpp\";\n"
                 "let x = " +
-                reader + "();\nlet result = " + query + ";\ncapture(result);\nresult;\n";
+                reader + "();\nlet result = " +
+                // A statement-path `let` is a plan, run by each statement
+                // that reads it; `collect` runs it once, as the count below
+                // expects.
+                (whole_script ? query : "collect(" + query + ")") +
+                ";\ncapture(result);\nresult;\n";
             captured = ibex::runtime::Table{};
             const auto before = ibex::runtime::narrowed_column_count();
             const auto planner = capture_planner_line(source, registry);

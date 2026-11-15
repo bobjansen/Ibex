@@ -2058,6 +2058,96 @@ TEST_CASE("Sorted Int64 pair keys group exactly, serial and parallel, against a 
     }
 }
 
+TEST_CASE("A one-sum Int64 pair group-by over one whole-table chunk takes the radix path",
+          "[physical][breaker][execute]") {
+    // One sum over unsorted, high-cardinality Int64 pairs (1.5M groups in
+    // 2.2M rows; a spread 1000 apart keeps the pair-dense path out). Handed
+    // over as ONE chunk, the async pair sum ran it as a single job and the
+    // owned path kept one big table per worker; both lost to the radix path,
+    // which now takes a first chunk of 2M rows or more. Streamed 300k-row
+    // chunks must still take the async path, whose owned finalize is the
+    // only FinalOrdering work a one-sum radix aggregate never does. Either
+    // way the groups, their first-occurrence order and every sum must match
+    // a hand-built reference.
+    constexpr std::int64_t kRows = 2'200'000;
+    runtime::Table t;
+    std::vector<std::pair<std::int64_t, std::int64_t>> order;
+    std::map<std::pair<std::int64_t, std::int64_t>, double> sums;
+    {
+        Column<std::int64_t> a;
+        Column<std::int64_t> b;
+        Column<double> v;
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            const std::int64_t ka = ((r * 7919) % 500'000) * 1000;
+            const std::int64_t kb = r % 3;
+            const double val = static_cast<double>(r % 101) * 0.25;
+            a.push_back(ka);
+            b.push_back(kb);
+            v.push_back(val);
+            auto [it, fresh] = sums.try_emplace({ka, kb}, 0.0);
+            if (fresh) {
+                order.emplace_back(ka, kb);
+            }
+            it->second += val;
+        }
+        t.add_column("a", std::move(a));
+        t.add_column("b", std::move(b));
+        t.add_column("v", std::move(v));
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+    auto ir = require_ir("t[select { s = sum(v) }, by { a, b }];");
+    const bool can_fan_out = std::min<std::size_t>(8, runtime::process_worker_pool().size()) >= 2;
+    // Runs on 1 and 8 threads; returns the 8-thread FinalOrdering pool tasks.
+    const auto check = [&] -> std::size_t {
+        std::size_t final_ordering_tasks = 0;
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            const auto profile = std::make_shared<runtime::ExecutionProfileState>(
+                /*worker_budget=*/threads, /*report=*/false);
+            exec.execution_profile = profile;
+            const auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == order.size());
+            const auto& oa = std::get<Column<std::int64_t>>(*out->find_entry("a")->column);
+            const auto& ob = std::get<Column<std::int64_t>>(*out->find_entry("b")->column);
+            const auto& os = std::get<Column<double>>(*out->find_entry("s")->column);
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                REQUIRE(oa[i] == order[i].first);
+                REQUIRE(ob[i] == order[i].second);
+                REQUIRE(os[i] == sums.at(order[i]));  // quarters: every sum is exact
+            }
+            if (threads == 8) {
+                for (const auto& row : profile->snapshot()) {
+                    if (row.label == "Aggregate.FinalOrdering") {
+                        final_ordering_tasks += row.pool_tasks;
+                    }
+                }
+            }
+        }
+        return final_ordering_tasks;
+    };
+    SECTION("one chunk goes to the radix path") {
+        CHECK(check() == 0);
+    }
+    SECTION("streamed chunks keep the async pair sum") {
+        const char* saved = std::getenv("IBEX_CHUNK_ROWS");
+        const std::optional<std::string> restore =
+            saved == nullptr ? std::nullopt : std::optional<std::string>(saved);
+        runtime::set_env("IBEX_CHUNK_ROWS", "300000");
+        const std::size_t tasks = check();
+        if (restore.has_value()) {
+            runtime::set_env("IBEX_CHUNK_ROWS", *restore);
+        } else {
+            runtime::unset_env("IBEX_CHUNK_ROWS");
+        }
+        if (can_fan_out) {
+            CHECK(tasks > 0);
+        }
+    }
+}
+
 TEST_CASE("Partitioned discovery over run heads matches serial on clustered keys",
           "[physical][breaker][execute]") {
     // Two aggregates keep the hot sum path out, so this one-chunk table goes

@@ -2477,6 +2477,18 @@ class HashAggregateState final {
     /// Rows per async hot job when one chunk is split (`try_async_hot_int_sum`):
     /// about one streamed row group, the chunk size the path was tuned on.
     static constexpr std::size_t kHotJobRows = std::size_t{1} << 20;
+    /// A FIRST pair-key chunk this large is a whole table handed over at once
+    /// (an in-memory table, a one-row-group file, the REPL statement path),
+    /// not a streamed row group. The async pair sum and the owned pair path
+    /// then lose to the radix path at every cardinality measured: lineitem
+    /// SF-10 in one chunk, one sum, 8 cores, 2k / 200k / 2M / 8M groups ran
+    /// async 736 / 1469 / 2494 / 3500 ms, owned 333 / 312 / 432 / 979 ms,
+    /// radix 294 / 311 / 342 / 796 ms. Their wins come from overlapping
+    /// many streamed chunks with decode and from fusing accumulation; one
+    /// chunk gives no overlap, the async path runs it as a single job, and
+    /// both keep one hash table per worker, too big for cache at high
+    /// cardinality, where radix keeps many small ones.
+    static constexpr std::size_t kPairOwnedMaxFirstChunkRows = 2 * kHotJobRows;
 
     struct OwnedHotRecord {
         std::int64_t key = 0;
@@ -2854,7 +2866,7 @@ class HashAggregateState final {
                 (plan_[0].kind != ExprType::Double && plan_[0].kind != ExprType::Int) ||
                 pair_packs_u64_ || scratch_stride_ != 0 || exec_ == nullptr ||
                 on_worker_pool_thread() || std::max(rows_offered_, rows) < kPairOwnedMinRows ||
-                group_entries.size() != 2 ||
+                rows >= kPairOwnedMaxFirstChunkRows || group_entries.size() != 2 ||
                 !std::holds_alternative<Column<std::int64_t>>(*group_entries[0]->column) ||
                 !std::holds_alternative<Column<std::int64_t>>(*group_entries[1]->column) ||
                 par_.discovery.decline != physical::FanOutDecline::None ||
@@ -3918,7 +3930,9 @@ class HashAggregateState final {
             return std::nullopt;
         }
 
-        if (!pair_dense_active_ &&
+        // A whole table in one first chunk goes to the radix path below
+        // (`kPairOwnedMaxFirstChunkRows`); later chunks follow the first.
+        if (!pair_dense_active_ && (owned_mode_ || rows < kPairOwnedMaxFirstChunkRows) &&
             try_owned<PairIntKey, PairIntKeyHash>(
                 [&](std::size_t row) { return pack(key_a_at(row), key_b_at(row)); }, rows, gids,
                 agg_entries, owned_pair_partitions_, kPairOwnedMinRows)) {

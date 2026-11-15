@@ -2538,6 +2538,35 @@ class HashAggregateState final {
         std::uint32_t record = std::numeric_limits<std::uint32_t>::max();
     };
 
+    /// Whether a key, by its hash, is in the sample that sizes a group table:
+    /// about one key in 512. Every row of a sampled key is sampled, so over a
+    /// set of rows the distinct sampled hashes per sampled row estimate the
+    /// share of rows that start a group (`estimate_groups`), wherever the
+    /// repeats fall -- a set's first rows cannot tell that, since a key that
+    /// repeats only far apart looks new in all of them. The hash is mixed
+    /// first (one multiply), so a hash whose top bits carry little (an
+    /// identity int hash) does not sample everything.
+    [[nodiscard]] static auto group_sampled(std::uint64_t hash) noexcept -> bool {
+        constexpr unsigned kGroupSampleShift = 55;
+        return ((hash * 0x9e3779b97f4a7c15ULL) >> kGroupSampleShift) == 0;
+    }
+
+    /// The groups among `rows` rows, from the hashes `group_sampled` kept of
+    /// them (sorted in place): distinct over sampled, times `rows`, an eighth
+    /// over for the estimate's noise. Unbounded when fewer than 32 were kept.
+    [[nodiscard]] static auto estimate_groups(std::vector<std::uint64_t>& sampled, std::size_t rows)
+        -> std::size_t {
+        constexpr std::size_t kMinGroupSamples = 32;
+        if (sampled.size() < kMinGroupSamples) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+        std::ranges::sort(sampled);
+        const auto distinct =
+            static_cast<std::size_t>(std::ranges::unique(sampled).begin() - sampled.begin());
+        const std::size_t estimate = rows * distinct / sampled.size();
+        return estimate + (estimate / 8);
+    }
+
     [[nodiscard]] static auto owned_hot_hash(std::int64_t key) noexcept -> std::uint64_t {
         // robin_hood's Int64 hash preserves too much of a sequential key's bit
         // pattern for a high-bit fixed table. SplitMix's finalizer gives both
@@ -2817,6 +2846,9 @@ class HashAggregateState final {
         std::size_t rows = 0;
         std::size_t part_count = 0;
         std::vector<std::vector<OwnedPairRecord>> records_by_partition;
+        /// Per partition, the hashes of the records of sampled keys
+        /// (`group_sampled`), which size the final tables.
+        std::vector<std::vector<std::uint64_t>> sampled_by_partition;
         std::optional<std::string> error;
     };
 
@@ -2840,6 +2872,7 @@ class HashAggregateState final {
             const std::size_t mask = job.part_count - 1;
 
             job.records_by_partition.resize(job.part_count);
+            job.sampled_by_partition.resize(job.part_count);
             // The first pass is deliberately only a count.  It lets each
             // vector make one allocation, while the following source-order
             // append preserves per-partition first-occurrence order.
@@ -2861,7 +2894,11 @@ class HashAggregateState final {
                     hot_sum_value<ValueT>(record.slot) = values[row];
                     record.slot.mark_present();
                 }
-                job.records_by_partition[hasher(record.key) & mask].push_back(record);
+                const auto hash = static_cast<std::uint64_t>(hasher(record.key));
+                job.records_by_partition[hash & mask].push_back(record);
+                if (group_sampled(hash)) [[unlikely]] {
+                    job.sampled_by_partition[hash & mask].push_back(hash);
+                }
             }
             job.first_column.reset();
             job.second_column.reset();
@@ -3502,9 +3539,9 @@ class HashAggregateState final {
     }
 
     /// Build q20's final PairInt maps after every streamed chunk has supplied
-    /// its compact records.  The exact record count is an upper bound on the
-    /// distinct keys in one partition, so this is the cardinality-sizing
-    /// experiment without an extra sketch pass or a calling-thread reserve.
+    /// its compact records. Each partition's index is reserved for its groups
+    /// as the jobs' key sample estimates them, capped at its record count (an
+    /// upper bound), with no extra sketch pass or calling-thread reserve.
     void finalize_owned_async_pair() {
         if (owned_finalized_) {
             return;
@@ -3535,10 +3572,17 @@ class HashAggregateState final {
                     auto& partition = owned_pair_partitions_[p];
                     const bool sum_is_int = plan_[0].kind == ExprType::Int;
                     std::size_t records = 0;
+                    std::vector<std::uint64_t> sampled;
                     for (const auto& job : owned_async_pair_jobs_) {
                         records += job->records_by_partition[p].size();
+                        sampled.insert(sampled.end(), job->sampled_by_partition[p].begin(),
+                                       job->sampled_by_partition[p].end());
                     }
-                    partition.index.reserve(records);
+                    // Records bound the groups from above, and are ~7.5x
+                    // them for lineitem's {l_partkey, l_suppkey}: reserving
+                    // that put a 60M-row stream's final build at 1.5 s
+                    // against 1.1 s with no reserve. The key sample caps it.
+                    partition.index.reserve(std::min(records, estimate_groups(sampled, records)));
                     partition.keys.reserve(records);
                     partition.first_rows.reserve(records);
                     partition.slots.reserve(records);
@@ -5008,19 +5052,9 @@ class HashAggregateState final {
         // keys every row is a head and nothing changes. A row that is not a
         // head has no partition written in `part_of_row_`: nothing reads it.
         constexpr bool kRunHeads = kKeepKeys && std::equality_comparable<Probe>;
-        // Hashes of the rows of a sample of KEYS, about one key in
-        // 2^(64 - kGroupSampleShift), kept per range: every row of a sampled
-        // key is kept, so in each partition distinct sampled hashes over
-        // sampled rows estimates the share of rows that start a group. Pass 3
-        // caps its table reserve by it. A partition's first rows cannot tell
-        // that: a key that repeats only far apart looks new in all of them.
-        // The test mixes the hash first (one multiply) so a hash whose top
-        // bits carry little (an identity int hash) does not sample everything.
-        constexpr unsigned kGroupSampleShift = 55;  // 1 key in 512
+        // The hashes of the rows of sampled keys (`group_sampled`), per range;
+        // pass 3 caps its table reserve by the estimate they give.
         std::vector<std::vector<std::uint64_t>> group_samples(ranges);
-        const auto sampled_key = [](std::uint64_t hash) {
-            return ((hash * 0x9e3779b97f4a7c15ULL) >> kGroupSampleShift) == 0;
-        };
         const auto is_head = [&](std::size_t row, std::size_t range_begin) {
             if constexpr (kRunHeads) {
                 return row == range_begin || !(row_keys[row] == row_keys[row - 1]);
@@ -5049,7 +5083,7 @@ class HashAggregateState final {
                     const auto part = static_cast<std::uint8_t>(hash & part_mask);
                     part_of_row_[row] = part;
                     ++row_counts[part];
-                    if (sampled_key(hash)) [[unlikely]] {
+                    if (group_sampled(hash)) [[unlikely]] {
                         samples.push_back(hash);
                     }
                 }
@@ -5116,14 +5150,10 @@ class HashAggregateState final {
         // cannot be handed out in first-occurrence order until every partition
         // has been seen. `gids[row]` therefore holds a local id until pass 4.
         const std::uint64_t row_base = rows_seen_;
-        // Each partition's group estimate from pass 1's key sample: distinct
-        // sampled hashes over sampled rows, times its rows, an eighth over for
-        // the estimate's noise. Unbounded where too few keys were sampled. A
-        // few hundred hashes per million rows, so this stays on the calling
+        // Each partition's group estimate from pass 1's key sample. A few
+        // hundred hashes per million rows, so this stays on the calling
         // thread.
-        constexpr std::size_t kMinGroupSamples = 32;
-        std::vector<std::size_t> group_estimate(part_count,
-                                                std::numeric_limits<std::size_t>::max());
+        std::vector<std::size_t> group_estimate(part_count);
         {
             std::vector<std::vector<std::uint64_t>> by_part(part_count);
             for (const auto& samples : group_samples) {
@@ -5132,16 +5162,7 @@ class HashAggregateState final {
                 }
             }
             for (std::size_t p = 0; p < part_count; ++p) {
-                auto& sampled = by_part[p];
-                if (sampled.size() < kMinGroupSamples) {
-                    continue;
-                }
-                std::ranges::sort(sampled);
-                const auto distinct = static_cast<std::size_t>(
-                    std::ranges::unique(sampled).begin() - sampled.begin());
-                const std::size_t estimate =
-                    (part_begin[p + 1] - part_begin[p]) * distinct / sampled.size();
-                group_estimate[p] = estimate + (estimate / 8);
+                group_estimate[p] = estimate_groups(by_part[p], part_begin[p + 1] - part_begin[p]);
             }
         }
         {

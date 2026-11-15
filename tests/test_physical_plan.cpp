@@ -2021,7 +2021,7 @@ TEST_CASE("Sorted Int64 pair keys group exactly, serial and parallel, against a 
         t.add_column("v", std::move(v));
         runtime::TableRegistry registry;
         registry.emplace("t", t);
-        auto ir = require_ir("t[select { s = sum(v), c = count() }, by { a, b }];");
+        const auto ir = require_ir("t[select { s = sum(v), c = count() }, by { a, b }];");
         for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
             runtime::ExecutionContext exec;
             exec.parallel_threads = threads;
@@ -2171,7 +2171,7 @@ TEST_CASE("Partitioned discovery over run heads matches serial on clustered keys
         t.add_column("v", std::move(v));
         registry.emplace("t", t);
     }
-    auto ir = require_ir("t[select { s = sum(v), c = count() }, by k];");
+    const auto ir = require_ir("t[select { s = sum(v), c = count() }, by k];");
     runtime::ExecutionContext serial;
     serial.parallel_threads = 1;
     runtime::ParallelPipelineStats stats;

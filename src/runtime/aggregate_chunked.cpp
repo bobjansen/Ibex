@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -9361,7 +9362,7 @@ class HashAggregateState final {
     /// As `int_index_deferred_`, for the pair path: while every new pair has
     /// been above all pairs seen, `pair_index_` stays empty.
     bool pair_index_deferred_ = true;
-    std::pair<std::int64_t, std::int64_t> pair_max_key_{};
+    std::pair<std::int64_t, std::int64_t> pair_max_key_;
     /// Groups the serial pair loop (or the sorted numbering) has numbered.
     std::size_t pair_serial_groups_ = 0;
     /// Same default-init-allocator invariant as `int_order_` above.

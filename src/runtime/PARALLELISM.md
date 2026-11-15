@@ -188,9 +188,10 @@ private gate. Summarized by parallel axis:
 | Operator                                      | Axis                                                               | Determinism device                                                                                         |
 | --------------------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
 | Fused bounds scan                             | row ranges, block-aligned to 4096                                  | per-range survivor lists concatenated in range order                                                       |
-| Group discovery (`try_discover_partitioned`)  | radix/hash partitioning by key hash                                | partition-local ids, then a serial first-occurrence merge assigns global ids in row order                  |
+| Group discovery (`try_discover_partitioned`)  | radix/hash partitioning by key hash                                | partition-local ids; each row range then numbers the groups whose first row it holds (count, prefix, number), so global ids follow row order |
+| Sorted group discovery (`try_discover_sorted`, Int64 / Int64 pair) | contiguous row ranges, each checked for order; no hashing | per-range run counts joined at range boundaries, a prefix gives each range its first id                     |
 | Grouped / ungrouped aggregation               | partial pre-aggregation into per-morsel private slots, then merge  | morsel count derived from **rows**, merged in ascending morsel order → machine-independent float reduction |
-| Owned aggregation (single-Int64 / PairIntKey) | partition-owned key maps + slots                                   | merge-path co-ranking on globally-unique `first_rows` (parallel finalize)                                  |
+| Owned aggregation (single-Int64 / PairIntKey) | partition-owned key maps + slots; a PairIntKey first chunk of 2M+ rows takes the radix path instead (I15) | merge-path co-ranking on globally-unique `first_rows` (parallel finalize)                                  |
 | Hash join build                               | head table partitioned by key hash, one worker per partition       | partitions are disjoint; no merge                                                                          |
 | Hash join probe                               | probe rows against the built, read-only index                      | per-worker `(li, ri)` pairs concatenated in range order                                                    |
 | Semi/anti join                                | dense right build; probe rows against the frozen set               | keep-bit words per row range                                                                               |
@@ -406,6 +407,20 @@ bugs: each new operator copies whichever neighbour it was written next to.
   morsel count from row count (for float reproducibility, no longer a
   guarantee). Reusing `morsel_grain` inside a reduction would make float
   results vary with thread count, now tolerated but avoidable.
+- **I15** — one-chunk inputs. The REPL statement path (`let r = t[...]`)
+  decodes a lazy source whole, and an in-memory table or a one-row-group file
+  arrives the same way: the aggregate sees ONE chunk, where a script streams
+  one per row group. Paths tuned on streamed chunks then lose their
+  parallelism or their cache fit: the async hot Int64 sum ran one job per
+  chunk (now cut into `kHotJobRows` jobs, `ca3fa3ea`); the async and owned
+  PairIntKey paths ran it as one job or kept per-worker tables far beyond
+  cache (a first chunk of `kPairOwnedMaxFirstChunkRows` = 2M rows now goes to
+  the radix path, `82b10685`); radix discovery's table reserve, extrapolated
+  from a partition's first rows, over-sized tables ~7.5x when keys repeat far
+  apart (now capped by a key sample, `9f6fe94e`). The rule: measure a fan-out
+  on one whole-table chunk AND on streamed chunks, and compare 8 cores (and
+  2) against 1 for work multiplication. The statement path itself still never
+  streams.
 
 **Not inconsistencies** (recorded so they are not "fixed"):
 

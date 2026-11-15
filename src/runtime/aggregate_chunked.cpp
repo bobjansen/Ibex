@@ -2488,7 +2488,8 @@ class HashAggregateState final {
     /// many streamed chunks with decode and from fusing accumulation; one
     /// chunk gives no overlap, the async path runs it as a single job, and
     /// both keep one hash table per worker, too big for cache at high
-    /// cardinality, where radix keeps many small ones.
+    /// cardinality, where radix keeps many small ones. src/runtime/PARALLELISM.md
+    /// I15 collects the other one-chunk cases.
     static constexpr std::size_t kPairOwnedMaxFirstChunkRows = 2 * kHotJobRows;
 
     struct OwnedHotRecord {

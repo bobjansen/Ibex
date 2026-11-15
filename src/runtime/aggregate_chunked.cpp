@@ -43,6 +43,11 @@
 #include <variant>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/mman.h>  // mmap/mremap: SlotArray
+#include <unistd.h>    // sysconf
+#endif
+
 #include "aggregate_prefilter.hpp"
 #include "physical_plan.hpp"
 
@@ -159,76 +164,104 @@ auto chunked_agg_tracks_validity(ir::AggFunc func) -> bool {
     }
 }
 
-/// Per-group slot array that grows through `realloc` and not by copying.
+/// Per-group array that grows without copying what it already holds.
 ///
-/// A group-by grows its slots once per chunk. `std::vector` copies the whole
-/// array on every reallocation, while `realloc` on an mmap-sized block extends
-/// it in place with `mremap` and moves no bytes. On q18 (3M groups, 6 chunks)
-/// those copies were 49ms of `size_group_arrays`' 79ms.
+/// A group-by grows its per-group arrays (slots, group keys) once per chunk.
+/// `std::vector` copies the whole array on every reallocation. `realloc` would
+/// extend an mmap-sized block in place with `mremap`, but the runtime tells
+/// glibc to serve large blocks from the heap (`M_MMAP_MAX` = 0, see
+/// `interpreter.cpp`), where `realloc` copies too. So on Linux a block of
+/// `kMapBytes` or more lives in a mapping of its own and grows with
+/// `mremap(MREMAP_MAYMOVE)`, which moves page tables, not bytes; elsewhere it
+/// stays on `realloc`. Streamed lineitem grouped by its 60M-pair primary key
+/// spent ~70% of the consumer thread copying these arrays (q18, 3M groups,
+/// once lost 49ms of `size_group_arrays`' 79ms the same way).
 ///
-/// Indexed by group id; the whole interface is `grow_uninitialized`,
-/// `fill_default`, `data` and `[]`.
-// realloc/free are the point of this class, which is its own RAII wrapper.
+/// Indexed by group id: `grow_uninitialized`, `fill_default`, `resize` (new
+/// elements uninitialized, as `default_init_allocator` leaves them),
+/// `push_back`/`emplace_back`, `data`, `[]`, `size`, `begin`/`end`. Elements
+/// are moved by their bytes, so they must be trivially copy-constructible and
+/// trivially destructible (an `AggSlotCore`, an Int64, a pair of them).
+// realloc/free and mmap/munmap are the point of this class, its own RAII wrapper.
 // NOLINTBEGIN(cppcoreguidelines-no-malloc)
 template <typename T>
 class SlotArray {
    public:
-    static_assert(std::is_trivially_copyable_v<T>);
+    static_assert(std::is_trivially_copy_constructible_v<T>);
     static_assert(std::is_trivially_destructible_v<T>);
 
     SlotArray() = default;
     SlotArray(const SlotArray&) = delete;
     auto operator=(const SlotArray&) -> SlotArray& = delete;
     SlotArray(SlotArray&& other) noexcept
-        : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+        : data_(other.data_),
+          size_(other.size_),
+          capacity_(other.capacity_),
+          mapped_(other.mapped_) {
         other.data_ = nullptr;
         other.size_ = 0;
         other.capacity_ = 0;
+        other.mapped_ = false;
     }
     auto operator=(SlotArray&& other) noexcept -> SlotArray& {
         if (this != &other) {
-            std::free(data_);
+            release();
             data_ = other.data_;
             size_ = other.size_;
             capacity_ = other.capacity_;
+            mapped_ = other.mapped_;
             other.data_ = nullptr;
             other.size_ = 0;
             other.capacity_ = 0;
+            other.mapped_ = false;
         }
         return *this;
     }
-    ~SlotArray() { std::free(data_); }
+    ~SlotArray() { release(); }
 
     [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
+    [[nodiscard]] auto empty() const noexcept -> bool { return size_ == 0; }
     [[nodiscard]] auto data() noexcept -> T* { return data_; }
     [[nodiscard]] auto data() const noexcept -> const T* { return data_; }
+    [[nodiscard]] auto begin() noexcept -> T* { return data_; }
+    [[nodiscard]] auto end() noexcept -> T* { return data_ + size_; }
+    [[nodiscard]] auto begin() const noexcept -> const T* { return data_; }
+    [[nodiscard]] auto end() const noexcept -> const T* { return data_ + size_; }
     auto operator[](std::size_t i) noexcept -> T& { return data_[i]; }
     auto operator[](std::size_t i) const noexcept -> const T& { return data_[i]; }
 
     /// Set the size to `n` and return the new tail UNINITIALIZED for the caller
     /// to fill. Shrinking only moves the size; the allocation is kept.
     ///
-    /// The fill is left to the caller because on fresh `mremap` pages its cost
-    /// is first-touch page faults, which parallelize (`fill_slots_parallel`).
+    /// The fill is left to the caller because on fresh pages its cost is
+    /// first-touch page faults, which parallelize (`fill_slots_parallel`).
     [[nodiscard]] auto grow_uninitialized(std::size_t n) -> std::span<T> {
         if (n <= size_) {
             size_ = n;
             return {};
         }
         if (n > capacity_) {
-            // Geometric, so a per-chunk resize does not call realloc once per
+            // Geometric, so a per-chunk resize does not reallocate once per
             // chunk on a stream of many small chunks.
-            const std::size_t want = std::max(n, capacity_ + (capacity_ / 2));
-            auto* grown = static_cast<T*>(std::realloc(data_, want * sizeof(T)));
-            if (grown == nullptr) {
-                throw std::bad_alloc();
-            }
-            data_ = grown;
-            capacity_ = want;
+            reallocate(std::max(n, capacity_ + (capacity_ / 2)));
         }
         const std::size_t old = size_;
         size_ = n;
         return {data_ + old, n - old};
+    }
+
+    /// `grow_uninitialized`, discarding the tail: what `default_init_allocator`
+    /// does for a trivially constructible element.
+    void resize(std::size_t n) { (void)grow_uninitialized(n); }
+
+    void push_back(const T& value) {
+        const T copy = value;  // `value` may live in this array
+        *grow_uninitialized(size_ + 1).data() = copy;
+    }
+
+    template <typename... Args>
+    void emplace_back(Args&&... args) {
+        push_back(T(std::forward<Args>(args)...));
     }
 
     /// Value-initialize `tail`: one `memset` when `T{}` is all zero bytes (as
@@ -252,14 +285,77 @@ class SlotArray {
             return;
         }
         for (auto& slot : tail) {
-            std::memcpy(&slot, &prototype, sizeof(T));
+            std::memcpy(static_cast<void*>(&slot), &prototype, sizeof(T));
         }
     }
 
    private:
+#ifdef __linux__
+    /// Blocks this large get a mapping of their own (see the class comment).
+    static constexpr std::size_t kMapBytes = std::size_t{64} << 20U;
+#endif
+
+    void reallocate(std::size_t want) {
+        const std::size_t bytes = want * sizeof(T);
+#ifdef __linux__
+        if (mapped_ || bytes >= kMapBytes) {
+            const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+            const std::size_t mapped_bytes = (bytes + page - 1) / page * page;
+            void* grown = nullptr;
+            if (mapped_) {
+                grown = ::mremap(data_, mapped_capacity_bytes(), mapped_bytes, MREMAP_MAYMOVE);
+            } else {
+                grown = ::mmap(nullptr, mapped_bytes, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            }
+            if (grown == MAP_FAILED) {
+                throw std::bad_alloc();
+            }
+            // The heap this leaves was tuned for transparent huge pages; ask
+            // for them here too. Advice only: failure changes nothing.
+            (void)::madvise(grown, mapped_bytes, MADV_HUGEPAGE);
+            if (!mapped_) {
+                if (size_ != 0) {
+                    std::memcpy(grown, static_cast<const void*>(data_), size_ * sizeof(T));
+                }
+                std::free(data_);
+                mapped_ = true;
+            }
+            data_ = static_cast<T*>(grown);
+            capacity_ = mapped_bytes / sizeof(T);
+            return;
+        }
+#endif
+        auto* grown = static_cast<T*>(std::realloc(static_cast<void*>(data_), bytes));
+        if (grown == nullptr) {
+            throw std::bad_alloc();
+        }
+        data_ = grown;
+        capacity_ = want;
+    }
+
+#ifdef __linux__
+    [[nodiscard]] auto mapped_capacity_bytes() const noexcept -> std::size_t {
+        return capacity_ * sizeof(T);
+    }
+#endif
+
+    void release() noexcept {
+#ifdef __linux__
+        if (mapped_) {
+            ::munmap(data_, mapped_capacity_bytes());
+            data_ = nullptr;
+            return;
+        }
+#endif
+        std::free(static_cast<void*>(data_));
+        data_ = nullptr;
+    }
+
     T* data_ = nullptr;
     std::size_t size_ = 0;
     std::size_t capacity_ = 0;
+    bool mapped_ = false;
 };
 // NOLINTEND(cppcoreguidelines-no-malloc)
 
@@ -9498,10 +9594,10 @@ class HashAggregateState final {
     /// Groups the serial loop has numbered; any other group means another
     /// path ran, and the deferral is given up before probing.
     std::size_t int_serial_groups_ = 0;
-    /// Group keys, as raw integers, in first-seen order. Default-init
-    /// allocator: `resize()`'s new elements are always fully overwritten by
-    /// the caller before being read (see the class docstring above).
-    std::vector<std::int64_t, default_init_allocator<std::int64_t>> int_order_;
+    /// Group keys, as raw integers, in first-seen order. `resize()` leaves
+    /// new elements uninitialized: the caller always overwrites them before
+    /// they are read (see the class docstring above).
+    SlotArray<std::int64_t> int_order_;
 
     // Two fixed-width-integer keys are packed into a two-word composite key
     // and grouped exactly as one integer key: `(l_partkey, l_suppkey)` on
@@ -9525,10 +9621,8 @@ class HashAggregateState final {
     std::pair<std::int64_t, std::int64_t> pair_max_key_;
     /// Groups the serial pair loop (or the sorted numbering) has numbered.
     std::size_t pair_serial_groups_ = 0;
-    /// Same default-init-allocator invariant as `int_order_` above.
-    std::vector<std::pair<std::int64_t, std::int64_t>,
-                default_init_allocator<std::pair<std::int64_t, std::int64_t>>>
-        pair_order_;
+    /// Same uninitialized-growth invariant as `int_order_` above.
+    SlotArray<std::pair<std::int64_t, std::int64_t>> pair_order_;
     /// Parallel group discovery (see `try_discover_partitioned`). `rows_seen_`
     /// makes a group's first-row index global across chunks, which is what the
     /// first-occurrence numbering is merged on.

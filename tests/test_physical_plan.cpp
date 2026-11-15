@@ -2125,6 +2125,61 @@ TEST_CASE("Streamed sorted keys accumulate across workers, bit-identical to one 
     }
 }
 
+TEST_CASE("Group arrays grown past their own mapping keep every group exact",
+          "[physical][breaker][execute]") {
+    // 5M distinct Int64 pairs, streamed in 1M-row chunks: the group keys (80 MB)
+    // and the two aggregate slots per group grow chunk by chunk past the size
+    // at which they move into a mapping of their own and then grow by
+    // `mremap`. Every group must come out with its own key, count and sum, in
+    // first-occurrence order.
+    constexpr std::int64_t kRows = 5'000'000;
+    runtime::Table t;
+    {
+        Column<std::int64_t> a;
+        Column<std::int64_t> b;
+        Column<std::int64_t> v;
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            a.push_back((r / 4) * 3);
+            b.push_back(r % 4);
+            v.push_back(r);
+        }
+        t.add_column("a", std::move(a));
+        t.add_column("b", std::move(b));
+        t.add_column("v", std::move(v));
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+    const auto ir = require_ir("t[select { s = sum(v), c = count() }, by { a, b }];");
+    const char* saved = std::getenv("IBEX_CHUNK_ROWS");
+    const std::optional<std::string> restore =
+        saved == nullptr ? std::nullopt : std::optional<std::string>(saved);
+    runtime::set_env("IBEX_CHUNK_ROWS", "1000000");
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+        CAPTURE(threads);
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = threads;
+        const auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        REQUIRE(out->rows() == static_cast<std::size_t>(kRows));
+        const auto& oa = std::get<Column<std::int64_t>>(*out->find_entry("a")->column);
+        const auto& ob = std::get<Column<std::int64_t>>(*out->find_entry("b")->column);
+        const auto& os = std::get<Column<std::int64_t>>(*out->find_entry("s")->column);
+        const auto& oc = std::get<Column<std::int64_t>>(*out->find_entry("c")->column);
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            const auto i = static_cast<std::size_t>(r);
+            if (oa[i] != (r / 4) * 3 || ob[i] != r % 4 || os[i] != r || oc[i] != 1) {
+                FAIL("group " << r << ": a=" << oa[i] << " b=" << ob[i] << " s=" << os[i]
+                              << " c=" << oc[i]);
+            }
+        }
+    }
+    if (restore.has_value()) {
+        runtime::set_env("IBEX_CHUNK_ROWS", *restore);
+    } else {
+        runtime::unset_env("IBEX_CHUNK_ROWS");
+    }
+}
+
 TEST_CASE("A one-sum Int64 pair group-by over one whole-table chunk takes the radix path",
           "[physical][breaker][execute]") {
     // One sum over unsorted, high-cardinality Int64 pairs (1.5M groups in

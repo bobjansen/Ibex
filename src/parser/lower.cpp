@@ -655,6 +655,13 @@ auto contains_expensive_node(const ir::Node& node) -> bool {
     });
 }
 
+/// Whether `expr` is a `collect(...)` call: the user asked for the binding to
+/// be materialized once, however cheap or rarely read.
+auto is_collect_call(const Expr& expr) -> bool {
+    const auto* call = std::get_if<CallExpr>(&expr.node);
+    return call != nullptr && call->callee == "collect" && call->args.size() == 1;
+}
+
 /// Look through redundant parentheses.
 auto unwrap_group(const Expr& expr) -> const Expr& {
     const Expr* current = &expr;
@@ -2312,7 +2319,8 @@ class Lowerer {
                                                                  .position = position});
                     } else if (share_repeated_bindings_ && !let_stmt.is_mut &&
                                let_counts_[let_stmt.name] == 1 &&
-                               ((table_ref_counts_[let_stmt.name] >= 2 &&
+                               (is_collect_call(*let_stmt.value) ||
+                                (table_ref_counts_[let_stmt.name] >= 2 &&
                                  contains_expensive_node(*value.value())) ||
                                 must_run_before_sinks(*value.value(), position, let_stmt.name))) {
                         // Referenced from several places and expensive to
@@ -2812,6 +2820,16 @@ class Lowerer {
     }
 
     auto lower_table_call(const CallExpr& call) -> LowerResult {
+        if (call.callee == "collect") {
+            // Materialize at will. As a value it is its argument; what it
+            // changes is a `let`: `let t = collect(e)` is materialized once,
+            // where it is, however many statements read `t` (see the `let`
+            // lowering), where a plain `let` is inlined into each reader.
+            if (call.args.size() != 1 || !call.named_args.empty()) {
+                return std::unexpected(LowerError{.message = "collect expects exactly 1 argument"});
+            }
+            return lower_expr(*call.args[0]);
+        }
         if (call.callee == "matmul") {
             if (call.args.size() != 2) {
                 return std::unexpected(LowerError{.message = "matmul expects exactly 2 arguments"});

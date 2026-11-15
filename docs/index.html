@@ -187,6 +187,12 @@
       recovered explicitly with <code>coalesce</code>.
     </p>
     <p class="section-sub">
+      Sources are lazy: <code>let h = parquet::read(path)</code> reads nothing,
+      and each query streams just the columns and rows it needs.
+      <code>collect(h[select { a, b }])</code> materializes a table once when
+      several queries should share it.
+    </p>
+    <p class="section-sub">
       Library functions live in namespaces: <code>import "csv"</code> then
       <code>csv::read(path)</code>, or <code>using csv;</code> and
       <code>read(path)</code>. Scripts declare their own with

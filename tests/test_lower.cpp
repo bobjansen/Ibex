@@ -649,6 +649,28 @@ result;
     CHECK(scans == 2);
 }
 
+TEST_CASE("lower_script materializes a collected binding once, however cheap", "[parser][lower]") {
+    // A filter over a scan, read once: a plain `let` of it is inlined into its
+    // reader, so the reader keeps its own selection and column pushdown.
+    // `collect(...)` asks for it to be materialized where it is instead.
+    const auto program = require_parse(R"(
+let cheap = t[filter a > 1];
+let kept = collect(t[filter a > 2]);
+cheap[select { a }];
+kept[select { a }];
+)");
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->shared_bindings.size() == 1);
+    CHECK(lowered->shared_bindings[0].name == "kept");
+    // The collected plan is its argument; `collect` itself leaves no node.
+    REQUIRE(lowered->shared_bindings[0].plan != nullptr);
+    CHECK(lowered->shared_bindings[0].plan->kind() == ir::NodeKind::Filter);
+    std::size_t scans = 0;
+    count_scans_of(*lowered->result, "kept", scans);
+    CHECK(scans == 1);
+}
+
 TEST_CASE("lower_script optimizes a shared binding's plan like the result's", "[parser][lower]") {
     // A binding used twice is planned once, as a shared binding -- which is
     // what every PDS-H script's `csv::write(result, ...); result;` makes of the

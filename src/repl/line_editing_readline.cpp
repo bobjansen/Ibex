@@ -70,6 +70,7 @@ constexpr auto kCompletionBuiltins = std::to_array<std::string_view>({
     "as_timeframe",
     "ceil",
     "coef",
+    "collect",
     "columns",
     "count",
     "cumprod",

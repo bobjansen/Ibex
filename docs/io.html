@@ -457,12 +457,20 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           indices. Reusing the same binding in multiple scan positions safely
           falls back to ordinary column projection.
         </p>
+        <p>
+          A <code>let</code> of a reader is lazy: it reads nothing, and every
+          query on the binding streams the file again, row group by row group,
+          decoding only what that query needs. To read once and keep the result
+          in memory, wrap it in <code>collect</code>, with a <code>select</code>
+          to keep only the columns you will use.
+        </p>
 <pre><code><span class="kw">import</span> <span class="str">"parquet"</span>;
 
 <span class="kw">let</span> prices = <span class="fn-name">parquet::read</span>(<span class="str">"data/prices.parquet"</span>);
 <span class="kw">let</span> liquid = prices[<span class="kw">filter</span> size &gt; 1000, <span class="kw">select</span> { ts, symbol, price }];
 <span class="kw">let</span> public_prices = <span class="fn-name">parquet::read</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
-<span class="kw">let</span> cloud = <span class="fn-name">parquet::read</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);</code></pre>
+<span class="kw">let</span> cloud = <span class="fn-name">parquet::read</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);
+<span class="kw">let</span> held = <span class="fn-name">collect</span>(prices[<span class="kw">select</span> { ts, symbol, price }]);</code></pre>
       </article>
       <article class="card" style="margin-top:1rem;">
         <h3>Write Parquet</h3>

@@ -97,8 +97,10 @@ class ReplSession {
         /// reads `ExecutionResult::table` / `scalar` itself can skip it.
         bool render = true;
         /// Execute table expressions with the script planner's deferred and
-        /// streaming scans. Statements still run in order and retain bindings.
-        bool plan_table_expressions = false;
+        /// streaming scans, as a script does. Statements still run in order and
+        /// retain bindings. False decodes each lazy source a statement reads
+        /// whole, into one chunk.
+        bool plan_table_expressions = true;
     };
 
     [[nodiscard]] auto execute(std::string_view source) -> ExecutionResult;

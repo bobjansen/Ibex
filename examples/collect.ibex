@@ -1,0 +1,28 @@
+// Lazy sources and collect: a `let` of a reader reads nothing; collect(...)
+// materializes a table once, with only the columns its select keeps.
+
+import "parquet";
+
+let trades = Table {
+    symbol = ["A", "B", "A", "C", "B", "A"],
+    price  = [10.0, 20.0, 11.0, 30.0, 21.0, 12.0],
+    qty    = [100, 200, 150, 50, 75, 25],
+    venue  = ["X", "Y", "X", "Z", "Y", "Z"]
+};
+parquet::write(trades, "collect_demo.parquet");
+
+// Lazy: nothing is read here. Each query below that read `source` would
+// stream the file again, decoding only the columns and rows it needs.
+let source = parquet::read("collect_demo.parquet");
+
+// Read once and keep in memory: two columns, decoded at this `let`.
+let held = collect(source[select { symbol, qty }]);
+
+print("volume by symbol, from the held table:");
+held[select { volume = sum(qty) }, by symbol];
+
+print("large trades, from the same held table (no second read):");
+held[filter qty >= 100];
+
+print("price is not held; this query streams the file for it:");
+source[select { avg_price = mean(price) }, by symbol];

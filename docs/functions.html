@@ -84,6 +84,7 @@
             <tr><td><code>exists(df[filter k == outer(j)])</code></td><td>In a <code>filter</code>: true when at least one inner row matches the <code>outer(...)</code> captures. A whole <code>&amp;&amp;</code> term is a semi join (<code>!exists</code> an anti join); under <code>||</code> it is a mark join. Never null.</td></tr>
             <tr><td><code>order(df, key1, ...)</code></td><td>Return a table ordered by keys. Usually written as <code>df[order key1, ...]</code>.</td></tr>
             <tr><td><code>print(value)</code></td><td>Print a human-readable value in scripts and REPL sessions.</td></tr>
+            <tr><td><code>collect(df)</code></td><td>Materialize a table once, where its <code>let</code> is, instead of re-reading its source in every query that uses the name. A <code>select</code> or <code>filter</code> inside decides what is decoded and kept: <code>let k = collect(parquet::read(p)[select { a, b }]);</code></td></tr>
           </tbody>
         </table>
       </article>

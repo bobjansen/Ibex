@@ -151,6 +151,69 @@ TEST_CASE("REPL session preserves bindings and returns structured results", "[re
     REQUIRE_FALSE(session.erase("numbers"));
 }
 
+TEST_CASE("REPL collect materializes a lazy source where a plain let keeps it lazy",
+          "[repl][session]") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_lazy_table(
+        "read_fake",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            ibex::runtime::Table schema;
+            schema.add_column("a", ibex::Column<std::int64_t>{});
+            schema.add_column("b", ibex::Column<std::int64_t>{});
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), 3,
+                [](const std::vector<std::string>& names, const ibex::runtime::Selection* selection)
+                    -> std::expected<ibex::runtime::Table, std::string> {
+                    const ibex::runtime::Selection all{0, 1, 2};
+                    const auto& rows = selection == nullptr ? all : *selection;
+                    ibex::runtime::Table table;
+                    for (const auto& name : names) {
+                        std::vector<std::int64_t> selected;
+                        selected.reserve(rows.size());
+                        for (const auto row : rows) {
+                            selected.push_back(static_cast<std::int64_t>(row + 1) *
+                                               (name == "a" ? 1 : 10));
+                        }
+                        table.add_column(name, ibex::Column<std::int64_t>{std::move(selected)});
+                    }
+                    table.logical_rows = rows.size();
+                    return table;
+                });
+        });
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    const auto result = session.execute(
+        "extern fn read_fake() -> DataFrame from \"fake.hpp\";\n"
+        "let lz = read_fake();\n"
+        "let kept = collect(lz[select { a }]);\n"
+        "kept[select { s = sum(a) }];");
+    REQUIRE(result.ok);
+    REQUIRE(result.table.has_value());
+    const auto& collected = *result.table;  // NOLINT(bugprone-unchecked-optional-access)
+    CHECK(std::get<ibex::Column<std::int64_t>>(*collected.find("s"))[0] == 6);
+    const auto environment = session.environment();
+    const auto find = [&](const std::string& name) {
+        return std::ranges::find_if(environment,
+                                    [&](const auto& entry) { return entry.name == name; });
+    };
+    REQUIRE(find("lz") != environment.end());
+    CHECK(find("lz")->lazy);
+    REQUIRE(find("kept") != environment.end());
+    CHECK_FALSE(find("kept")->lazy);
+    CHECK(find("kept")->rows == 3);
+    // Only the selected column was decoded and kept.
+    REQUIRE(find("kept")->columns.size() == 1);
+    CHECK(find("kept")->columns[0].first == "a");
+}
+
+TEST_CASE("REPL collect takes exactly one argument", "[repl][session]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    const auto result = session.execute("let t = Table { a = [1, 2] };\ncollect(t, t);");
+    REQUIRE_FALSE(result.ok);
+    CHECK(result.error.contains("collect expects exactly 1 argument"));
+}
+
 TEST_CASE("REPL session collects every rendered table", "[repl][session]") {
     ibex::runtime::ExternRegistry registry;
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
@@ -3544,10 +3607,19 @@ TEST_CASE("ReplSession: planned expressions stream bound lazy sources", "[repl][
         REQUIRE(total != nullptr);
         CHECK((*total)[0] == 7);
     }
-    // The option is call-scoped; a normal session call still decodes eagerly.
+    // Streaming is the default: an ordinary session call never decodes the
+    // source whole either.
     const auto ordinary = session.execute("input[select { total = sum(v) }];");
-    CHECK_FALSE(ordinary.ok);
-    CHECK(ordinary.error.find("whole-source decode forbidden") != std::string::npos);
+    CAPTURE(ordinary.error);
+    CHECK(ordinary.ok);
+    // The option is call-scoped: opting out decodes the source whole.
+    ibex::repl::ReplSession::ExecuteOptions eager;
+    eager.plan_table_expressions = false;
+    const auto whole = session.execute("input[select { total = sum(v) }];", std::move(eager));
+    CHECK_FALSE(whole.ok);
+    CHECK(whole.error.find("whole-source decode forbidden") != std::string::npos);
+    // ...and does not leak into the next call.
+    CHECK(session.execute("input[select { total = sum(v) }];").ok);
 }
 
 TEST_CASE("ReplSession: print output comes back without rendering results", "[repl][session]") {

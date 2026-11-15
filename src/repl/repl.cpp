@@ -340,8 +340,11 @@ auto render_results() -> bool& {
     return render;
 }
 
+// Statements stream by default: a table expression runs through the script
+// planner's deferred and streaming scans, as a script does, rather than
+// decoding each lazy source whole into one chunk. `ExecuteOptions` can opt out.
 auto plan_table_expressions() -> bool& {
-    static thread_local bool enabled = false;
+    static thread_local bool enabled = true;
     return enabled;
 }
 

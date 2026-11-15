@@ -110,6 +110,13 @@ In interactive mode:
   semicolons are required.
 - All bindings persist for the duration of the session.
 - `:load <file>` loads and executes a script in the current REPL context.
+- A table expression statement is planned and streamed as a script is: a lazy
+  source (`parquet::read(...)`) is read unit by unit with its filters and
+  column demand pushed down, never decoded whole first. A `let` of a bare
+  source binds it lazily and reads nothing; each statement that reads it reads
+  the columns and rows it needs again. `collect(...)` (Section 12.5.1)
+  materializes a value once, at the `let`, for statements that should not
+  re-read it.
 
 ---
 
@@ -4313,6 +4320,38 @@ pass-through return lets `print` be used inline — `let m = print(df[...]);`
 displays the table and binds it in one step. `print` takes exactly one
 argument. In REPL mode, a bare expression statement is implicitly printed
 without requiring `print`.
+
+### 12.5.1 Materialization
+
+```
+collect(df: DataFrame<S>) -> DataFrame<S>
+collect(tf: TimeFrame<S>) -> TimeFrame<S>
+```
+
+Evaluates its argument and holds the result as a materialized table. As a value
+it is its argument unchanged; what it changes is a `let`. A plain `let` of a
+table expression is a plan: in a script each reader of the name has it inlined
+(sharing it only when it is read more than once and costly to repeat), and a
+`let` of a bare lazy source (`let h = parquet::read(p);`) reads nothing until a
+statement reads `h`, then re-reads what that statement needs. `let t =
+collect(e);` instead evaluates `e` once, where the `let` is, and every reader
+of `t` reads the held table.
+
+Projection and selection pushdown still apply inside the argument, so a
+`select` or `filter` there decides what is decoded and kept:
+
+```
+import "parquet";
+let lineitem = parquet::read("lineitem.parquet");           // nothing read
+let kept = collect(lineitem[select { l_orderkey, l_quantity }]);
+// two columns decoded once, held in memory
+kept[select { q = sum(l_quantity) }, by l_orderkey];
+kept[filter l_quantity > 45];
+```
+
+`collect` takes exactly one argument. Applied to a table that is already
+materialized it changes nothing. A compiled program (`ibex_compile`) evaluates
+every table eagerly, so there `collect` is the identity.
 
 ### 12.6 Scalar Functions
 

@@ -128,6 +128,29 @@ let lit = Table { g = [1, 2], pad = [0, 0], v = [1.0, 2.0] };
 // A compiled program gets the same implied-predicate pushdown as the REPL: the
 // disjunction names both inputs in every branch, so each input is filtered by
 // what it implies before the join, and the disjunction itself runs after it.
+TEST_CASE("lower/codegen: collect compiles to its argument", "[codegen]") {
+    // A compiled program evaluates every table eagerly, so `collect` adds
+    // nothing: the program is the one without it, read through the same
+    // narrowing to the collected select.
+    const auto emitted = [](const std::string& body) {
+        const std::string src = R"(
+extern fn csv::read(path: String) -> DataFrame from "csv.hpp";
+let x = csv::read("x.csv");
+)" + body;
+        auto parsed = parser::parse(src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        return emit_to_string(**lowered);
+    };
+    const auto with =
+        emitted("let k = collect(x[select { g, v }]);\nk[select { s = sum(v) }, by g];");
+    const auto without = emitted("let k = x[select { g, v }];\nk[select { s = sum(v) }, by g];");
+    INFO(with);
+    CHECK(with == without);
+    CHECK_FALSE(contains(with, "collect"));
+}
+
 TEST_CASE("lower/codegen: a disjunction across join sides filters each input first",
           "[codegen][implied]") {
     const char* src = R"(

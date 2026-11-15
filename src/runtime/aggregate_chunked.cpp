@@ -2084,17 +2084,23 @@ class HashAggregateState final {
                 }
             }
             if (all_cat && group_entries.size() >= 2) {
-                // Nullable keys only while their cells index densely: past
-                // that, three or more go to the packed path, which keeps a null
-                // cell too and partitions discovery, rather than the generic.
+                // Several Categorical keys keep the code path only while their
+                // cells index densely (and in parallel,
+                // `try_process_rows_cat_multi_parallel`). Past that the path's
+                // fallback is a serial hash index (`multi_cat_find_or_insert`),
+                // so they leave it: two non-null keys for the pair path, which
+                // packs both codes into one word, three or more for the packed
+                // path; both partition their discovery across workers. A
+                // nullable pair goes to the generic path, as before. (PARALLELISM.md
+                // I3; a later chunk whose dictionaries outgrow the dense space
+                // still migrates to the hash index.)
                 std::vector<const Column<Categorical>*> key_cols;
                 std::vector<std::uint8_t> nullable;
                 for (const auto* e : group_entries) {
                     key_cols.push_back(&std::get<Column<Categorical>>(*e->column));
                     nullable.push_back(e->validity.has_value() ? 1U : 0U);
                 }
-                if (std::ranges::any_of(nullable, [](std::uint8_t n) { return n != 0U; }) &&
-                    !cat_cell_plan(key_cols, nullable).dense_possible) {
+                if (!cat_cell_plan(key_cols, nullable).dense_possible) {
                     all_cat = false;
                 }
             }

@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -2177,6 +2178,95 @@ TEST_CASE("Group arrays grown past their own mapping keep every group exact",
         runtime::set_env("IBEX_CHUNK_ROWS", *restore);
     } else {
         runtime::unset_env("IBEX_CHUNK_ROWS");
+    }
+}
+
+TEST_CASE("Categorical keys past the dense cell space partition their discovery",
+          "[physical][breaker][execute]") {
+    // 100 x 50,000 dictionary entries is 5M cells, past the dense limit. Such
+    // keys used to stay on the Categorical path and fall to its serial hash
+    // index (PARALLELISM.md I3); two now take the pair path and three the
+    // packed path, which partition discovery across workers. Groups, their
+    // first-occurrence order, decoded keys and sums must match a hand
+    // reference.
+    constexpr std::int64_t kRows = 600'000;
+    constexpr std::int32_t kA = 100;
+    constexpr std::int32_t kB = 50'000;
+    constexpr std::int32_t kC = 7;
+    const auto dictionary = [](const char* prefix, std::int32_t n) {
+        std::vector<std::string> out;
+        out.reserve(static_cast<std::size_t>(n));
+        for (std::int32_t i = 0; i < n; ++i) {
+            out.push_back(std::string(prefix) + std::to_string(i));
+        }
+        return out;
+    };
+    Column<Categorical>::codes_storage a_codes;
+    Column<Categorical>::codes_storage b_codes;
+    Column<Categorical>::codes_storage c_codes;
+    Column<std::int64_t> v;
+    for (std::int64_t r = 0; r < kRows; ++r) {
+        a_codes.push_back(static_cast<std::int32_t>(r % kA));
+        b_codes.push_back(static_cast<std::int32_t>((r * 7919) % kB));
+        c_codes.push_back(static_cast<std::int32_t>((r / 3) % kC));
+        v.push_back(r % 101);
+    }
+    runtime::Table t;
+    t.add_column("a", Column<Categorical>{dictionary("a", kA), a_codes});
+    t.add_column("b", Column<Categorical>{dictionary("b", kB), b_codes});
+    t.add_column("c", Column<Categorical>{dictionary("c", kC), c_codes});
+    t.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    const auto check = [&](const char* query, bool three) {
+        CAPTURE(query);
+        using Key = std::tuple<std::int32_t, std::int32_t, std::int32_t>;
+        std::vector<Key> order;
+        std::map<Key, std::int64_t> sums;
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            const auto i = static_cast<std::size_t>(r);
+            const Key key{a_codes[i], b_codes[i], three ? c_codes[i] : 0};
+            auto [it, fresh] = sums.try_emplace(key, 0);
+            if (fresh) {
+                order.push_back(key);
+            }
+            it->second += r % 101;
+        }
+        const auto ir = require_ir(query);
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{8}}) {
+            CAPTURE(threads);
+            runtime::ParallelPipelineStats stats;
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            exec.parallel_stats = &stats;
+            const auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == order.size());
+            const auto& oa = std::get<Column<Categorical>>(*out->find_entry("a")->column);
+            const auto& ob = std::get<Column<Categorical>>(*out->find_entry("b")->column);
+            const auto& os = std::get<Column<std::int64_t>>(*out->find_entry("s")->column);
+            for (std::size_t g = 0; g < order.size(); ++g) {
+                const auto& [ka, kb, kc] = order[g];
+                REQUIRE(oa[g] == "a" + std::to_string(ka));
+                REQUIRE(ob[g] == "b" + std::to_string(kb));
+                if (three) {
+                    const auto& oc = std::get<Column<Categorical>>(*out->find_entry("c")->column);
+                    REQUIRE(oc[g] == "c" + std::to_string(kc));
+                }
+                REQUIRE(os[g] == sums.at(order[g]));
+            }
+            if (threads == 8 &&
+                std::min<std::size_t>(8, runtime::process_worker_pool().size()) >= 2) {
+                CHECK(stats.parallel_aggregate_partitions.load() > 0);
+            }
+        }
+    };
+    SECTION("two keys") {
+        check("t[select { s = sum(v) }, by { a, b }];", false);
+    }
+    SECTION("three keys") {
+        check("t[select { s = sum(v) }, by { a, b, c }];", true);
     }
 }
 

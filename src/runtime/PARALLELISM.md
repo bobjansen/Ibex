@@ -378,12 +378,16 @@ bugs: each new operator copies whichever neighbour it was written next to.
   `evaluate_field_maybe_parallel` splits Bool, Categorical and interpolated
   String results through their direct routes.) These are capability limits of
   two unrelated kernels, not one missing predicate.
-- **I3** — multi-key Categorical grouping is parallel only while its Cartesian
-  cell space is dense (`try_process_rows_cat_multi_parallel`, up to
-  `kDenseCellLimit` = 4M cells, slot-combinable aggregates). Past that, or when
-  a later chunk grows the dictionaries past it, the groups migrate to a serial
-  hash index (`multi_cat_find_or_insert`), although the pair and packed-key
-  paths already carry Categorical codes and partition their discovery.
+- **I3** — multi-key Categorical grouping keeps its code path only while its
+  Cartesian cell space is dense (`try_process_rows_cat_multi_parallel`, up to
+  `kDenseCellLimit` = 4M cells). A key whose first chunk is already past that
+  now goes to the pair path (two keys) or the packed path (three or more),
+  which partition discovery (2026-11-15: h2o 1e7 `sum by {id1, id3}`, 6.3M
+  groups, 8c 1.25 s -> 0.17 s; the serial hash index's own hash, which
+  collided exactly over small codes, was fixed first: 11.3 s -> 1.25 s). What
+  is left: a stream whose LATER chunk grows the dictionaries past the limit
+  still migrates its groups to the serial hash index
+  (`multi_cat_find_or_insert`), and a nullable pair goes to the generic path.
 - **I6** — private row thresholds (`parallel_min_rows`, `kMinProbeRows`,
   `kMinParallelPredicateRows`, `kDefaultPartitionMinRows`, …) beside the two
   `ExecutionContext` knobs. Break-evens differ per operator; the

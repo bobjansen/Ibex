@@ -116,7 +116,8 @@ compute across a **pipeline breaker** (join build, aggregate, sort).
   0.45 -> 0.34 s at 8 cores. A source longer than three rounds of the pool
   still leaves one pool thread spare for downstream batches
   (`scan_pipeline_worker_count`; once a deadlock guard against every thread
-  parking, which elastic workers rule out), and the consumer decodes units in
+  parking, which elastic workers rule out; kept because dropping it measured
+  worse, q13 +7%, q15 +11%), and the consumer decodes units in
   its place whenever it would otherwise wait (`run_consumer_unit`, under a
   serial context); the ring carries one extra round so the workers are not
   starved of slots behind it. Before this, q06 at 8 cores kept 7 of 8 cores
@@ -388,9 +389,10 @@ bugs: each new operator copies whichever neighbour it was written next to.
   `ExecutionContext` knobs. Break-evens differ per operator; the
   problem is that none can be swept without recompiling. Convergence:
   `ExecutionContext`-scaled multiples.
-- **I7** — `parallel_min_cells` (width) is consulted by 2 sites (`pipeline_executor.cpp`, `sort.cpp`) against ~20 for `parallel_min_rows`, though
-  "131k rows won at 6 columns, lost at 2" applies equally to filter gather,
-  join concat and aggregate emission.
+- **I7** — `parallel_min_cells` (width) is consulted by 2 sites
+  (`pipeline_executor.cpp`, `sort.cpp`) against ~20 for `parallel_min_rows`,
+  though "131k rows won at 6 columns, lost at 2" applies equally to filter
+  gather, join concat and aggregate emission.
 - **I9** — worker-count caps differ: the plan-owned phases and the join /
   semi-anti probes cap at 64, every other site is bounded only by budget and
   pool, undocumented.

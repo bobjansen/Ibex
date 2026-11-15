@@ -18859,6 +18859,45 @@ TEST_CASE("Scan pipeline workers never park on the ring holding a pool thread",
     CHECK(parks == 0);
 }
 
+TEST_CASE("Morsel pipeline on elastic workers keeps every row and group",
+          "[runtime][parallel][pipeline]") {
+    // The morsel pipeline's workers now leave instead of parking and are
+    // called back as the consumer takes (`ElasticRingProducers`, shared with
+    // the scan pipeline, whose no-park test fails on the old loop). This
+    // checks the morsel side end to end: an in-memory table through filter
+    // and update morsels into a high-cardinality group-by, every row and
+    // group accounted for. It does not assert "no park": in a debug build the
+    // morsel workers never get a window ahead of this consumer, so it could
+    // not fail.
+    constexpr std::int64_t kRows = 1'280'000;
+    runtime::Table t;
+    {
+        Column<std::int64_t> x;
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            x.push_back(((r * 7919) % 1'000'003) * 4);
+        }
+        t.add_column("x", std::move(x));
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+    const auto ir = require_ir(
+        "t[filter x >= 0][update { y = x * 2 }][select { n = count() }, by y]"
+        "[select { groups = count(), rows = sum(n) }];");
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 8;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_stats = &stats;
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    CHECK(std::get<Column<std::int64_t>>(*out->find("rows"))[0] == kRows);
+    CHECK(std::get<Column<std::int64_t>>(*out->find("groups"))[0] == 1'000'003);
+    if (runtime::process_worker_pool().size() >= 2) {
+        CHECK(stats.morsels.load() > 0);  // the filter ran as a morsel pipeline
+    }
+}
+
 TEST_CASE("Scan pipeline consumer decodes units in place of the spare thread",
           "[runtime][parallel][pipeline]") {
     auto state = std::make_shared<ManyUnitState>();

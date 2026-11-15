@@ -182,6 +182,67 @@ auto chunked_agg_tracks_validity(ir::AggFunc func) -> bool {
 /// `push_back`/`emplace_back`, `data`, `[]`, `size`, `begin`/`end`. Elements
 /// are moved by their bytes, so they must be trivially copy-constructible and
 /// trivially destructible (an `AggSlotCore`, an Int64, a pair of them).
+#ifdef __linux__
+/// Released `SlotArray` mappings, kept resident for the next large array.
+///
+/// The runtime keeps freed heap memory resident (`M_TRIM_THRESHOLD` = -1), so a
+/// repeated query reuses pages it has already faulted in. A mapping returned to
+/// the kernel on release lost that: the second run of an in-memory grouped
+/// aggregate in one session took +15% re-faulting its group arrays. Up to
+/// `kMaxBlocks` released mappings are kept instead, and a new one reuses one --
+/// the smallest that fits, or the largest grown by `mremap`, which keeps the
+/// pages it has. Their contents are stale, as recycled heap memory's are; a
+/// `SlotArray` never reads an element it has not written.
+class MappedBlockCache {
+   public:
+    struct Block {
+        void* data = nullptr;
+        std::size_t bytes = 0;
+    };
+
+    static auto instance() -> MappedBlockCache& {
+        static MappedBlockCache cache;
+        return cache;
+    }
+
+    /// A mapping of at least `bytes`: a cached one, or none (`data` null).
+    [[nodiscard]] auto take(std::size_t bytes) -> Block {
+        const std::scoped_lock lock(mutex_);
+        if (blocks_.empty()) {
+            return {};
+        }
+        auto best = blocks_.end();
+        for (auto it = blocks_.begin(); it != blocks_.end(); ++it) {
+            if (it->bytes >= bytes && (best == blocks_.end() || it->bytes < best->bytes)) {
+                best = it;
+            }
+        }
+        if (best == blocks_.end()) {  // none fits: grow the largest
+            best = std::ranges::max_element(blocks_, {}, &Block::bytes);
+        }
+        const Block block = *best;
+        blocks_.erase(best);
+        return block;
+    }
+
+    /// Keep `block` for reuse, unmapping the smallest once there are too many.
+    void give(Block block) noexcept {
+        const std::scoped_lock lock(mutex_);
+        blocks_.push_back(block);
+        if (blocks_.size() > kMaxBlocks) {
+            const auto smallest = std::ranges::min_element(blocks_, {}, &Block::bytes);
+            ::munmap(smallest->data, smallest->bytes);
+            blocks_.erase(smallest);
+        }
+    }
+
+   private:
+    static constexpr std::size_t kMaxBlocks = 8;
+    std::mutex mutex_;
+    std::vector<Block> blocks_;
+};
+#endif
+
 // realloc/free and mmap/munmap are the point of this class, its own RAII wrapper.
 // NOLINTBEGIN(cppcoreguidelines-no-malloc)
 template <typename T>
@@ -197,10 +258,12 @@ class SlotArray {
         : data_(other.data_),
           size_(other.size_),
           capacity_(other.capacity_),
+          mapped_bytes_(other.mapped_bytes_),
           mapped_(other.mapped_) {
         other.data_ = nullptr;
         other.size_ = 0;
         other.capacity_ = 0;
+        other.mapped_bytes_ = 0;
         other.mapped_ = false;
     }
     auto operator=(SlotArray&& other) noexcept -> SlotArray& {
@@ -209,10 +272,12 @@ class SlotArray {
             data_ = other.data_;
             size_ = other.size_;
             capacity_ = other.capacity_;
+            mapped_bytes_ = other.mapped_bytes_;
             mapped_ = other.mapped_;
             other.data_ = nullptr;
             other.size_ = 0;
             other.capacity_ = 0;
+            other.mapped_bytes_ = 0;
             other.mapped_ = false;
         }
         return *this;
@@ -300,10 +365,21 @@ class SlotArray {
 #ifdef __linux__
         if (mapped_ || bytes >= kMapBytes) {
             const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
-            const std::size_t mapped_bytes = (bytes + page - 1) / page * page;
+            std::size_t mapped_bytes = (bytes + page - 1) / page * page;
             void* grown = nullptr;
             if (mapped_) {
                 grown = ::mremap(data_, mapped_capacity_bytes(), mapped_bytes, MREMAP_MAYMOVE);
+            } else if (const auto cached = MappedBlockCache::instance().take(mapped_bytes);
+                       cached.data != nullptr) {
+                grown = cached.bytes >= mapped_bytes
+                            ? cached.data
+                            : ::mremap(cached.data, cached.bytes, mapped_bytes, MREMAP_MAYMOVE);
+                if (grown != MAP_FAILED && cached.bytes > mapped_bytes) {
+                    mapped_bytes = cached.bytes;  // keep all of it; it is ours now
+                }
+                if (grown == MAP_FAILED) {
+                    ::munmap(cached.data, cached.bytes);
+                }
             } else {
                 grown = ::mmap(nullptr, mapped_bytes, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -323,6 +399,7 @@ class SlotArray {
             }
             data_ = static_cast<T*>(grown);
             capacity_ = mapped_bytes / sizeof(T);
+            mapped_bytes_ = mapped_bytes;
             return;
         }
 #endif
@@ -336,15 +413,17 @@ class SlotArray {
 
 #ifdef __linux__
     [[nodiscard]] auto mapped_capacity_bytes() const noexcept -> std::size_t {
-        return capacity_ * sizeof(T);
+        return mapped_bytes_;
     }
 #endif
 
     void release() noexcept {
 #ifdef __linux__
         if (mapped_) {
-            ::munmap(data_, mapped_capacity_bytes());
+            MappedBlockCache::instance().give({.data = data_, .bytes = mapped_bytes_});
             data_ = nullptr;
+            mapped_bytes_ = 0;
+            mapped_ = false;
             return;
         }
 #endif
@@ -355,6 +434,9 @@ class SlotArray {
     T* data_ = nullptr;
     std::size_t size_ = 0;
     std::size_t capacity_ = 0;
+    /// The mapping's own size, when `mapped_`: whole pages, which need not be a
+    /// whole number of elements.
+    std::size_t mapped_bytes_ = 0;
     bool mapped_ = false;
 };
 // NOLINTEND(cppcoreguidelines-no-malloc)

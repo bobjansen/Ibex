@@ -4986,6 +4986,19 @@ class HashAggregateState final {
         // keys every row is a head and nothing changes. A row that is not a
         // head has no partition written in `part_of_row_`: nothing reads it.
         constexpr bool kRunHeads = kKeepKeys && std::equality_comparable<Probe>;
+        // Hashes of the rows of a sample of KEYS, about one key in
+        // 2^(64 - kGroupSampleShift), kept per range: every row of a sampled
+        // key is kept, so in each partition distinct sampled hashes over
+        // sampled rows estimates the share of rows that start a group. Pass 3
+        // caps its table reserve by it. A partition's first rows cannot tell
+        // that: a key that repeats only far apart looks new in all of them.
+        // The test mixes the hash first (one multiply) so a hash whose top
+        // bits carry little (an identity int hash) does not sample everything.
+        constexpr unsigned kGroupSampleShift = 55;  // 1 key in 512
+        std::vector<std::vector<std::uint64_t>> group_samples(ranges);
+        const auto sampled_key = [](std::uint64_t hash) {
+            return ((hash * 0x9e3779b97f4a7c15ULL) >> kGroupSampleShift) == 0;
+        };
         const auto is_head = [&](std::size_t row, std::size_t range_begin) {
             if constexpr (kRunHeads) {
                 return row == range_begin || !(row_keys[row] == row_keys[row - 1]);
@@ -4998,6 +5011,7 @@ class HashAggregateState final {
                 const std::size_t begin = r * grain;
                 const std::size_t end = std::min(rows, begin + grain);
                 std::size_t* row_counts = counts.data() + (r * part_count);
+                auto& samples = group_samples[r];
                 Hash hasher;
                 for (std::size_t row = begin; row < end; ++row) {
                     const auto key = key_at(row);
@@ -5009,9 +5023,13 @@ class HashAggregateState final {
                             continue;
                         }
                     }
-                    const auto part = static_cast<std::uint8_t>(hasher(key) & part_mask);
+                    const auto hash = static_cast<std::uint64_t>(hasher(key));
+                    const auto part = static_cast<std::uint8_t>(hash & part_mask);
                     part_of_row_[row] = part;
                     ++row_counts[part];
+                    if (sampled_key(hash)) [[unlikely]] {
+                        samples.push_back(hash);
+                    }
                 }
             });
             batch.wait();
@@ -5076,6 +5094,34 @@ class HashAggregateState final {
         // cannot be handed out in first-occurrence order until every partition
         // has been seen. `gids[row]` therefore holds a local id until pass 4.
         const std::uint64_t row_base = rows_seen_;
+        // Each partition's group estimate from pass 1's key sample: distinct
+        // sampled hashes over sampled rows, times its rows, an eighth over for
+        // the estimate's noise. Unbounded where too few keys were sampled. A
+        // few hundred hashes per million rows, so this stays on the calling
+        // thread.
+        constexpr std::size_t kMinGroupSamples = 32;
+        std::vector<std::size_t> group_estimate(part_count,
+                                                std::numeric_limits<std::size_t>::max());
+        {
+            std::vector<std::vector<std::uint64_t>> by_part(part_count);
+            for (const auto& samples : group_samples) {
+                for (const std::uint64_t hash : samples) {
+                    by_part[hash & part_mask].push_back(hash);
+                }
+            }
+            for (std::size_t p = 0; p < part_count; ++p) {
+                auto& sampled = by_part[p];
+                if (sampled.size() < kMinGroupSamples) {
+                    continue;
+                }
+                std::ranges::sort(sampled);
+                const auto distinct = static_cast<std::size_t>(
+                    std::ranges::unique(sampled).begin() - sampled.begin());
+                const std::size_t estimate =
+                    (part_begin[p + 1] - part_begin[p]) * distinct / sampled.size();
+                group_estimate[p] = estimate + (estimate / 8);
+            }
+        }
         {
             std::atomic<std::size_t> cursor{0};
             auto batch = pool.submit(std::min(workers, part_count), [&](std::size_t) {
@@ -5089,6 +5135,14 @@ class HashAggregateState final {
                     // not regrow and rehash on the way there. A
                     // low-cardinality partition never trips it, so nothing is
                     // reserved per row there.
+                    //
+                    // That rate can be far too high: {l_partkey, l_suppkey}
+                    // repeats ~7.5 times, but far apart, so nearly every one
+                    // of a partition's first rows is new and the old
+                    // extrapolation reserved ~7.5x the groups (lineitem SF-10,
+                    // 2 cores: 3.3 s, against 2.0 s with no reserve at all).
+                    // The key sample from pass 1 sees the whole partition;
+                    // with enough of it, it caps the reserve.
                     constexpr std::size_t kReserveSample = 1024;
                     const std::size_t sample_end = part_begin[p] + kReserveSample;
                     const std::size_t held_at_start = partition.gids.size();
@@ -5096,7 +5150,10 @@ class HashAggregateState final {
                         if (i == sample_end && part_end - i > 4 * kReserveSample) {
                             const std::size_t fresh = partition.gids.size() - held_at_start;
                             if (fresh * 2 > kReserveSample) {
-                                const std::size_t more = (part_end - i) * fresh / kReserveSample;
+                                const std::size_t estimate = group_estimate[p];
+                                const std::size_t more =
+                                    std::min((part_end - i) * fresh / kReserveSample,
+                                             estimate > fresh ? estimate - fresh : 0);
                                 const std::size_t total = partition.gids.size() + more;
                                 partition.index.reserve(total);
                                 partition.gids.reserve(total);

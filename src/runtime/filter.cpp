@@ -3261,12 +3261,12 @@ void select_bounds_range(const std::vector<BoundsSpec>& specs, const std::vector
 /// `filter_selection`, so there is exactly one authority on whether a query is
 /// parallel — no second copy in the environment to disagree with it.
 auto select_bounds_morsels(const ExecutionContext& exec, std::size_t rows) -> std::size_t {
-    constexpr std::size_t kMinRowsPerMorsel = 65536;
     constexpr std::size_t kMaxMorsels = 64;
     if (!exec.can_fan_out() || on_worker_pool_thread() || rows < exec.parallel_min_rows) {
         return 1;
     }
-    const std::size_t morsels = std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
+    const std::size_t morsels = std::clamp<std::size_t>(
+        rows / exec.operator_grain_policy.filter_bounds_rows, 1, kMaxMorsels);
     const std::size_t budget = exec.compute_budget();
     return std::min({morsels, budget, process_worker_pool().size()});
 }
@@ -3464,6 +3464,11 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
 auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
                       const ExecutionContext& exec, const ScalarRegistry* scalars)
     -> std::expected<Selection, std::string> {
+    if (!exec.operator_grain_policy.valid()) {
+        return std::unexpected(
+            "operator grain policy requires positive grains and an ordered map band");
+    }
+
     std::optional<std::vector<ir::Expr>> bound;
     for (std::size_t i = 0; i < conjuncts.size(); ++i) {
         if (auto expr = bind_filter_constants(conjuncts[i], scalars, [&](const std::string& name) {

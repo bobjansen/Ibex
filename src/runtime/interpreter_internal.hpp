@@ -1699,13 +1699,10 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
     -> std::expected<Table, std::string>;
 
 // aggregate.cpp — grouped/global aggregation.
-/// `exec` is optional and only the GROUPED path can use it: the collect
-/// aggregates (median/quantile/skew/kurtosis) reduce disjoint per-group slices,
-/// which splits across workers. Callers that aggregate the whole table into one
-/// group have nothing to split and pass nothing.
-/// `aggregate_table` for a query with a Decimal aggregate input (int128
-/// accumulators, checked overflow); every non-Decimal aggregate in the query is
-/// delegated back to `aggregate_table`. decimal_aggregate.cpp.
+/// Grouped/global Decimal aggregation uses checked int128 accumulators.
+/// Sum/Mean use the context's Decimal grain and compute budget when supplied;
+/// a null context uses library defaults. Non-Decimal aggregates are delegated
+/// back to aggregate_table. decimal_aggregate.cpp.
 [[nodiscard]] auto aggregate_table_decimal(const Table& input,
                                            const std::vector<ir::ColumnRef>& group_by,
                                            const std::vector<ir::AggSpec>& aggregations,

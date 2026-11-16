@@ -202,7 +202,7 @@ struct GidUnitsEq {
 };
 
 auto aggregate_decimal_column(const ir::AggSpec& agg, const ColumnEntry& entry,
-                              const Grouping& grouping)
+                              const Grouping& grouping, const ExecutionContext& exec)
     -> std::expected<ComputedColumn, std::string> {
     const auto& col = std::get<Column<Decimal>>(*entry.column);
     const DecimalType in_type = decimal_type_of(col);
@@ -220,11 +220,12 @@ auto aggregate_decimal_column(const ir::AggSpec& agg, const ColumnEntry& entry,
             // overflow is past 38 digits -- an error, never a wrap.
             std::vector<Int128> sums(groups, 0);
             std::vector<std::int64_t> counts(groups, 0);
-            constexpr std::size_t kMinRowsPerWorker = 65536;
-            const bool parallel = rows >= kMinRowsPerWorker && !on_worker_pool_thread();
+            const std::size_t grain = exec.operator_grain_policy.decimal_partial_rows;
+            const bool parallel =
+                exec.can_fan_out() && rows / grain >= 2 && !on_worker_pool_thread();
             WorkerPool* pool = parallel ? &process_worker_pool() : nullptr;
             const std::size_t workers =
-                parallel ? std::min(pool->size(), rows / kMinRowsPerWorker) : 1;
+                parallel ? std::min({pool->size(), exec.compute_budget(), rows / grain}) : 1;
             // A private group array per worker avoids atomics in the row loop.
             // Bound the scratch size; very high-cardinality inputs keep the
             // serial path rather than multiplying an already large state table.
@@ -393,6 +394,12 @@ auto aggregate_decimal_column(const ir::AggSpec& agg, const ColumnEntry& entry,
 auto aggregate_table_decimal(const Table& input, const std::vector<ir::ColumnRef>& group_by,
                              const std::vector<ir::AggSpec>& aggregations,
                              const ExecutionContext* exec) -> std::expected<Table, std::string> {
+    const ExecutionContext defaults;
+    const ExecutionContext& context = exec == nullptr ? defaults : *exec;
+    if (!context.operator_grain_policy.valid()) {
+        return std::unexpected(
+            "operator grain policy requires positive grains and an ordered map band");
+    }
     auto grouping = group_rows(input, group_by);
     if (!grouping) {
         return std::unexpected(grouping.error());
@@ -424,7 +431,7 @@ auto aggregate_table_decimal(const Table& input, const std::vector<ir::ColumnRef
             delegated_at.push_back(i);
             continue;
         }
-        auto computed = aggregate_decimal_column(agg, *entry, *grouping);
+        auto computed = aggregate_decimal_column(agg, *entry, *grouping, context);
         if (!computed) {
             return std::unexpected(computed.error());
         }

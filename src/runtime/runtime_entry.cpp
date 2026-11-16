@@ -250,19 +250,16 @@ auto morsel_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t
     if (exec.parallel_grain != 0) {
         return exec.parallel_grain;  // explicit override, used as given
     }
-    // Aim for this many morsels per worker, so one slow morsel cannot strand
-    // the others. Below ~2 per thread the sweep shows real imbalance loss.
-    constexpr std::size_t kMorselsPerThread = 4;
-    // The measured good band was 16k-256k; clamp inside it. The upper bound is
-    // what stops the formula from choosing a grain worse than the old constant
-    // on a large input — see the declaration.
-    constexpr std::size_t kMinGrain = 4096;
-    constexpr std::size_t kMaxGrain = 65536;
-
+    // More than one morsel per worker hedges against uneven work. Clamp the
+    // computed grain to the context's strategy band; an explicit override above
+    // remains authoritative.
     const std::size_t pool_size = process_worker_pool().size();
     const std::size_t budget = exec.compute_budget();
     const std::size_t threads = std::max<std::size_t>(std::min(budget, pool_size), 1);
-    return std::clamp(rows / (threads * kMorselsPerThread), kMinGrain, kMaxGrain);
+    const auto& policy = exec.operator_grain_policy;
+    // Divide sequentially so even a very large configured target cannot wrap.
+    return std::clamp(rows / threads / policy.map_morsels_per_worker, policy.map_min_rows,
+                      policy.map_max_rows);
 }
 
 auto process_pipeline_stats() -> ParallelPipelineStats* {
@@ -984,6 +981,10 @@ auto build_operator_from_physical_plan(const physical::Plan& plan, const ir::Nod
                                        const ExternRegistry* externs, const ExecutionContext& exec,
                                        ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
+    if (!exec.operator_grain_policy.valid()) {
+        return std::unexpected(
+            "operator grain policy requires positive grains and an ordered map band");
+    }
     if ((exec.join_threshold_policy && !exec.join_threshold_policy->valid()) ||
         exec.radix_sort_min_rows == 0) {
         return std::unexpected("join/sort thresholds must be positive");
@@ -1261,6 +1262,10 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
+    if (!exec.operator_grain_policy.valid()) {
+        return std::unexpected(
+            "operator grain policy requires positive grains and an ordered map band");
+    }
     if ((exec.join_threshold_policy && !exec.join_threshold_policy->valid()) ||
         exec.radix_sort_min_rows == 0) {
         return std::unexpected("join/sort thresholds must be positive");

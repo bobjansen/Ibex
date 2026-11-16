@@ -3113,3 +3113,135 @@ TEST_CASE("Aggregate grains change submitted work and preserve results",
         }
     }
 }
+
+TEST_CASE("Remaining operator grains reject invalid values", "[physical][operator-grains]") {
+    using Policy = runtime::OperatorGrainPolicy;
+    const auto tree = require_ir("trades;");
+    for (const auto field :
+         {&Policy::filter_bounds_rows, &Policy::update_bucket_rows, &Policy::window_split_rows,
+          &Policy::decimal_partial_rows, &Policy::map_min_rows, &Policy::map_max_rows,
+          &Policy::map_morsels_per_worker}) {
+        runtime::ExecutionContext exec;
+        exec.operator_grain_policy.*field = 0;
+        const auto result =
+            runtime::interpret(*tree, trades_registry(), nullptr, nullptr, nullptr, exec);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("operator grain policy") != std::string::npos);
+    }
+    runtime::ExecutionContext exec;
+    exec.operator_grain_policy.map_min_rows = exec.operator_grain_policy.map_max_rows + 1;
+    CHECK_FALSE(
+        runtime::interpret(*tree, trades_registry(), nullptr, nullptr, nullptr, exec).has_value());
+}
+
+TEST_CASE("Fused filter bounds consume the configured grain", "[physical][operator-grains]") {
+    const auto registry = phase_policy_input(20000, 16, false, true);
+    auto tree = require_ir("input[filter a >= 3];");
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(ir::node_cast<ir::FilterNode>(*tree).take_predicate());
+    for (const auto grain : {1000U, 1'000'000U}) {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 8;
+        exec.parallel_min_rows = 0;
+        exec.operator_grain_policy.filter_bounds_rows = grain;
+        auto profile = std::make_shared<runtime::ExecutionProfileState>(8, false);
+        auto* entry = profile->stage("bounds");
+        {
+            const runtime::ExecutionProfileScope scope(entry, runtime::ProfilePhase::Next);
+            const auto result =
+                runtime::filter_selection(registry.at("input"), conjuncts, exec, nullptr);
+            REQUIRE(result.has_value());
+            std::vector<std::size_t> want;
+            for (std::size_t row = 0; row < 20000; ++row)
+                if (row % 16 >= 3)
+                    want.push_back(row);
+            CHECK(std::vector<std::size_t>(result->begin(), result->end()) == want);
+        }
+        CHECK((profile->snapshot().front().pool_tasks > 0) == (grain == 1000));
+    }
+}
+
+TEST_CASE("Grouped update bucketing respects its grain", "[physical][operator-grains]") {
+    const auto registry = phase_policy_input(20000, 8, false, false);
+    const auto tree = require_ir("input[update { s = cumsum(v) }, by a];");
+    runtime::ExecutionContext exec;
+    exec.parallel_min_rows = 0;
+    exec.operator_grain_policy.update_bucket_rows = 1000;
+    const auto small = checked_policy_tasks(*tree, registry, exec, "");
+    exec.operator_grain_policy.update_bucket_rows = 1'000'000;
+    CHECK(small > checked_policy_tasks(*tree, registry, exec, ""));
+}
+
+TEST_CASE("Grouped window split grain changes actual halo pieces", "[physical][operator-grains]") {
+    auto registry = phase_policy_input(20000, 2, false, true);
+    Column<Timestamp> ts;
+    for (std::int64_t row = 0; row < 20000; ++row)
+        ts.push_back(Timestamp{row});
+    registry.at("input").add_column("ts", std::move(ts));
+    registry.at("input").set_properties(runtime::TableProperties::time_frame("ts"));
+    const auto tree = require_ir("input[window 40ns, by a, update { s = rolling_sum(v) }];");
+    for (const auto grain : std::vector<std::size_t>{
+             1000, 1'000'000, (std::numeric_limits<std::size_t>::max() / 3) * 2 + 2}) {
+        runtime::ExecutionContext exec;
+        exec.parallel_min_rows = 0;
+        exec.operator_grain_policy.window_split_rows = grain;
+        runtime::ParallelPipelineStats stats;
+        exec.parallel_stats = &stats;
+        checked_policy_tasks(*tree, registry, exec, "");
+        CHECK((stats.window_halo_pieces.load() > 0) == (grain == 1000));
+    }
+}
+
+TEST_CASE("Decimal partials respect query budget and grain",
+          "[physical][decimal][operator-grains]") {
+    auto registry = phase_policy_input(20000, 8, false, true);
+    auto d = runtime::make_decimal_column(DecimalType{.precision = 10, .scale = 2});
+    for (std::int64_t row = 0; row < 20000; ++row)
+        d.push_back(Decimal{row % 101 - 50});
+    registry.at("input").add_column("d", std::move(d));
+    runtime::ValidityBitmap validity(20000, true);
+    validity.set(123, false);
+    registry.at("input").columns.back().validity = std::move(validity);
+    const auto tree = require_ir("input[select { s = sum(d), m = mean(d) }, by a];");
+    for (const auto budget : {1U, 2U, 4U}) {
+        for (const auto grain : {1000U, 1'000'000U}) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = budget;
+            exec.operator_grain_policy.decimal_partial_rows = grain;
+            exec.execution_profile =
+                std::make_shared<runtime::ExecutionProfileState>(budget, false);
+            const auto result =
+                runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(result.has_value());
+            auto serial = exec;
+            serial.parallel_threads = 1;
+            serial.execution_profile.reset();
+            const auto reference =
+                runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, serial);
+            REQUIRE(reference.has_value());
+            CHECK_FALSE(runtime::compare_tables(*reference, *result).has_value());
+            std::uint64_t tasks = 0;
+            for (const auto& row : exec.execution_profile->snapshot())
+                tasks += row.pool_tasks;
+            CHECK(tasks == (budget > 1 && grain == 1000 ? budget * 2 : 0));
+        }
+    }
+}
+
+TEST_CASE("Map grain band and target are runtime policy", "[physical][operator-grains]") {
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 2;
+    exec.operator_grain_policy.map_min_rows = 100;
+    exec.operator_grain_policy.map_max_rows = 10000;
+    exec.operator_grain_policy.map_morsels_per_worker = 2;
+    CHECK(runtime::morsel_grain(exec, 20000) == 5000);
+    exec.operator_grain_policy.map_morsels_per_worker = std::numeric_limits<std::size_t>::max();
+    CHECK(runtime::morsel_grain(exec, 20000) == 100);  // no multiplication overflow
+    exec.operator_grain_policy.map_min_rows = 300;
+    CHECK(runtime::morsel_grain(exec, 20000) == 300);
+    exec.operator_grain_policy.map_morsels_per_worker = 1;
+    exec.operator_grain_policy.map_max_rows = 500;
+    CHECK(runtime::morsel_grain(exec, 20000) == 500);
+    exec.parallel_grain = 17;
+    CHECK(runtime::morsel_grain(exec, 20000) == 17);  // explicit query override wins
+}

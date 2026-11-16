@@ -12,6 +12,7 @@
 #include <ibex/runtime/aggregate_discovery_policy.hpp>
 #include <ibex/runtime/aggregate_phase_policy.hpp>
 #include <ibex/runtime/join_threshold_policy.hpp>
+#include <ibex/runtime/operator_grain_policy.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
@@ -1114,6 +1115,9 @@ struct ExecutionContext {
     /// LSD-to-MSD radix strategy switch; distinct from the shared sort fan-out floor.
     static constexpr std::size_t default_radix_sort_min_rows = 1U << 16U;
     std::size_t radix_sort_min_rows = default_radix_sort_min_rows;
+
+    /// Row-range strategy grains; does not override the shared admission floor.
+    OperatorGrainPolicy operator_grain_policy{};
 
     [[nodiscard]] auto join_thresholds() const noexcept -> const JoinThresholdPolicy& {
         static const JoinThresholdPolicy defaults;

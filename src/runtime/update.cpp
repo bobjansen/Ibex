@@ -1413,6 +1413,11 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                            ir::Duration duration, const ScalarRegistry* scalars,
                            const ExternRegistry* externs, const ExecutionContext& exec,
                            bool aligned) -> std::expected<Table, std::string> {
+    if (!exec.operator_grain_policy.valid()) {
+        return std::unexpected(
+            "operator grain policy requires positive grains and an ordered map band");
+    }
+
     Table output = std::move(input);
     const std::size_t rows = output.rows();
     if (!output.time_index().has_value()) {
@@ -1513,9 +1518,9 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
     const std::size_t pool_size = process_worker_pool().size();
     const std::size_t budget = exec.compute_budget();
     // Enough rows per worker that the per-worker hash index is worth building.
-    constexpr std::size_t kMinRowsPerWorker = 32768;
     const std::size_t workers =
-        std::min({budget, pool_size, std::max<std::size_t>(rows / kMinRowsPerWorker, 1)});
+        std::min({budget, pool_size,
+                  std::max<std::size_t>(rows / exec.operator_grain_policy.update_bucket_rows, 1)});
     return workers < 2 ? 0 : workers;
 }
 
@@ -3450,8 +3455,9 @@ struct WindowTask {
     // Aim past the worker count so a group whose buckets divide unevenly can
     // still be balanced by work stealing, but keep each piece large enough that
     // its own gather and scatter dominate the fixed per-piece cost.
-    constexpr std::size_t kMinSplitRows = 32768;
-    const std::size_t target = std::max(rows / (workers * 4), kMinSplitRows);
+    const std::size_t target =
+        std::min(std::max<std::size_t>(rows, 1),
+                 std::max(rows / (workers * 4), exec.operator_grain_policy.window_split_rows));
 
     // An aligned clause whose every field is bucket-local is the better cut when
     // it is available: the boundary itself resets the rolling state, so the
@@ -3593,6 +3599,11 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                                    const ScalarRegistry* scalars, const ExternRegistry* externs,
                                    const ExecutionContext& exec, bool aligned)
     -> std::expected<Table, std::string> {
+    if (!exec.operator_grain_policy.valid()) {
+        return std::unexpected(
+            "operator grain policy requires positive grains and an ordered map band");
+    }
+
     if (group_by.empty()) {
         return windowed_update_table(std::move(input), fields, duration, scalars, externs, exec,
                                      aligned);
@@ -4384,6 +4395,11 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
 auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                   const ScalarRegistry* scalars, const ExternRegistry* externs,
                   const ExecutionContext& exec) -> std::expected<Table, std::string> {
+    if (!exec.operator_grain_policy.valid()) {
+        return std::unexpected(
+            "operator grain policy requires positive grains and an ordered map band");
+    }
+
     Table output = std::move(input);
     if (output.time_index().has_value()) {
         if (auto ok = check_row_order(output, fields); !ok) {
@@ -5759,6 +5775,11 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
                                     const GroupedRowPlan& grouped, const ScalarRegistry* scalars,
                                     const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
+    if (!exec.operator_grain_policy.valid()) {
+        return std::unexpected(
+            "operator grain policy requires positive grains and an ordered map band");
+    }
+
     if (is_group_inert_update(fields)) {
         return update_table(std::move(input), fields, scalars, externs, exec);
     }
@@ -6152,6 +6173,11 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                           const std::vector<ir::ColumnRef>& group_by, const ScalarRegistry* scalars,
                           const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
+    if (!exec.operator_grain_policy.valid()) {
+        return std::unexpected(
+            "operator grain policy requires positive grains and an ordered map band");
+    }
+
     if (group_by.empty()) {
         return update_table(std::move(input), fields, scalars, externs, exec);
     }

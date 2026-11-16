@@ -55,6 +55,8 @@ def main():
         summaries.append({"case": key, "default_ms": statistics.median(before), "target_ms": statistics.median(after),
                           "paired_ratio": ratio, "p": pvalue, "wins": sum(b < a for a, b in zip(before, after)),
                           "target_cpu_ms": cpu, "default_cpu_ms": cpu_before, "verdict": verdict,
+                          "fields": sorted({int(p["target"].get("fields", 0)) for p in pairs.values()}),
+                          "finalizes": sorted({int(p["target"].get("finalizes", 0)) for p in pairs.values()}),
                           "fanouts": sorted({int(p["target"]["fanouts"]) for p in pairs.values()})})
     (args.output_dir / "summary.json").write_text(json.dumps(summaries, indent=2) + "\n")
     print("rows cardinality chunk cores shape agg default_ms target_ms delta% p verdict cpu_work_x fanouts")

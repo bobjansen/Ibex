@@ -300,6 +300,7 @@ lifetime. There are no new environment switches. Defaults are unchanged:
 | `pair_owned_min_rows` | 65536 | Owned pair and async pair-sum admission |
 | `sorted_min_rows` | 262144 | Sorted Discovery admission, per chunk |
 | `sorted_range_rows` | 65536 | Sorted Discovery range grain |
+| `key_fill_range_groups` | 65536 | Key-copy group-range grain |
 | `async_hot_job_rows` | 1048576 | Async integer hot-sum job grain |
 | `pair_owned_max_first_chunk_rows` | 2097152 | Pair-owned first-chunk upper cutoff |
 
@@ -323,6 +324,52 @@ optional policy and changing that field. All other strategies keep their default
 The [Discovery sweep](../../benchmarking/discovery-policy/README.md) exercises
 whole-table and streamed inputs across rows, cardinalities and core counts;
 generated samples remain in ignored storage.
+
+### Remaining strategy thresholds
+
+`ExecutionContext::aggregate_phase_policy` optionally supplies an
+`AggregatePhasePolicy`, copied into the resolved aggregate alongside Discovery's
+policy. Accumulation admission is the minimum of two private-slot morsels,
+sorted rows, dense-GID rows and owned-range rows. FinalOrdering admission is the
+minimum of the merge-group and ordered-run floors. Overrides refresh these
+floors before row-estimate resolution; unset overrides preserve explicit plan
+floors. All entries must be positive.
+
+| Aggregate phase policy field | Default | Unit |
+| --- | ---: | --- |
+| `accumulation_morsel_rows` | 65536 | Input rows per private partial |
+| `sorted_min_rows` / `sorted_range_rows` | 262144 / 65536 | Input rows |
+| `dense_gid_min_rows` | 1048576 | Input rows |
+| `owned_range_min_rows` / `owned_range_min_groups` | 1048576 / 65536 | Input rows / groups |
+| `owned_range_morsel_rows` / `owned_range_window_rows` | 65536 / 4194304 | Input rows |
+| `slot_init_min_bytes` | 4194304 | Fresh slot bytes |
+| `merge_min_groups` / `merge_groups_per_worker` | 131072 / 4096 | Groups |
+| `ordered_min_runs` / `ordered_runs_per_worker` | 65536 / 8192 | Ordered runs |
+
+Kernel defaults are retained. FinalOrdering's default **plan** floor is now
+65536, allowing its ordered-run strategy below the former 131072-row veto.
+Distinct groups and compressed runs never exceed input rows, so the minimum is
+a safe estimate-based floor. The first-value seeding pass retains the shared
+`parallel_min_rows` gate as well as its phase permission. Emission already uses
+its resolved phase floor and the shared output-group threshold.
+
+Reduction grains depend on the input and policy, never on the worker budget.
+Explicitly changing a private-partial grain may change floating-point rounding
+between policies. Owned ranges preserve each group's input order. Dense-GID
+admission also selects the existing two-rows-per-cell density heuristic; a
+lowered threshold can therefore change the dense/hash choice at one core.
+Memory budgets, key capabilities and safety alignments remain algorithm checks.
+
+`ExecutionContext::join_threshold_policy` optionally supplies
+`JoinThresholdPolicy`: build 131072 rows, probe 16384 rows, concatenation 65536
+output matches, and semi/anti right-side passes 262144 rows. Build/probe floors
+are refreshed before resolution. Streaming and materialized probes, and the
+semi/anti left filter, use the same probe floor. The semi/anti right passes keep
+their separate floor and byte budget. An unset override preserves explicit
+join-plan floors. `ExecutionContext::radix_sort_min_rows` defaults to 65536 and
+selects LSD versus MSD radix sorting across whole-table, streamed and ranking
+calls; it does not replace the shared sort fan-out or output-cell gates. Query
+execution rejects zero join/sort thresholds. No environment switches were added.
 
 ## Who owns which decision
 
@@ -494,12 +541,11 @@ capability limits, others are inconsistent policy or incomplete migrations.
   packed layout can also outgrow its reserved fields and fall back to generic
   grouping. See the categorical transition rules above; generic grouping may
   itself partition, but hashes categorical text rather than compact codes.
-- **I6** — private strategy thresholds still exist outside aggregate Discovery.
-  Discovery now takes its row thresholds and grains from one runtime
-  `AggregateDiscoveryPolicy`, retaining distinct measured defaults. Accumulation,
-  other breaker families, and non-row algorithm constants still have local
-  choices. Move those only with measurements for their own strategy and phase;
-  a universal row floor would erase meaningful differences.
+- **I6** — migrated aggregate strategy floors and grains now live in Discovery
+  and phase policies, and join passes and radix sorting read context thresholds.
+  Remaining private choices include the unmigrated filter/update/decimal paths
+  and non-row algorithm constants. Move those with their operator migration and
+  measurements; shared row/cell gates and byte budgets have different units.
 - **I7** — `parallel_min_cells` (width) is consulted by 2 sites
   (`pipeline_executor.cpp`, `sort.cpp`) against ~20 for `parallel_min_rows`,
   though "131k rows won at 6 columns, lost at 2" applies equally to filter
@@ -511,10 +557,11 @@ capability limits, others are inconsistent policy or incomplete migrations.
   Discovery's default phase floor is now derived from its policy rather than a
   second constant; explicit context overrides update it before row-estimate
   resolution. This closes the default-policy drift between 32768-row packed,
-  65536-row owned and 262144-row radix strategies. Accumulation and FinalOrdering
-  still apply their own runtime gates: their phase floor must stay at or below
-  the minimum work size their paths admit. Emission uses group count as its
-  runtime unit; declining on a smaller input-row estimate is safe because groups
+  65536-row owned and 262144-row radix strategies. Accumulation now derives
+  its floor from its strategy policy; FinalOrdering derives its floor from both the merge-group and ordered-run strategies. The
+  latter removes the old 131072-row veto on a 65536-run kernel. Runtime gates
+  still check observed work sizes and capabilities. Emission uses group count
+  as its runtime unit; declining on a smaller input-row estimate is safe because groups
   cannot exceed input rows. Explicit physical-plan floors remain intentional
   admission restrictions when no context policy override is supplied.
 - **I12** — two thread species: the long-lived stage thread of
@@ -534,9 +581,9 @@ capability limits, others are inconsistent policy or incomplete migrations.
   row group; so did every REPL statement until 2026-11-15 (`52f30e38`), which
   decoded its lazy sources whole. Paths tuned on streamed chunks then lose
   their parallelism or their cache fit: the async hot Int64 sum ran one job per
-  chunk (now cut into `kHotJobRows` jobs, `ca3fa3ea`); the async and owned
+  chunk (now cut by `async_hot_job_rows`, `ca3fa3ea`); the async and owned
   PairIntKey paths ran it as one job or kept per-worker tables far beyond
-  cache (a first chunk of `kPairOwnedMaxFirstChunkRows` = 2M rows now goes to
+  cache (a first chunk at `pair_owned_max_first_chunk_rows` = 2M rows goes to
   the radix path, `82b10685`); radix discovery's table reserve, extrapolated
   from a partition's first rows, over-sized tables ~7.5x when keys repeat far
   apart (now capped by a key sample, `9f6fe94e`). It cuts the other way too:
@@ -617,7 +664,8 @@ once partitioned, later small chunks must keep consulting those partitions.
 The migrations centralized phase permission and worker ceilings, including
 Distinct's named floor and the shared join caps. Aggregate Discovery now carries its strategy thresholds through a shared
 runtime policy; its data-dependent admission checks remain in the operator.
-Other phases and breaker families retain local thresholds (I6, I10).
+Aggregate Accumulation and FinalOrdering now also carry strategy policies;
+remaining unmigrated breaker families retain local choices (I6, I10).
 
 ## The descriptor
 

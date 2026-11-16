@@ -48,8 +48,8 @@ class PreparedSource final : public Operator {
     std::size_t* offered_;
 };
 
-auto prepare(std::size_t rows, std::size_t cardinality, std::size_t chunk_rows, bool generic)
-    -> std::vector<Chunk> {
+auto prepare(std::size_t rows, std::size_t cardinality, std::size_t chunk_rows, bool generic,
+             bool ordered, bool dense, std::size_t prefix_rows) -> std::vector<Chunk> {
     std::vector<Chunk> chunks;
     const std::size_t grain = chunk_rows == 0 ? rows : chunk_rows;
     for (std::size_t begin = 0; begin < rows;) {
@@ -57,9 +57,14 @@ auto prepare(std::size_t rows, std::size_t cardinality, std::size_t chunk_rows, 
         Column<std::int64_t> a, b, c, v;
         Column<double> f;
         for (std::size_t row = begin; row < end; ++row) {
-            const std::size_t key = row % cardinality;
-            a.push_back(
-                static_cast<std::int64_t>(static_cast<std::uint64_t>(key) * 0x9e3779b97f4a7c15ULL));
+            const std::size_t key = prefix_rows != 0
+                                        ? (row < prefix_rows ? row / 2 : row - prefix_rows / 2)
+                                    : ordered ? row * cardinality / rows
+                                              : row % cardinality;
+            a.push_back(static_cast<std::int64_t>(dense     ? key
+                                                  : ordered ? key * 1'000'003
+                                                            : static_cast<std::uint64_t>(key) *
+                                                                  0x9e3779b97f4a7c15ULL));
             b.push_back(static_cast<std::int64_t>(key % 991));
             c.push_back(static_cast<std::int64_t>(key % 7));
             v.push_back(static_cast<std::int64_t>(row % 101));
@@ -94,6 +99,14 @@ int main(int argc, char** argv) {
     std::string shape = "pair";
     std::string aggregate = "sum";
     AggregateDiscoveryPolicy target;
+    AggregatePhasePolicy target_phase;
+    bool ordered = false;
+    bool dense = false;
+    std::size_t prefix_rows = 0;
+    app.add_option("--ordered-prefix-rows", prefix_rows,
+                   "Even-length repeated prefix, followed by unique ordered keys");
+    app.add_flag("--ordered-keys", ordered, "Emit contiguous ordered key runs");
+    app.add_flag("--dense-keys", dense, "Use small contiguous integer keys");
     app.add_option("--rows", row_counts)->delimiter(',');
     app.add_option("--cardinalities", cardinalities)->delimiter(',');
     app.add_option("--chunks", chunk_sizes, "0 means one whole-table chunk")->delimiter(',');
@@ -110,8 +123,38 @@ int main(int argc, char** argv) {
     app.add_option("--hot-job-rows", target.async_hot_job_rows)->check(CLI::PositiveNumber);
     app.add_option("--pair-max-first-chunk-rows", target.pair_owned_max_first_chunk_rows)
         ->check(CLI::PositiveNumber);
+    app.add_option("--key-fill-range-groups", target.key_fill_range_groups)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--accumulation-morsel-rows", target_phase.accumulation_morsel_rows)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--accumulation-sorted-rows", target_phase.sorted_min_rows)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--accumulation-sorted-range-rows", target_phase.sorted_range_rows)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--dense-gid-rows", target_phase.dense_gid_min_rows)->check(CLI::PositiveNumber);
+    app.add_option("--owned-range-rows", target_phase.owned_range_min_rows)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--owned-range-groups", target_phase.owned_range_min_groups)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--owned-range-morsel-rows", target_phase.owned_range_morsel_rows)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--owned-range-window-rows", target_phase.owned_range_window_rows)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--slot-init-bytes", target_phase.slot_init_min_bytes)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--merge-groups", target_phase.merge_min_groups)->check(CLI::PositiveNumber);
+    app.add_option("--merge-grain-groups", target_phase.merge_groups_per_worker)
+        ->check(CLI::PositiveNumber);
+    app.add_option("--ordered-runs", target_phase.ordered_min_runs)->check(CLI::PositiveNumber);
+    app.add_option("--ordered-grain-runs", target_phase.ordered_runs_per_worker)
+        ->check(CLI::PositiveNumber);
     CLI11_PARSE(app, argc, argv);
-    if (!target.valid()) {
+    ordered = ordered || prefix_rows != 0;
+    if (prefix_rows % 2 != 0) {
+        std::fprintf(stderr, "Ordered prefix rows must be even\n");
+        return 1;
+    }
+    if (!target.valid() || !target_phase.valid()) {
         std::fprintf(stderr, "Policy rows and grains must be positive\n");
         return 1;
     }
@@ -137,14 +180,19 @@ int main(int argc, char** argv) {
             throw std::runtime_error(lowered.error().message);
         std::puts(
             "rows,cardinality,chunk_rows,cores,shape,aggregate,repeat,side,ms,cpu_ms,source_rows,"
-            "groups,fanouts");
+            "groups,fanouts,fields,finalizes");
         for (const auto rows : row_counts)
             for (const auto requested : cardinalities)
                 for (const auto chunk_rows : chunk_sizes) {
                     if (rows == 0 || requested == 0)
                         throw std::runtime_error("Rows and cardinalities must be positive");
                     const std::size_t cardinality = std::min(requested, rows);
-                    const auto chunks = prepare(rows, cardinality, chunk_rows, shape == "generic");
+                    if (prefix_rows != 0 &&
+                        (prefix_rows > rows || cardinality != rows - prefix_rows / 2))
+                        throw std::runtime_error(
+                            "Prefix fixture cardinality must equal rows - prefix_rows / 2");
+                    const auto chunks = prepare(rows, cardinality, chunk_rows, shape == "generic",
+                                                ordered, dense, prefix_rows);
                     std::size_t offered = 0;
                     ExternRegistry externs;
                     externs.register_chunked_table("policy_input", [&](const ExternArgs&) {
@@ -163,11 +211,12 @@ int main(int argc, char** argv) {
                     const auto integer = [&](const char* name, std::size_t group) {
                         return std::get<Column<std::int64_t>>(*reference->find(name))[group];
                     };
-                    // Group g first appears at row g, then repeats every cardinality
-                    // rows. Check serial execution against this independent formula.
+                    // Check each serial group against the generator's independent formula.
                     for (std::size_t group = 0; group < cardinality; ++group) {
                         const auto key = static_cast<std::int64_t>(
-                            static_cast<std::uint64_t>(group) * 0x9e3779b97f4a7c15ULL);
+                            dense     ? group
+                            : ordered ? group * 1'000'003
+                                      : static_cast<std::uint64_t>(group) * 0x9e3779b97f4a7c15ULL);
                         if (integer("a", group) != key)
                             throw std::runtime_error("Incorrect reference group order");
                         if ((shape == "pair" || shape == "packed") &&
@@ -180,13 +229,23 @@ int main(int argc, char** argv) {
                             std::get<Column<double>>(*reference->find("f"))[group] !=
                                 static_cast<double>(group % 17) * 0.25)
                             throw std::runtime_error("Incorrect reference floating key");
+                        const auto first_row =
+                            prefix_rows != 0
+                                ? (group < prefix_rows / 2 ? group * 2 : group + prefix_rows / 2)
+                            : ordered ? (group * rows + cardinality - 1) / cardinality
+                                      : group;
+                        const auto end_row =
+                            prefix_rows != 0 ? first_row + (group < prefix_rows / 2 ? 2 : 1)
+                            : ordered        ? ((group + 1) * rows + cardinality - 1) / cardinality
+                                             : rows;
+                        const auto step = ordered ? std::size_t{1} : cardinality;
                         if (aggregate != "sum" &&
                             integer("n", group) !=
-                                static_cast<std::int64_t>((rows - 1 - group) / cardinality + 1))
+                                static_cast<std::int64_t>((end_row - 1 - first_row) / step + 1))
                             throw std::runtime_error("Incorrect reference count");
                         if (aggregate != "count") {
                             std::int64_t sum = 0;
-                            for (std::size_t row = group; row < rows; row += cardinality)
+                            for (std::size_t row = first_row; row < end_row; row += step)
                                 sum += static_cast<std::int64_t>(row % 101);
                             if (integer("s", group) != sum)
                                 throw std::runtime_error("Incorrect reference sum");
@@ -201,6 +260,8 @@ int main(int argc, char** argv) {
                             exec.parallel_threads = cores;
                             exec.aggregate_discovery_policy =
                                 candidate ? target : AggregateDiscoveryPolicy{};
+                            exec.aggregate_phase_policy =
+                                candidate ? target_phase : AggregatePhasePolicy{};
                             ParallelPipelineStats stats;
                             exec.parallel_stats = &stats;
                             const auto cpu_start = std::clock();
@@ -220,13 +281,17 @@ int main(int argc, char** argv) {
                             if (const auto mismatch = compare_tables(*reference, *result))
                                 throw std::runtime_error(mismatch->message());
                             if (emit) {
-                                std::printf("%zu,%zu,%zu,%zu,%s,%s,%zu,%s,%.6f,%.6f,%zu,%zu,%llu\n",
-                                            rows, cardinality, chunk_rows, cores, shape.c_str(),
-                                            aggregate.c_str(), repeat,
-                                            candidate ? "target" : "default", ms, cpu_ms, offered,
-                                            result->rows(),
-                                            static_cast<unsigned long long>(
-                                                stats.parallel_aggregate_partitions.load()));
+                                std::printf(
+                                    "%zu,%zu,%zu,%zu,%s,%s,%zu,%s,%.6f,%.6f,%zu,%zu,%llu,%llu,%"
+                                    "llu\n",
+                                    rows, cardinality, chunk_rows, cores, shape.c_str(),
+                                    aggregate.c_str(), repeat, candidate ? "target" : "default", ms,
+                                    cpu_ms, offered, result->rows(),
+                                    static_cast<unsigned long long>(
+                                        stats.parallel_aggregate_partitions.load()),
+                                    static_cast<unsigned long long>(stats.parallel_fields.load()),
+                                    static_cast<unsigned long long>(
+                                        stats.parallel_aggregate_finalizes.load()));
                                 std::fflush(stdout);
                             }
                         };

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1465,7 +1466,7 @@ TEST_CASE("The plan describes a hash aggregate's structural fan-out policies",
         REQUIRE(nodes.accumulation.parallelism.breaker_max_workers == 64);
         REQUIRE(nodes.final_ordering.parallelism.strategy ==
                 runtime::physical::PartitionStrategy::Owned);
-        REQUIRE(nodes.final_ordering.parallelism.row_floor == (1U << 17U));
+        REQUIRE(nodes.final_ordering.parallelism.row_floor == (1U << 16U));
         REQUIRE(nodes.final_ordering.parallelism.breaker_max_workers == 64);
         REQUIRE(nodes.emission.parallelism.strategy ==
                 runtime::physical::PartitionStrategy::ColumnRange);
@@ -2730,8 +2731,8 @@ TEST_CASE("Aggregate discovery rejects zero floors and grains before execution",
     using Policy = runtime::AggregateDiscoveryPolicy;
     auto tree = require_ir("trades[select { n = count() }, by price];");
     for (const auto field :
-         {&Policy::packed_min_rows, &Policy::sorted_range_rows, &Policy::async_hot_job_rows,
-          &Policy::pair_owned_max_first_chunk_rows}) {
+         {&Policy::packed_min_rows, &Policy::key_fill_range_groups, &Policy::sorted_range_rows,
+          &Policy::async_hot_job_rows, &Policy::pair_owned_max_first_chunk_rows}) {
         runtime::ExecutionContext exec;
         exec.parallel_threads = 8;
         exec.aggregate_discovery_policy.emplace();
@@ -2791,5 +2792,324 @@ TEST_CASE("Aggregate discovery policy controls async job grain and pair strategy
         const auto result = runtime::interpret(*pair, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(result.has_value());
         CHECK((stats.parallel_aggregate_partitions.load() > 0) == (cutoff > 1));
+    }
+}
+
+namespace {
+auto phase_policy_input(std::size_t rows, std::size_t groups, bool sorted, bool dense)
+    -> runtime::TableRegistry {
+    runtime::Table table;
+    Column<std::int64_t> a, b, c, v;
+    for (std::size_t row = 0; row < rows; ++row) {
+        const auto group = sorted ? row * groups / rows : row % groups;
+        a.push_back(dense    ? static_cast<std::int64_t>(group)
+                    : sorted ? static_cast<std::int64_t>(group * 1'000'003)
+                             : static_cast<std::int64_t>(group * 0x9e3779b97f4a7c15ULL));
+        b.push_back(static_cast<std::int64_t>(group % 17));
+        c.push_back(static_cast<std::int64_t>(group % 3));
+        v.push_back(static_cast<std::int64_t>(row % 101));
+    }
+    table.add_column("a", std::move(a));
+    table.add_column("b", std::move(b));
+    table.add_column("c", std::move(c));
+    table.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("input", std::move(table));
+    return registry;
+}
+
+auto checked_policy_tasks(const ir::Node& tree, const runtime::TableRegistry& registry,
+                          runtime::ExecutionContext exec, std::string_view phase) -> std::uint64_t {
+    auto serial = exec;
+    serial.parallel_threads = 1;
+    serial.execution_profile.reset();
+    const auto reference = runtime::interpret(tree, registry, nullptr, nullptr, nullptr, serial);
+    INFO((reference ? "reference succeeds" : reference.error()));
+    REQUIRE(reference.has_value());
+    exec.parallel_threads = 8;
+    exec.execution_profile = std::make_shared<runtime::ExecutionProfileState>(8, false);
+    const auto result = runtime::interpret(tree, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(result.has_value());
+    const auto mismatch = runtime::compare_tables(*reference, *result);
+    INFO((mismatch ? mismatch->message() : "tables agree"));
+    CHECK_FALSE(mismatch.has_value());
+    std::uint64_t tasks = 0;
+    for (const auto& row : exec.execution_profile->snapshot())
+        if (phase.empty() || row.label == phase)
+            tasks += row.pool_tasks;
+    return tasks;
+}
+
+auto disabled_aggregate_phase_policy() -> runtime::AggregatePhasePolicy {
+    runtime::AggregatePhasePolicy policy;
+    policy.accumulation_morsel_rows = 1'000'000;
+    policy.sorted_min_rows = 1'000'000;
+    policy.dense_gid_min_rows = 1'000'000;
+    policy.owned_range_min_rows = 1'000'000;
+    policy.slot_init_min_bytes = 1'000'000'000;
+    return policy;
+}
+}  // namespace
+
+TEST_CASE("Aggregate phase floors derive from strategy policy and reject invalid grains",
+          "[physical][aggregate][phase-policy]") {
+    using Policy = runtime::AggregatePhasePolicy;
+    Policy policy;
+    CHECK(runtime::physical::aggregate_accumulation_parallelism().row_floor == 131072);
+    CHECK(runtime::physical::aggregate_final_ordering_parallelism().row_floor == 65536);
+    for (const auto field : {&Policy::accumulation_morsel_rows, &Policy::sorted_min_rows,
+                             &Policy::dense_gid_min_rows, &Policy::owned_range_min_rows}) {
+        auto tuned = policy;
+        tuned.*field = 1000;
+        CHECK(runtime::physical::aggregate_accumulation_parallelism({}, tuned).row_floor ==
+              (field == &Policy::accumulation_morsel_rows ? 2000 : 1000));
+    }
+    policy.accumulation_morsel_rows = std::numeric_limits<std::size_t>::max();
+    CHECK(policy.accumulation_floor() == 262144);  // doubling must not overflow
+    const auto tree = require_ir("trades[select { n = count() }, by price];");
+    for (const auto field :
+         {&Policy::accumulation_morsel_rows, &Policy::sorted_min_rows, &Policy::sorted_range_rows,
+          &Policy::dense_gid_min_rows, &Policy::owned_range_min_rows,
+          &Policy::owned_range_min_groups, &Policy::owned_range_morsel_rows,
+          &Policy::owned_range_window_rows, &Policy::slot_init_min_bytes, &Policy::merge_min_groups,
+          &Policy::merge_groups_per_worker, &Policy::ordered_min_runs,
+          &Policy::ordered_runs_per_worker}) {
+        runtime::ExecutionContext exec;
+        exec.aggregate_phase_policy.emplace();
+        (*exec.aggregate_phase_policy).*field = 0;
+        const auto result =
+            runtime::interpret(*tree, trades_registry(), nullptr, nullptr, nullptr, exec);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("aggregate phase policy") != std::string::npos);
+    }
+}
+
+TEST_CASE("Accumulation overrides admit private sorted and dense strategies below old phase floor",
+          "[physical][aggregate][phase-policy]") {
+    using Policy = runtime::AggregatePhasePolicy;
+    struct Case {
+        const char* name;
+        std::size_t Policy::* floor;
+        std::size_t groups;
+        bool sorted;
+        bool dense;
+    };
+    for (const auto& c :
+         std::vector<Case>{{"private", &Policy::accumulation_morsel_rows, 8, false, true},
+                           {"sorted", &Policy::sorted_min_rows, 10000, true, false},
+                           {"dense", &Policy::dense_gid_min_rows, 10000, false, true}}) {
+        INFO(c.name);
+        const auto registry = phase_policy_input(20000, c.groups, c.sorted, c.dense);
+        const auto tree = require_ir("input[select { n = count(), s = sum(v) }, by a];");
+        for (const bool lowered : {false, true}) {
+            INFO(lowered);
+            runtime::ExecutionContext exec;
+            exec.aggregate_phase_policy = disabled_aggregate_phase_policy();
+            (*exec.aggregate_phase_policy).*c.floor = lowered ? 1000 : 1'000'000;
+            exec.aggregate_phase_policy->sorted_range_rows = 1000;
+            if (c.sorted) {
+                exec.aggregate_discovery_policy.emplace();
+                exec.aggregate_discovery_policy->sorted_min_rows = 1000;
+                exec.aggregate_discovery_policy->sorted_range_rows = 1000;
+            }
+            const auto tasks = checked_policy_tasks(*tree, registry, exec,
+                                                    c.sorted ? "Aggregate.Accumulation" : "");
+            CHECK((tasks > 0) == lowered);
+        }
+    }
+}
+
+TEST_CASE("Owned-range thresholds and grains control work without changing row order",
+          "[physical][aggregate][phase-policy]") {
+    const auto registry = phase_policy_input(100000, 50000, false, false);
+    const auto tree = require_ir("input[select { n = count(), s = sum(v) }, by a];");
+    runtime::ExecutionContext exec;
+    exec.aggregate_phase_policy = disabled_aggregate_phase_policy();
+    exec.aggregate_phase_policy->owned_range_min_rows = 1000;
+    exec.aggregate_phase_policy->owned_range_min_groups = 1000;
+    exec.aggregate_phase_policy->owned_range_morsel_rows = 5000;
+    exec.aggregate_phase_policy->owned_range_window_rows = 11000;  // partial last morsel/window
+    CHECK(checked_policy_tasks(*tree, registry, exec, "Aggregate.Accumulation") > 0);
+    exec.aggregate_phase_policy->owned_range_min_groups = 1'000'000;
+    CHECK(checked_policy_tasks(*tree, registry, exec, "Aggregate.Accumulation") == 0);
+}
+
+TEST_CASE("FinalOrdering uses merge and ordered-run floors before plan admission",
+          "[physical][aggregate][phase-policy]") {
+    for (const bool sorted : {false, true}) {
+        INFO(sorted);
+        const auto registry = phase_policy_input(20000, sorted ? 5000 : 20000, sorted, false);
+        const auto tree = require_ir("input[select { n = count() }, by a];");
+        for (const bool lowered : {false, true}) {
+            runtime::ExecutionContext exec;
+            exec.aggregate_discovery_policy.emplace();
+            exec.aggregate_discovery_policy->int_owned_min_rows = 1000;
+            exec.aggregate_phase_policy.emplace();
+            exec.aggregate_phase_policy->merge_min_groups = lowered ? 1000 : 1'000'000;
+            exec.aggregate_phase_policy->ordered_min_runs = lowered ? 1000 : 1'000'000;
+            exec.aggregate_phase_policy->merge_groups_per_worker = 1000;
+            exec.aggregate_phase_policy->ordered_runs_per_worker = 1000;
+            CHECK((checked_policy_tasks(*tree, registry, exec, "Aggregate.FinalOrdering") > 0) ==
+                  lowered);
+        }
+    }
+    // Regression: 75,904 ordered runs clear the kernel's 64k floor but the old
+    // 128k phase floor vetoed it when the table's exact row count was known.
+    auto registry = phase_policy_input(80000, 80000, true, false);
+    Column<std::int64_t> clustered;
+    for (std::int64_t row = 0; row < 80000; ++row)
+        clustered.push_back((row < 8192 ? row / 2 : row - 4096) * 1'000'003);
+    runtime::Table clustered_table;
+    clustered_table.add_column("a", std::move(clustered));
+    registry.at("input") = std::move(clustered_table);
+    const auto tree = require_ir("input[select { n = count() }, by a];");
+    CHECK(checked_policy_tasks(*tree, registry, {}, "Aggregate.FinalOrdering") > 0);
+}
+
+TEST_CASE("Join threshold overrides reach build probe and concatenate",
+          "[physical][join][phase-policy]") {
+    auto registry = phase_policy_input(20000, 20000, false, false);
+    auto other = phase_policy_input(10000, 5000, false, false).at("input");
+    for (auto& entry : other.columns)
+        if (entry.name != "a")
+            entry.name = "other_" + entry.name;
+    registry.emplace("other", std::move(other));
+    const auto tree = require_ir("(input join other on a);");
+    runtime::ExecutionContext exec;
+    runtime::ParallelPipelineStats stats;
+    exec.parallel_stats = &stats;
+    exec.join_threshold_policy.emplace();
+    exec.join_threshold_policy->build_min_rows = 1000;
+    exec.join_threshold_policy->probe_min_rows = 1000;
+    exec.join_threshold_policy->concat_min_rows = 1000;
+    const auto with_concat = checked_policy_tasks(*tree, registry, exec, "");
+    CHECK(stats.parallel_hash_builds.load() > 0);
+    CHECK(stats.parallel_probes.load() > 0);
+    exec.join_threshold_policy->concat_min_rows = 1'000'000;
+    const auto without_concat = checked_policy_tasks(*tree, registry, exec, "");
+    CHECK(with_concat > without_concat);
+    exec.join_threshold_policy->build_min_rows = 1'000'000;
+    exec.join_threshold_policy->probe_min_rows = 1'000'000;
+    stats.parallel_hash_builds.store(0);
+    stats.parallel_probes.store(0);
+    checked_policy_tasks(*tree, registry, exec, "");
+    CHECK(stats.parallel_hash_builds.load() == 0);
+    CHECK(stats.parallel_probes.load() == 0);
+}
+
+TEST_CASE("Semi right passes and radix strategies consume their runtime thresholds",
+          "[physical][phase-policy]") {
+    SECTION("semi right intersection") {
+        auto registry = phase_policy_input(20000, 20000, false, false);
+        const auto right = phase_policy_input(100000, 100000, false, false);
+        registry.emplace("other", right.at("input"));
+        const auto tree = require_ir("(input semi join other on a);");
+        runtime::ExecutionContext exec;
+        exec.join_threshold_policy.emplace();
+        exec.join_threshold_policy->probe_min_rows = 1'000'000;
+        exec.join_threshold_policy->semi_right_min_rows = 1000;
+        const auto admitted = checked_policy_tasks(*tree, registry, exec, "");
+        exec.join_threshold_policy->semi_right_min_rows = 1'000'000;
+        CHECK(admitted > checked_policy_tasks(*tree, registry, exec, ""));
+    }
+    SECTION("radix strategy switch") {
+        const auto registry = phase_policy_input(20000, 20000, false, false);
+        const auto tree = require_ir("input[order { a }];");
+        runtime::ExecutionContext exec;
+        exec.parallel_min_rows = 1000;
+        exec.radix_sort_min_rows = 1000;
+        const auto msd = checked_policy_tasks(*tree, registry, exec, "");
+        exec.radix_sort_min_rows = 1'000'000;
+        CHECK(msd > checked_policy_tasks(*tree, registry, exec, ""));
+    }
+}
+
+TEST_CASE("Join and sort reject invalid runtime thresholds", "[physical][phase-policy]") {
+    const auto tree = require_ir("trades;");
+    using Policy = runtime::JoinThresholdPolicy;
+    for (const auto field : {&Policy::build_min_rows, &Policy::probe_min_rows,
+                             &Policy::concat_min_rows, &Policy::semi_right_min_rows}) {
+        runtime::ExecutionContext exec;
+        exec.join_threshold_policy.emplace();
+        (*exec.join_threshold_policy).*field = 0;
+        const auto result =
+            runtime::interpret(*tree, trades_registry(), nullptr, nullptr, nullptr, exec);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("thresholds must be positive") != std::string::npos);
+    }
+    runtime::ExecutionContext exec;
+    exec.radix_sort_min_rows = 0;
+    CHECK_FALSE(
+        runtime::interpret(*tree, trades_registry(), nullptr, nullptr, nullptr, exec).has_value());
+}
+
+TEST_CASE("Aggregate grains change submitted work and preserve results",
+          "[physical][aggregate][phase-policy]") {
+    SECTION("private morsels") {
+        const auto registry = phase_policy_input(20000, 8, false, true);
+        const auto tree = require_ir("input[select { n = count(), s = sum(v) }, by a];");
+        runtime::ExecutionContext exec;
+        exec.aggregate_phase_policy = disabled_aggregate_phase_policy();
+        exec.aggregate_phase_policy->accumulation_morsel_rows = 1000;
+        const auto small = checked_policy_tasks(*tree, registry, exec, "");
+        exec.aggregate_phase_policy->accumulation_morsel_rows = 5000;
+        CHECK(small > checked_policy_tasks(*tree, registry, exec, ""));
+    }
+    SECTION("sorted ranges") {
+        const auto registry = phase_policy_input(20000, 10000, true, false);
+        const auto tree = require_ir("input[select { n = count(), s = sum(v) }, by a];");
+        runtime::ExecutionContext exec;
+        exec.aggregate_discovery_policy.emplace();
+        exec.aggregate_discovery_policy->sorted_min_rows = 1000;
+        exec.aggregate_phase_policy = disabled_aggregate_phase_policy();
+        exec.aggregate_phase_policy->sorted_min_rows = 1000;
+        exec.aggregate_phase_policy->sorted_range_rows = 1000;
+        const auto small = checked_policy_tasks(*tree, registry, exec, "Aggregate.Accumulation");
+        exec.aggregate_phase_policy->sorted_range_rows = 10000;
+        CHECK(small > checked_policy_tasks(*tree, registry, exec, "Aggregate.Accumulation"));
+    }
+    SECTION("key copies") {
+        const auto registry = phase_policy_input(20000, 20000, false, false);
+        const auto tree = require_ir("input[select { n = count() }, by { a, b, c }];");
+        runtime::ExecutionContext exec;
+        exec.aggregate_discovery_policy.emplace();
+        exec.aggregate_discovery_policy->packed_min_rows = 1000;
+        exec.aggregate_discovery_policy->key_fill_range_groups = 1000;
+        const auto small = checked_policy_tasks(*tree, registry, exec, "Aggregate.Discovery");
+        exec.aggregate_discovery_policy->key_fill_range_groups = 1'000'000;
+        CHECK(small > checked_policy_tasks(*tree, registry, exec, "Aggregate.Discovery"));
+    }
+    SECTION("slot initialization") {
+        const auto registry = phase_policy_input(20000, 20000, false, false);
+        const auto tree = require_ir("input[select { n = count(), s = sum(v) }, by a];");
+        runtime::ExecutionContext exec;
+        exec.aggregate_discovery_policy.emplace();
+        exec.aggregate_discovery_policy->radix_min_rows = 1000;
+        exec.aggregate_phase_policy = disabled_aggregate_phase_policy();
+        // Admit the phase; this input is unsorted and has no dense domain.
+        exec.aggregate_phase_policy->sorted_min_rows = 1000;
+        exec.aggregate_phase_policy->slot_init_min_bytes = 10000;
+        const auto small = checked_policy_tasks(*tree, registry, exec, "");
+        exec.aggregate_phase_policy->slot_init_min_bytes = 1'000'000'000;
+        CHECK(small > checked_policy_tasks(*tree, registry, exec, ""));
+    }
+    SECTION("final ordering grains") {
+        for (const bool sorted : {false, true}) {
+            const auto registry = phase_policy_input(20000, sorted ? 5000 : 20000, sorted, false);
+            const auto tree = require_ir("input[select { n = count() }, by a];");
+            runtime::ExecutionContext exec;
+            exec.aggregate_discovery_policy.emplace();
+            exec.aggregate_discovery_policy->int_owned_min_rows = 1000;
+            exec.aggregate_phase_policy.emplace();
+            exec.aggregate_phase_policy->merge_min_groups = 1000;
+            exec.aggregate_phase_policy->ordered_min_runs = 1000;
+            exec.aggregate_phase_policy->merge_groups_per_worker = 1000;
+            exec.aggregate_phase_policy->ordered_runs_per_worker = 1000;
+            const auto small =
+                checked_policy_tasks(*tree, registry, exec, "Aggregate.FinalOrdering");
+            exec.aggregate_phase_policy->merge_groups_per_worker = 50000;
+            exec.aggregate_phase_policy->ordered_runs_per_worker = 50000;
+            CHECK(small > checked_policy_tasks(*tree, registry, exec, "Aggregate.FinalOrdering"));
+        }
     }
 }

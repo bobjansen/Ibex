@@ -382,6 +382,10 @@ namespace {
 /// and `build_physical_distinct` share the dedup policy.
 auto resolve_join_parallelism(physical::JoinParallelism par, const ExecutionContext& exec)
     -> physical::JoinParallelism {
+    if (exec.join_threshold_policy) {
+        par.build.row_floor = exec.join_thresholds().build_min_rows;
+        par.probe.row_floor = exec.join_thresholds().probe_min_rows;
+    }
     // The pool is sized for decode and spawns its threads on first touch, so a
     // serial query must not construct it just to learn it is serial.
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
@@ -420,6 +424,15 @@ auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
         }
         par.discovery_policy = *exec.aggregate_discovery_policy;
         par.discovery.row_floor = par.discovery_policy.admission_floor();
+    }
+    if (exec.aggregate_phase_policy.has_value()) {
+        if (!exec.aggregate_phase_policy->valid()) {
+            return std::unexpected(
+                "aggregate phase policy requires positive thresholds and grains");
+        }
+        par.phase_policy = *exec.aggregate_phase_policy;
+        par.accumulation.row_floor = par.phase_policy.accumulation_floor();
+        par.final_ordering.row_floor = par.phase_policy.final_ordering_floor();
     }
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
     physical::resolve_breaker_parallelism(par.discovery, exec, pool_size);
@@ -971,6 +984,10 @@ auto build_operator_from_physical_plan(const physical::Plan& plan, const ir::Nod
                                        const ExternRegistry* externs, const ExecutionContext& exec,
                                        ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
+    if ((exec.join_threshold_policy && !exec.join_threshold_policy->valid()) ||
+        exec.radix_sort_min_rows == 0) {
+        return std::unexpected("join/sort thresholds must be positive");
+    }
     if (!plan.migrated) {
         return std::unexpected("physical executor: plan does not migrate its root");
     }
@@ -1244,6 +1261,10 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
+    if ((exec.join_threshold_policy && !exec.join_threshold_policy->valid()) ||
+        exec.radix_sort_min_rows == 0) {
+        return std::unexpected("join/sort thresholds must be positive");
+    }
     if (exec.execution_profile == nullptr) {
         return build_operator_impl(node, registry, scalars, externs, exec, model_out);
     }

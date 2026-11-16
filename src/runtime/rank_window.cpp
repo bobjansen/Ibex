@@ -296,7 +296,8 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         if (group_entries.empty()) {
             // Ungrouped: one run, so there is nothing to bucket and the whole
             // table is the slice.
-            auto sort_result = radix_sort_u64_asc(std::move(codes), rows);
+            auto sort_result =
+                radix_sort_u64_asc(std::move(codes), rows, 1, exec.radix_sort_min_rows);
             idx.resize(rows);
             std::visit(
                 [&](const auto& sorted) {

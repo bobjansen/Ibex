@@ -1011,7 +1011,6 @@ struct JoinProbe {
         // again. Each part's destination slice is disjoint and known, so the
         // copies go back to the workers; below the threshold the batch costs
         // more than the memcpy it spreads.
-        constexpr std::size_t kMinParallelConcatRows = 1U << 16U;
         const auto copy_part = [&](std::size_t w, std::size_t at) {
             const auto& part = probe_parts_[w];
             std::ranges::copy(part.li, li.begin() + static_cast<std::ptrdiff_t>(at));
@@ -1023,7 +1022,7 @@ struct JoinProbe {
             part_offsets_[w] = at;
             at += probe_parts_[w].li.size();
         }
-        if (total >= kMinParallelConcatRows) {
+        if (total >= exec_->join_thresholds().concat_min_rows) {
             auto batch =
                 pool.submit(workers, [&](std::size_t w) { copy_part(w, part_offsets_[w]); });
             batch.wait();

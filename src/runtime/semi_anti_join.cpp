@@ -422,7 +422,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// floor as `filter_rows`; no byte budget, since no worker keeps a copy.
     [[nodiscard]] auto right_pass_worker_count() const -> std::size_t {
         if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() ||
-            right_rows_ < kMinParallelPredicateRows) {
+            right_rows_ < exec_->join_thresholds().semi_right_min_rows) {
             return 0;
         }
         const std::size_t workers =
@@ -447,7 +447,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         -> std::size_t {
         constexpr std::size_t kSlotBudgetBytes = 8UL << 20;
         if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() || slots == 0 ||
-            right_rows < kMinParallelPredicateRows) {
+            right_rows < exec_->join_thresholds().semi_right_min_rows) {
             return 0;
         }
         const auto& pool = process_worker_pool();
@@ -1132,13 +1132,6 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         return "ChunkedSemiAntiJoinOperator: unsupported key type";
     }
 
-    // Below this the fan-out costs more than the probes it splits: a probe runs
-    // at ~10ns/row, so a 1<<16 chunk is a ~0.6ms pass, and there is nothing
-    // there for eight threads to divide. The queries this split exists for are
-    // two orders of magnitude past the gate either way -- q21 probes 21.5M rows
-    // -- so it is set where a mistake is cheap rather than where it is tight.
-    static constexpr std::size_t kMinParallelPredicateRows = 1U << 18U;
-
     /// The rows of `t` that `pred` keeps, through the filter operator's own
     /// machinery. Each morsel packs its keep bits a 64-row word at a time,
     /// with no branch on the predicate, and counts its string bytes; the
@@ -1171,7 +1164,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         // thread lost to the inner join a semi join replaces (Q11, once the
         // adapter's joins became visible to `reduce_inner_joins_to_semi`).
         if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
-            rows >= physical::join_probe_parallelism().row_floor &&
+            rows >= exec_->join_thresholds().probe_min_rows &&
             filter_gather_is_thread_safe(t, layout->src_of_dst)) {
             // `submit` clamps its worker count to the pool size, so more
             // morsels than that would leave some unvisited.

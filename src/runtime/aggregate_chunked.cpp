@@ -3514,14 +3514,15 @@ class HashAggregateState final {
         // steps by exactly one at each value and so equals any target rank at
         // exactly one `v`. Each worker then merges the disjoint input slices
         // between two frontiers into its disjoint output slice.
-        // The FinalOrdering node's worker ceiling and fan-out permission are the
-        // plan's (src/runtime/PARALLELISM.md); `part_count` and `total / 4096`
-        // stay here -- they need the group count discovery just produced. The
-        // `1U << 17U` group floor is this merge's own threshold, beside it.
+        // The plan owns permission and the worker ceiling. The resolved policy
+        // supplies the group floor and per-worker grain; only the observed
+        // partition and group counts are derived here.
         std::size_t workers = 1;
         if (exec_ != nullptr && par_.final_ordering.decline == physical::FanOutDecline::None &&
-            !on_worker_pool_thread() && part_count >= 2 && total >= std::size_t{1} << 17U) {
-            workers = std::min({par_.final_ordering.worker_cap, part_count, total / 4096});
+            !on_worker_pool_thread() && part_count >= 2 &&
+            total >= phase_policy().merge_min_groups) {
+            workers = std::min({par_.final_ordering.worker_cap, part_count,
+                                total / phase_policy().merge_groups_per_worker});
         }
 
         if (workers < 2) {
@@ -3845,13 +3846,13 @@ class HashAggregateState final {
             // Each worker owns a contiguous run slice; a key straddling a slice
             // boundary has its leading partial count carried back to the group
             // the previous worker finished (at most `workers - 1` fixups).
-            // Ceiling and permission from the plan; `run_count / 8192` and this
-            // path's own `1U << 16U` run floor stay here (the ordered-run merge
-            // is a strategy specialization, floor beside its code).
+            // The plan owns permission and the ceiling; the policy supplies
+            // this strategy's run floor and per-worker grain.
             std::size_t workers = 1;
             if (exec_ != nullptr && par_.final_ordering.decline == physical::FanOutDecline::None &&
-                !on_worker_pool_thread() && run_count >= (std::size_t{1} << 16U)) {
-                workers = std::min({par_.final_ordering.worker_cap, run_count / 8192});
+                !on_worker_pool_thread() && run_count >= phase_policy().ordered_min_runs) {
+                workers = std::min({par_.final_ordering.worker_cap,
+                                    run_count / phase_policy().ordered_runs_per_worker});
             }
 
             std::size_t total = 0;
@@ -4348,7 +4349,7 @@ class HashAggregateState final {
         // 64-bit keys measure their domain, so the array must also be denser
         // than the data (the single-int path's rule).
         const std::uint64_t rows_per_cell =
-            rows >= kParallelDenseGidRows ? kIntDenseRowsPerCell : 4;
+            rows >= phase_policy().dense_gid_min_rows ? kIntDenseRowsPerCell : 4;
         if (require_density && !pair_dense_active_ && cells * rows_per_cell > rows) {
             return false;
         }
@@ -4546,7 +4547,7 @@ class HashAggregateState final {
         // (`try_assign_dense_gids_parallel`'s 2^20 rows): smaller chunks keep
         // four, and the streamed and partitioned paths built for them.
         const std::uint64_t rows_per_cell =
-            rows >= kParallelDenseGidRows ? kIntDenseRowsPerCell : 4;
+            rows >= phase_policy().dense_gid_min_rows ? kIntDenseRowsPerCell : 4;
         const bool fits = span != 0 && span <= kIntDenseCellLimit &&
                           (int_dense_active_ || span * rows_per_cell <= rows);
         if (!fits) {
@@ -4662,7 +4663,7 @@ class HashAggregateState final {
                                         const CellAt& cell_at, const Grow& grow,
                                         const Record& record, std::uint32_t* gids) -> bool {
         constexpr std::uint32_t kUnseen = std::numeric_limits<std::uint32_t>::max();
-        if (rows < kParallelDenseGidRows || rows >= kUnseen || exec_ == nullptr ||
+        if (rows < phase_policy().dense_gid_min_rows || rows >= kUnseen || exec_ == nullptr ||
             par_.accumulation.decline != physical::FanOutDecline::None ||
             par_.accumulation.worker_cap < 2 || on_worker_pool_thread()) {
             return false;
@@ -4861,11 +4862,6 @@ class HashAggregateState final {
     /// Set once the one-core sample (`sample_mostly_distinct`) said no.
     mutable bool single_core_sample_declined_ = false;
 
-    /// Accumulation retains its own sorted-range defaults. Discovery reads
-    /// sorted_min_rows and sorted_range_rows from its runtime policy instead.
-    static constexpr std::size_t kSortedAccumulationMinRows = std::size_t{1} << 18;
-    /// Rows per range of the sorted-chunk numbering, at least.
-    static constexpr std::size_t kSortedAccumulationRangeRows = std::size_t{1} << 16;
     /// Set once a chunk was found not sorted, so later chunks skip the check.
     bool sorted_int_declined_ = false;
     bool sorted_pair_declined_ = false;
@@ -5648,8 +5644,7 @@ class HashAggregateState final {
         // Sized so the batch (a submit plus a join) stays small against the
         // work. Below a few megabytes the serial memset is already
         // bandwidth-bound and has no faults left to hide.
-        constexpr std::size_t kMinTailBytes = 4UL << 20;
-        if (tail.size() * sizeof(AggSlotCore) < kMinTailBytes) {
+        if (tail.size() * sizeof(AggSlotCore) < phase_policy().slot_init_min_bytes) {
             return false;
         }
         if (exec_ == nullptr || par_.accumulation.decline != physical::FanOutDecline::None ||
@@ -6872,9 +6867,9 @@ class HashAggregateState final {
         group_keys_.prepare_fill_from(first, count, stores);
 
         const std::size_t columns = group_keys_.columns();
-        constexpr std::size_t kMinRangeRows = std::size_t{1} << 16;
-        const std::size_t ranges = std::clamp<std::size_t>(count / kMinRangeRows, 1,
-                                                           std::max<std::size_t>(1, workers * 4));
+        const std::size_t ranges =
+            std::clamp<std::size_t>(count / discovery_policy().key_fill_range_groups, 1,
+                                    std::max<std::size_t>(1, workers * 4));
         const std::size_t grain = (count + ranges - 1) / ranges;
         const auto range_of = [&](std::size_t r) {
             const std::size_t lo = std::min(count, r * grain);
@@ -6929,9 +6924,9 @@ class HashAggregateState final {
         const std::size_t columns = group_entries.size();
         const std::size_t workers =
             on_worker_pool_thread() ? std::size_t{1} : par_.discovery.worker_cap;
-        constexpr std::size_t kMinRangeRows = std::size_t{1} << 16;
-        const std::size_t ranges = std::clamp<std::size_t>(rows.size() / kMinRangeRows, 1,
-                                                           std::max<std::size_t>(1, workers * 4));
+        const std::size_t ranges =
+            std::clamp<std::size_t>(rows.size() / discovery_policy().key_fill_range_groups, 1,
+                                    std::max<std::size_t>(1, workers * 4));
         const std::size_t grain = (rows.size() + ranges - 1) / ranges;
         const auto fan = [&](const auto& body, std::size_t task_columns = 0) {
             const std::size_t tasks = (task_columns == 0 ? columns : task_columns) * ranges;
@@ -7211,10 +7206,10 @@ class HashAggregateState final {
     /// equal ranges finish together, so unlike a filter there is no imbalance
     /// to hedge against and every extra morsel is pure dispatch and merge
     /// overhead. The cap bounds the partial array.
-    [[nodiscard]] static auto morsel_cut_from_rows(std::size_t rows) -> std::size_t {
-        constexpr std::size_t kMinRowsPerMorsel = 65536;
+    [[nodiscard]] auto morsel_cut_from_rows(std::size_t rows) const -> std::size_t {
         constexpr std::size_t kMaxMorsels = 64;
-        return std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
+        return std::clamp<std::size_t>(rows / phase_policy().accumulation_morsel_rows, 1,
+                                       kMaxMorsels);
     }
 
     [[nodiscard]] auto dense_morsel_count(std::size_t n_cells, std::size_t rows) const
@@ -7338,13 +7333,10 @@ class HashAggregateState final {
                                      const std::vector<const ColumnEntry*>& agg_entries,
                                      std::size_t rows,
                                      const std::vector<std::uint8_t>* skip = nullptr) -> bool {
-        constexpr std::size_t kMinRows = std::size_t{1} << 20;
-        constexpr std::size_t kMinGroups = std::size_t{1} << 16;
-        constexpr std::size_t kMorselRows = std::size_t{1} << 16;
-        constexpr std::size_t kWindowRows = std::size_t{1} << 22;
         // Slots one owner holds, sized to sit in a core's L2.
         constexpr std::size_t kRangeBytes = std::size_t{1} << 20;
-        if (rows < kMinRows || n_groups_ < kMinGroups || exec_ == nullptr ||
+        if (rows < phase_policy().owned_range_min_rows ||
+            n_groups_ < phase_policy().owned_range_min_groups || exec_ == nullptr ||
             par_.accumulation.decline != physical::FanOutDecline::None ||
             par_.accumulation.worker_cap < 2 || on_worker_pool_thread()) {
             return false;
@@ -7394,13 +7386,15 @@ class HashAggregateState final {
             std::vector<std::uint32_t> gids;
             std::vector<ColumnEntry> values;  // per aggregate; unset when not gathered
         };
-        for (std::size_t w0 = 0; w0 < rows; w0 += kWindowRows) {
-            const std::size_t w1 = std::min(rows, w0 + kWindowRows);
-            const std::size_t n_morsels = (w1 - w0 + kMorselRows - 1) / kMorselRows;
+        for (std::size_t w0 = 0; w0 < rows;) {
+            const std::size_t w1 = w0 + std::min(rows - w0, phase_policy().owned_range_window_rows);
+            const std::size_t n_morsels =
+                1 + (w1 - w0 - 1) / phase_policy().owned_range_morsel_rows;
             std::vector<Block> blocks(n_morsels);
             fan(n_morsels, [&](std::size_t m) {
-                const std::size_t begin = w0 + (m * kMorselRows);
-                const std::size_t end = std::min(w1, begin + kMorselRows);
+                const std::size_t begin = w0 + (m * phase_policy().owned_range_morsel_rows);
+                const std::size_t end =
+                    begin + std::min(w1 - begin, phase_policy().owned_range_morsel_rows);
                 Block& block = blocks[m];
                 std::vector<std::size_t>& start = block.start;
                 start.assign(n_ranges + 1, 0);
@@ -7449,6 +7443,7 @@ class HashAggregateState final {
                                             skip);
                 }
             });
+            w0 = w1;
         }
         if (exec_->parallel_stats != nullptr) {
             exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
@@ -7468,7 +7463,7 @@ class HashAggregateState final {
     auto try_accumulate_ascending(const std::uint32_t* gids,
                                   const std::vector<const ColumnEntry*>& agg_entries,
                                   std::size_t rows, const std::vector<std::uint8_t>* skip) -> bool {
-        if (rows < kSortedAccumulationMinRows || exec_ == nullptr ||
+        if (rows < phase_policy().sorted_min_rows || exec_ == nullptr ||
             par_.accumulation.decline != physical::FanOutDecline::None ||
             par_.accumulation.worker_cap < 2 || on_worker_pool_thread()) {
             return false;
@@ -7483,7 +7478,7 @@ class HashAggregateState final {
             }
         }
         const std::size_t workers = par_.accumulation.worker_cap;
-        const std::size_t ranges = std::min(workers * 4, rows / kSortedAccumulationRangeRows);
+        const std::size_t ranges = std::min(workers * 4, rows / phase_policy().sorted_range_rows);
         if (ranges < 2) {
             return false;
         }
@@ -9758,8 +9753,6 @@ class HashAggregateState final {
     // Single-integer dense path (`try_process_rows_int_dense`): `key - min`
     // indexes `int_dense_gid_`; `int_order_` stays the key of each group.
     static constexpr std::uint64_t kIntDenseRowsPerCell = 2;
-    /// Rows below which `try_assign_dense_gids_parallel` declines.
-    static constexpr std::size_t kParallelDenseGidRows = std::size_t{1} << 20;
     /// The single-int dense path's own bound. Its cells are a u32 gid each
     /// (plus a u32 first row while numbering), and at two rows a cell that is
     /// at most 4 bytes per row; h2o q5 at K=2 is 5e6 ids over 1e7 rows, and
@@ -9941,6 +9934,9 @@ class HashAggregateState final {
     /// Accumulation retains its ordered-run and dense-GID thresholds.
     [[nodiscard]] auto discovery_policy() const noexcept -> const AggregateDiscoveryPolicy& {
         return par_.discovery_policy;
+    }
+    [[nodiscard]] auto phase_policy() const noexcept -> const AggregatePhasePolicy& {
+        return par_.phase_policy;
     }
     physical::AggregateParallelism par_{};
     ExecutionProfileEntry* discovery_profile_ = nullptr;

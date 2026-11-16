@@ -1596,7 +1596,8 @@ class ChunkedOrderedLimitOperator final : public Operator {
                     gathered[i] = key[order[i]];
                 }
             });
-            const SortIdx sorted = radix_sort_u64_asc(std::move(gathered), n, workers);
+            const SortIdx sorted =
+                radix_sort_u64_asc(std::move(gathered), n, workers, exec_.radix_sort_min_rows);
             std::vector<std::uint64_t> next(n);
             std::visit(
                 [&](const auto& idx) {

@@ -120,10 +120,6 @@ void radix_sort_by_key_serial(std::vector<std::uint64_t> src_keys, std::vector<I
         idx = std::move(*src_i);
 }
 
-/// Below this many rows the MSD split's 65536-bucket histogram costs more
-/// than the LSD passes it saves.
-constexpr std::size_t kParallelRadixMinRows = std::size_t{1} << 16;
-
 /// Run `body(t, begin, end)` over `workers` fixed, contiguous chunks of
 /// `[0, rows)`, chunk `t` on worker `t`; inline when `workers` is 1. A radix
 /// pass needs the same chunks when it counts as when it scatters, which a
@@ -375,10 +371,11 @@ void radix_sort_by_key_msd(std::vector<std::uint64_t> src_keys, std::vector<Idx>
 
 /// Stable radix sort of `idx` by `src_keys`. A small input takes the plain
 /// LSD sort; a large one the cache-friendly MSD split, across `workers`.
+/// The context threshold balances the MSD histogram against saved LSD passes.
 template <typename Idx>
 void radix_sort_by_key(std::vector<std::uint64_t> src_keys, std::vector<Idx>& idx, std::size_t rows,
-                       std::size_t workers) {
-    if (rows < kParallelRadixMinRows) {
+                       std::size_t workers, std::size_t min_rows) {
+    if (rows < min_rows) {
         radix_sort_by_key_serial(std::move(src_keys), idx, rows);
         return;
     }
@@ -391,11 +388,11 @@ namespace {
 
 template <typename Idx>
 
-auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows, std::size_t workers)
-    -> std::vector<Idx> {
+auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows, std::size_t workers,
+                     std::size_t min_rows) -> std::vector<Idx> {
     std::vector<Idx> idx(rows);
     fill_identity(idx, workers);
-    radix_sort_by_key(std::move(src_keys), idx, rows, workers);
+    radix_sort_by_key(std::move(src_keys), idx, rows, workers, min_rows);
     return idx;
 }
 
@@ -493,11 +490,11 @@ void sort_key_index_slice(std::uint64_t* keys, std::size_t* idx, std::size_t n,
 
 // Dispatch to 32-bit indices for tables that fit, 64-bit otherwise.
 using SortIdx = std::variant<std::vector<std::uint32_t>, std::vector<std::uint64_t>>;
-auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows, std::size_t workers)
-    -> SortIdx {
+auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows, std::size_t workers,
+                        std::size_t min_rows) -> SortIdx {
     if (rows <= std::numeric_limits<std::uint32_t>::max())
-        return radix_sort_impl<std::uint32_t>(std::move(keys), rows, workers);
-    return radix_sort_impl<std::uint64_t>(std::move(keys), rows, workers);
+        return radix_sort_impl<std::uint32_t>(std::move(keys), rows, workers, min_rows);
+    return radix_sort_impl<std::uint64_t>(std::move(keys), rows, workers, min_rows);
 }
 
 // Stable multi-key sort by LSD radix: `codes[k]` holds one order-preserving u64
@@ -521,7 +518,7 @@ auto lsd_multi_radix(const std::vector<std::vector<std::uint64_t>>& codes, std::
             for (std::size_t i = begin; i < end; ++i)
                 gathered[i] = code[static_cast<std::size_t>(idx[i])];  // Index is below rows.
         });
-        radix_sort_by_key(std::move(gathered), idx, rows, workers);
+        radix_sort_by_key(std::move(gathered), idx, rows, workers, exec.radix_sort_min_rows);
     }
     return idx;
 }
@@ -1021,7 +1018,8 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     // Fast path: single ascending I64 key — radix sort (pre-sorted case already handled above).
     if (!has_null_keys && flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 &&
         flat_keys[0].ascending) {
-        auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows, sort_workers);
+        auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows, sort_workers,
+                                              exec.radix_sort_min_rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
                 return gather_rows_parallel(input, idx, &resolved_keys, exec);
@@ -1041,7 +1039,8 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             for (std::size_t i = begin; i < end; ++i)
                 radix_keys[i] = double_to_sortable_u64(f[i]);
         });
-        auto sort_result = radix_sort_u64_asc(std::move(radix_keys), rows, sort_workers);
+        auto sort_result =
+            radix_sort_u64_asc(std::move(radix_keys), rows, sort_workers, exec.radix_sort_min_rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
                 return gather_rows_parallel(input, idx, &resolved_keys, exec);

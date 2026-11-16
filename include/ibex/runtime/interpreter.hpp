@@ -10,6 +10,8 @@
 #include <ibex/core/time_zone.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/aggregate_discovery_policy.hpp>
+#include <ibex/runtime/aggregate_phase_policy.hpp>
+#include <ibex/runtime/join_threshold_policy.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
@@ -1102,6 +1104,21 @@ struct ExecutionContext {
     /// Its admission floor replaces Discovery's plan floor before row-estimate
     /// admission. Leave unset to preserve explicit physical-plan floors.
     std::optional<AggregateDiscoveryPolicy> aggregate_discovery_policy = std::nullopt;
+
+    /// Optional per-query Accumulation and FinalOrdering thresholds.
+    std::optional<AggregatePhasePolicy> aggregate_phase_policy = std::nullopt;
+
+    /// Optional row floors shared by streaming, materialized and semi/anti joins.
+    std::optional<JoinThresholdPolicy> join_threshold_policy = std::nullopt;
+
+    /// LSD-to-MSD radix strategy switch; distinct from the shared sort fan-out floor.
+    static constexpr std::size_t default_radix_sort_min_rows = 1U << 16U;
+    std::size_t radix_sort_min_rows = default_radix_sort_min_rows;
+
+    [[nodiscard]] auto join_thresholds() const noexcept -> const JoinThresholdPolicy& {
+        static const JoinThresholdPolicy defaults;
+        return join_threshold_policy ? *join_threshold_policy : defaults;
+    }
 
     /// Look up a deferred scan by its plan (instance) name, or null if there is
     /// no registry or no matching entry.

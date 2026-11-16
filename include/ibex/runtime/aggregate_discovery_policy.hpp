@@ -18,6 +18,7 @@ struct AggregateDiscoveryPolicy {
     std::size_t int_owned_min_rows = 1U << 16U;
     std::size_t pair_owned_min_rows = 1U << 16U;
     std::size_t sorted_min_rows = 1U << 18U;
+    std::size_t key_fill_range_groups = 1U << 16U;
     std::size_t sorted_range_rows = 1U << 16U;
     std::size_t async_hot_job_rows = 1U << 20U;
     std::size_t pair_owned_max_first_chunk_rows = 1U << 21U;
@@ -30,8 +31,8 @@ struct AggregateDiscoveryPolicy {
     }
 
     [[nodiscard]] constexpr auto valid() const noexcept -> bool {
-        return admission_floor() != 0 && sorted_range_rows != 0 && async_hot_job_rows != 0 &&
-               pair_owned_max_first_chunk_rows != 0;
+        return admission_floor() != 0 && key_fill_range_groups != 0 && sorted_range_rows != 0 &&
+               async_hot_job_rows != 0 && pair_owned_max_first_chunk_rows != 0;
     }
 
     auto operator==(const AggregateDiscoveryPolicy&) const -> bool = default;

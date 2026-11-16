@@ -68,15 +68,12 @@ constexpr std::size_t kPackedKeyMaxWorkers = 64;
 
 /// Fan-out floors for streaming join build and probe phases. Both phases
 /// cap workers at the minimum of the compute budget, pool size, and 64.
-constexpr std::size_t kJoinBuildRowFloor = 1U << 17U;
-constexpr std::size_t kJoinProbeRowFloor = 1U << 14U;
 constexpr std::size_t kJoinMaxWorkers = 64;
 
 /// Discovery derives its floor from AggregateDiscoveryPolicy so no strategy's
 /// admission is vetoed by a separately maintained phase constant. Accumulation
-/// starts at two 65536-row morsels; FinalOrdering uses the merge's group floor.
+/// starts at two policy-sized morsels; FinalOrdering admits both merge strategies.
 /// Groups never exceed input rows, so an input-estimate decline is safe there.
-constexpr std::size_t kAggFinalizeRowFloor = 1U << 17U;
 constexpr std::size_t kAggMaxWorkers = 64;
 
 /// The exact cardinality of a registered table scan, or `None` when its input
@@ -1104,14 +1101,14 @@ auto order_sort_parallelism() -> BreakerParallelism {
     return {.strategy = PartitionStrategy::RowRange};
 }
 
-auto join_hash_build_parallelism() -> BreakerParallelism {
-    return {.row_floor = kJoinBuildRowFloor,
+auto join_hash_build_parallelism(const JoinThresholdPolicy& policy) -> BreakerParallelism {
+    return {.row_floor = policy.build_min_rows,
             .breaker_max_workers = kJoinMaxWorkers,
             .strategy = PartitionStrategy::HeadTable};
 }
 
-auto join_probe_parallelism() -> BreakerParallelism {
-    return {.row_floor = kJoinProbeRowFloor,
+auto join_probe_parallelism(const JoinThresholdPolicy& policy) -> BreakerParallelism {
+    return {.row_floor = policy.probe_min_rows,
             .breaker_max_workers = kJoinMaxWorkers,
             .strategy = PartitionStrategy::Range};
 }
@@ -1128,15 +1125,17 @@ auto aggregate_discovery_parallelism(RowEstimate estimate, const AggregateDiscov
             .estimate = estimate};
 }
 
-auto aggregate_accumulation_parallelism(RowEstimate estimate) -> BreakerParallelism {
-    return {.row_floor = kAggFinalizeRowFloor,
+auto aggregate_accumulation_parallelism(RowEstimate estimate, const AggregatePhasePolicy& policy)
+    -> BreakerParallelism {
+    return {.row_floor = policy.accumulation_floor(),
             .breaker_max_workers = kAggMaxWorkers,
             .strategy = PartitionStrategy::Morsel,
             .estimate = estimate};
 }
 
-auto aggregate_final_ordering_parallelism(RowEstimate estimate) -> BreakerParallelism {
-    return {.row_floor = kAggFinalizeRowFloor,
+auto aggregate_final_ordering_parallelism(RowEstimate estimate, const AggregatePhasePolicy& policy)
+    -> BreakerParallelism {
+    return {.row_floor = policy.final_ordering_floor(),
             .breaker_max_workers = kAggMaxWorkers,
             .strategy = PartitionStrategy::Owned,
             .estimate = estimate};

@@ -370,8 +370,10 @@ struct BreakerPhase {
 /// checks that stay in the operator are the ones only it can make: the
 /// `parallel_join_probe` toggle (probe only), nesting
 /// (`on_worker_pool_thread`), and whether this side/chunk cleared the floor.
-[[nodiscard]] auto join_hash_build_parallelism() -> BreakerParallelism;
-[[nodiscard]] auto join_probe_parallelism() -> BreakerParallelism;
+[[nodiscard]] auto join_hash_build_parallelism(const JoinThresholdPolicy& policy = {})
+    -> BreakerParallelism;
+[[nodiscard]] auto join_probe_parallelism(const JoinThresholdPolicy& policy = {})
+    -> BreakerParallelism;
 
 /// Both fan-out phases of a streaming join, resolved together — what every join
 /// construction site hands `ChunkedInnerJoinOperator`. Bundled so the two
@@ -430,21 +432,24 @@ struct StreamingJoinNodes {
 [[nodiscard]] auto aggregate_discovery_parallelism(RowEstimate estimate = {},
                                                    const AggregateDiscoveryPolicy& policy = {})
     -> BreakerParallelism;
-[[nodiscard]] auto aggregate_accumulation_parallelism(RowEstimate estimate = {})
+[[nodiscard]] auto aggregate_accumulation_parallelism(RowEstimate estimate = {},
+                                                      const AggregatePhasePolicy& policy = {})
     -> BreakerParallelism;
-[[nodiscard]] auto aggregate_final_ordering_parallelism(RowEstimate estimate = {})
+[[nodiscard]] auto aggregate_final_ordering_parallelism(RowEstimate estimate = {},
+                                                        const AggregatePhasePolicy& policy = {})
     -> BreakerParallelism;
 [[nodiscard]] auto aggregate_emission_parallelism(RowEstimate estimate = {}) -> BreakerParallelism;
 
-/// Both fan-out phases of a hash aggregate, resolved together — what
+/// The four fan-out phases of a hash aggregate, resolved together — what
 /// `build_physical_aggregate` hands the operator. Bundled like `JoinParallelism`
-/// so the two cannot be passed in the wrong order.
+/// so phases cannot be passed in the wrong order.
 struct AggregateParallelism {
     BreakerParallelism discovery;
     BreakerParallelism accumulation;
     BreakerParallelism final_ordering;
     BreakerParallelism emission;
     AggregateDiscoveryPolicy discovery_policy{};
+    AggregatePhasePolicy phase_policy{};
 };
 
 /// Values crossing the structural phases of the hash-aggregate fallback.

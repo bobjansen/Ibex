@@ -279,3 +279,7 @@ install(TARGETS ibex_eval_bin
 # Native compact-storage experiment: actual join operator with fixed Int64 keys.
 add_executable(ibex_bench_compact_int32 bench_compact_int32.cpp)
 target_link_libraries(ibex_bench_compact_int32 PRIVATE Ibex::parser Ibex::runtime Ibex::CompilerOptions)
+
+# Runtime-configurable aggregate Discovery policy sweep (prepared chunk inputs).
+add_executable(ibex_bench_discovery_policy bench_aggregate_discovery.cpp)
+target_link_libraries(ibex_bench_discovery_policy PRIVATE Ibex::parser Ibex::runtime Ibex::CompilerOptions CLI11::CLI11)

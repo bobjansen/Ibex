@@ -285,6 +285,45 @@ Reproduction instructions and benchmark harnesses live in
 Cross-chunk correctness fixtures are in `tests/test_chunked_sources.cpp`.
 Generated measurements and profiling output stay outside version control.
 
+### Aggregate Discovery admission policy
+
+`AggregateDiscoveryPolicy` collects Discovery's row thresholds and grains. An
+optional override in `ExecutionContext::aggregate_discovery_policy` is copied
+into the resolved `AggregateParallelism`, so an operator keeps one policy for its
+lifetime. There are no new environment switches. Defaults are unchanged:
+
+| Policy field | Default rows | Role |
+| --- | ---: | --- |
+| `radix_min_rows` | 262144 | General integer/string/pair partition admission |
+| `packed_min_rows` | 32768 | Packed, generic and fixed-code partition admission |
+| `int_owned_min_rows` | 65536 | Owned integer and async hot-sum admission |
+| `pair_owned_min_rows` | 65536 | Owned pair and async pair-sum admission |
+| `sorted_min_rows` | 262144 | Sorted Discovery admission, per chunk |
+| `sorted_range_rows` | 65536 | Sorted Discovery range grain |
+| `async_hot_job_rows` | 1048576 | Async integer hot-sum job grain |
+| `pair_owned_max_first_chunk_rows` | 2097152 | Pair-owned first-chunk upper cutoff |
+
+The default plan floor comes from `admission_floor()`, the minimum of the five
+strategy admission floors. An explicit context override recomputes that floor
+**before** resolving row estimates; lowering an operator strategy's threshold
+cannot leave it vetoed by the old default plan floor. Leaving the override unset
+preserves explicitly supplied physical-plan floors. Worker ceilings remain owned
+by their phase descriptors. Zero floors, grains and upper cutoffs are rejected
+when building the aggregate.
+
+Shape checks, one-core cardinality sampling, cumulative rows offered, and
+existing-group adoption still decide which permitted path can run. Packed keys
+that cannot be reconstructed from stored groups still cannot begin partitioning
+after a serial prefix. Once a path owns partitioned state, a small trailing chunk
+must continue using it. Accumulation's sorted/dense thresholds are separate;
+Discovery overrides do not retune that phase.
+
+For example, an embedding can lower only `packed_min_rows` by emplacing the
+optional policy and changing that field. All other strategies keep their defaults.
+The [Discovery sweep](../../benchmarking/discovery-policy/README.md) exercises
+whole-table and streamed inputs across rows, cardinalities and core counts;
+generated samples remain in ignored storage.
+
 ## Who owns which decision
 
 The answer depends on the operator category. Map chains and the promoted
@@ -455,11 +494,12 @@ capability limits, others are inconsistent policy or incomplete migrations.
   packed layout can also outgrow its reserved fields and fall back to generic
   grouping. See the categorical transition rules above; generic grouping may
   itself partition, but hashes categorical text rather than compact codes.
-- **I6** — private row thresholds (`parallel_min_rows`, `kMinProbeRows`,
-  `kMinParallelPredicateRows`, `kDefaultPartitionMinRows`, …) beside the two
-  `ExecutionContext` knobs. Break-evens differ per operator; the
-  problem is that none can be swept without recompiling. Convergence:
-  `ExecutionContext`-scaled multiples.
+- **I6** — private strategy thresholds still exist outside aggregate Discovery.
+  Discovery now takes its row thresholds and grains from one runtime
+  `AggregateDiscoveryPolicy`, retaining distinct measured defaults. Accumulation,
+  other breaker families, and non-row algorithm constants still have local
+  choices. Move those only with measurements for their own strategy and phase;
+  a universal row floor would erase meaningful differences.
 - **I7** — `parallel_min_cells` (width) is consulted by 2 sites
   (`pipeline_executor.cpp`, `sort.cpp`) against ~20 for `parallel_min_rows`,
   though "131k rows won at 6 columns, lost at 2" applies equally to filter
@@ -467,19 +507,16 @@ capability limits, others are inconsistent policy or incomplete migrations.
 - **I9** — worker-count caps differ: the plan-owned phases and the join /
   semi-anti probes cap at 64, every other site is bounded only by budget and
   pool, undocumented.
-- **I10** — a phase's plan `row_floor` does two jobs: it declines the phase at
-  plan time when the input estimate is confident (every registry table, lazy
-  or not, gives one), and it is printed as the phase's floor. At run time the
-  aggregate's phases mostly apply their operators' own path gates instead. The
-  rule that keeps the two consistent: **a plan floor must not exceed the
-  lowest gate of any path in its phase**, or the plan vetoes a fan-out the
-  operator admits. Discovery broke it until 2026-11-14: its floor was the
-  radix path's 262144, so a 32k–262k-row source never reached the packed
-  (32768) or partition-owned (65536) discovery; it is now 32768. Emission
-  compares its _group_ count to the inherited `parallel_min_rows` — the right
-  unit, since every group is an output row — and FinalOrdering's 131072 copies
-  the merge's own group floor; groups never exceed input rows, so declining
-  either on the input estimate is safe.
+- **I10** — plan admission and runtime strategy admission must remain coherent.
+  Discovery's default phase floor is now derived from its policy rather than a
+  second constant; explicit context overrides update it before row-estimate
+  resolution. This closes the default-policy drift between 32768-row packed,
+  65536-row owned and 262144-row radix strategies. Accumulation and FinalOrdering
+  still apply their own runtime gates: their phase floor must stay at or below
+  the minimum work size their paths admit. Emission uses group count as its
+  runtime unit; declining on a smaller input-row estimate is safe because groups
+  cannot exceed input rows. Explicit physical-plan floors remain intentional
+  admission restrictions when no context policy override is supplied.
 - **I12** — two thread species: the long-lived stage thread of
   `PipelinedStageOperator` (parks on consumer backpressure; hosting it on the
   pool would deadlock) is named and counted (`on_stage_thread()`,
@@ -578,9 +615,9 @@ can start partitioning after an earlier serial chunk, adopting its existing gids
 once partitioned, later small chunks must keep consulting those partitions.
 
 The migrations centralized phase permission and worker ceilings, including
-Distinct's named floor and the shared join caps. Aggregate strategy-specific
-floors and data-dependent specialization gates remain beside their kernels;
-I6 and I10 describe that incomplete convergence.
+Distinct's named floor and the shared join caps. Aggregate Discovery now carries its strategy thresholds through a shared
+runtime policy; its data-dependent admission checks remain in the operator.
+Other phases and breaker families retain local thresholds (I6, I10).
 
 ## The descriptor
 

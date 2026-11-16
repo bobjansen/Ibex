@@ -406,6 +406,50 @@ than treating a synthetic chunk size as their grain. Whole-query filter plans
 may instead use the map executor, so the fused-bounds sweep calls that kernel
 directly and records its actual pool tasks.
 
+### Worker ceilings and work decomposition (I9)
+
+A compute budget, physical pool size, phase ceiling and useful work count are
+separate limits. `compute_budget()` returns the requested per-query compute
+budget; an explicit value is not silently clipped to machine affinity. The
+pool is sized independently for decode, and may be larger. The phase resolver
+computes `min(budget, pool size, breaker_max_workers)`; zero for the last term
+means no additional phase ceiling. `WorkerPool::submit` knows only pool size,
+not a query's context, so the operator must enforce its own limit.
+
+| Path or limit | Current rule | Meaning |
+| --- | --- | --- |
+| Distinct; join build/probe; aggregate Discovery, Accumulation, FinalOrdering | Default phase ceiling 64 | Named capability policy in `physical_plan.cpp` |
+| Order and aggregate Emission | No extra phase ceiling | Budget/pool, then available tasks |
+| Materialized join probe; semi/anti right passes | Local ceiling 64 | Not yet carried by the same phase descriptors |
+| Semi/anti left filter | Budget/pool and row ranges | The two sides already have different ceilings |
+| Generic row ranges; lazy membership ranges; fused filter bounds | At most 64 ranges/morsels | Work decomposition also limits useful concurrency |
+| Private aggregate partials | At most 64 partials | Data-derived arithmetic cuts and bounded scratch; not interchangeable with workers |
+| Aggregate slot initialization | At most 16 workers within Accumulation's cap | First-touch/page-fault work has its own scaling limit |
+| Aggregate count-distinct | 16 hash shards | Available independent state, not a generic worker policy |
+| Aggregate radix discovery | At most 256 partitions, several per worker | Byte-sized partition IDs/cache locality; partitions can exceed workers |
+| Semi intersection / Decimal partials | Additional private-state limits | Respectively a byte budget and a scratch-cell budget |
+| Grouped updates/windows, sorts, gathers, reshape and map runs | Budget/pool plus groups, tasks or grain | No uniform additional 64-worker ceiling |
+| Elastic map/scan producers | Explicit active-worker bound; sometimes reserve one pool worker | The reserve is a measured overlap choice; decode has its own budget |
+
+The old I9 description that every remaining path was limited only by budget
+and pool was incomplete. Do not normalize these numbers by changing partition
+counts, reduction cuts or fixed shard arrays: those have different units and
+can affect memory use or floating-point order. No measurements here establish a compute scaling cutoff at 64; this machine
+has fewer hardware threads, so a large thread-count sweep would mainly test
+oversubscription.
+
+There is also an enforcement gap below those ceilings. Async integer and pair
+sums use Discovery's resolved worker cap for their partition count, but their
+`TaskGroup` submits independent jobs without an active-worker limit. A larger
+pool can therefore execute more Discovery work concurrently than the phase
+cap permits. Elastic pipeline producers use the same generic task-group API
+but enforce `running_ < workers_` themselves. The
+[worker-cap probe](../../benchmarking/worker-caps/README.md) reproduces the
+aggregate gap with prepared inputs and attributed worker time, including the
+ordinary pool policy. Fixing async admission is higher priority than making
+all compile-time ceilings equal. Budgeted draining lanes/admission must retain
+job boundaries and deterministic merges without blocking pool workers.
+
 ## Who owns which decision
 
 The answer depends on the operator category. Map chains and the promoted
@@ -602,9 +646,14 @@ capability limits, others are inconsistent policy or incomplete migrations.
   path across rows, width, types and selectivity, validating whole-query CPU and
   latency before changing defaults. Do not infer one universal crossover from
   the count of `parallel_min_cells` readers.
-- **I9** — worker-count caps differ: the plan-owned phases and the join /
-  semi-anti probes cap at 64, every other site is bounded only by budget and
-  pool, undocumented.
+- **I9** — worker ceilings need consistent meaning and enforcement. The
+  inventory above separates phase ceilings, useful work, memory limits and
+  reduction cuts; the former claim that all other sites were budget/pool-only
+  was stale. More seriously, async aggregate task groups can exceed their
+  resolved Discovery cap because partition count is bounded but active jobs
+  are not. The worker-cap probe confirms this on the ordinary compute/decode
+  pool split. Enforce async admission first; do not turn 64 partials or 16
+  hash shards into a universal thread ceiling.
 - **I10** — plan admission and runtime strategy admission must remain coherent.
   Discovery's default phase floor is now derived from its policy rather than a
   second constant; explicit context overrides update it before row-estimate

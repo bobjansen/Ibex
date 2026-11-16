@@ -8,6 +8,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/table_compare.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <CLI/CLI.hpp>
 
@@ -25,6 +26,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "execution_profile_internal.hpp"
 
 namespace {
 using namespace ibex;
@@ -100,6 +103,9 @@ int main(int argc, char** argv) {
     std::string aggregate = "sum";
     AggregateDiscoveryPolicy target;
     AggregatePhasePolicy target_phase;
+    bool profile_workers = false;
+    app.add_flag("--profile-workers", profile_workers,
+                 "Attribute worker wall time for the cap audit");
     bool ordered = false;
     bool dense = false;
     std::size_t prefix_rows = 0;
@@ -180,7 +186,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error(lowered.error().message);
         std::puts(
             "rows,cardinality,chunk_rows,cores,shape,aggregate,repeat,side,ms,cpu_ms,source_rows,"
-            "groups,fanouts,fields,finalizes");
+            "groups,fanouts,fields,finalizes,discovery_pool_ms,pool_threads");
         for (const auto rows : row_counts)
             for (const auto requested : cardinalities)
                 for (const auto chunk_rows : chunk_sizes) {
@@ -262,6 +268,9 @@ int main(int argc, char** argv) {
                                 candidate ? target : AggregateDiscoveryPolicy{};
                             exec.aggregate_phase_policy =
                                 candidate ? target_phase : AggregatePhasePolicy{};
+                            if (profile_workers)
+                                exec.execution_profile =
+                                    std::make_shared<ExecutionProfileState>(cores, false);
                             ParallelPipelineStats stats;
                             exec.parallel_stats = &stats;
                             const auto cpu_start = std::clock();
@@ -280,10 +289,17 @@ int main(int argc, char** argv) {
                                 throw std::runtime_error("Source rows multiplied or lost");
                             if (const auto mismatch = compare_tables(*reference, *result))
                                 throw std::runtime_error(mismatch->message());
+                            double discovery_pool_ms = 0;
+                            if (profile_workers) {
+                                for (const auto& entry : exec.execution_profile->snapshot())
+                                    if (entry.label == "Aggregate.Discovery")
+                                        discovery_pool_ms +=
+                                            static_cast<double>(entry.pool_work_ns) / 1e6;
+                            }
                             if (emit) {
                                 std::printf(
                                     "%zu,%zu,%zu,%zu,%s,%s,%zu,%s,%.6f,%.6f,%zu,%zu,%llu,%llu,%"
-                                    "llu\n",
+                                    "llu,%.6f,%zu\n",
                                     rows, cardinality, chunk_rows, cores, shape.c_str(),
                                     aggregate.c_str(), repeat, candidate ? "target" : "default", ms,
                                     cpu_ms, offered, result->rows(),
@@ -291,7 +307,8 @@ int main(int argc, char** argv) {
                                         stats.parallel_aggregate_partitions.load()),
                                     static_cast<unsigned long long>(stats.parallel_fields.load()),
                                     static_cast<unsigned long long>(
-                                        stats.parallel_aggregate_finalizes.load()));
+                                        stats.parallel_aggregate_finalizes.load()),
+                                    discovery_pool_ms, existing_worker_pool_size());
                                 std::fflush(stdout);
                             }
                         };

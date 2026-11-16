@@ -9,6 +9,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/core/time_zone.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/aggregate_discovery_policy.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
@@ -1096,6 +1097,11 @@ struct ExecutionContext {
     /// a streaming left input. `IBEX_STREAM_PROBES=1` turns it on; off by
     /// default until it is measured.
     bool stream_probes = false;
+
+    /// Optional per-query Discovery policy for tuning without recompilation.
+    /// Its admission floor replaces Discovery's plan floor before row-estimate
+    /// admission. Leave unset to preserve explicit physical-plan floors.
+    std::optional<AggregateDiscoveryPolicy> aggregate_discovery_policy = std::nullopt;
 
     /// Look up a deferred scan by its plan (instance) name, or null if there is
     /// no registry or no matching entry.

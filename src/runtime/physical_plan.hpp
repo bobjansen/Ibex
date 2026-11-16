@@ -427,7 +427,9 @@ struct StreamingJoinNodes {
 /// Capability policies for the four structural hash-aggregate nodes. Runtime
 /// data still selects specialized kernels and deterministic partition counts;
 /// these values own fan-out permission and worker ceilings.
-[[nodiscard]] auto aggregate_discovery_parallelism(RowEstimate estimate = {}) -> BreakerParallelism;
+[[nodiscard]] auto aggregate_discovery_parallelism(RowEstimate estimate = {},
+                                                   const AggregateDiscoveryPolicy& policy = {})
+    -> BreakerParallelism;
 [[nodiscard]] auto aggregate_accumulation_parallelism(RowEstimate estimate = {})
     -> BreakerParallelism;
 [[nodiscard]] auto aggregate_final_ordering_parallelism(RowEstimate estimate = {})
@@ -442,6 +444,7 @@ struct AggregateParallelism {
     BreakerParallelism accumulation;
     BreakerParallelism final_ordering;
     BreakerParallelism emission;
+    AggregateDiscoveryPolicy discovery_policy{};
 };
 
 /// Values crossing the structural phases of the hash-aggregate fallback.

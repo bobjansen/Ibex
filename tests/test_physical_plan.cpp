@@ -10,6 +10,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/pipeline.hpp>
+#include <ibex/runtime/table_compare.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <catch2/catch_approx.hpp>
@@ -2643,5 +2644,152 @@ TEST_CASE("The join operator reads the probe plan: parallel output equals serial
         for (std::size_t i = 0; i < s->rows(); ++i) {
             REQUIRE(sc[i] == pc[i]);
         }
+    }
+}
+
+TEST_CASE("Aggregate discovery policy derives phase admission from every strategy",
+          "[physical][aggregate][discovery-policy]") {
+    using Policy = runtime::AggregateDiscoveryPolicy;
+    const std::vector<std::size_t Policy::*> floors{
+        &Policy::radix_min_rows, &Policy::packed_min_rows, &Policy::int_owned_min_rows,
+        &Policy::pair_owned_min_rows, &Policy::sorted_min_rows};
+    CHECK(runtime::physical::aggregate_discovery_parallelism().row_floor ==
+          Policy{}.admission_floor());
+    for (const auto field : floors) {
+        Policy policy;
+        for (const auto other : floors)
+            policy.*other = 1'000'000;
+        policy.*field = 1234;
+        CHECK(policy.valid());
+        CHECK(runtime::physical::aggregate_discovery_parallelism({}, policy).row_floor == 1234);
+        policy.*field = 0;
+        CHECK_FALSE(policy.valid());
+    }
+}
+
+TEST_CASE("Aggregate discovery runtime overrides admit paths below the default plan floor",
+          "[physical][aggregate][discovery-policy]") {
+    using Policy = runtime::AggregateDiscoveryPolicy;
+    struct Strategy {
+        const char* name;
+        std::size_t Policy::* floor;
+        const char* keys;
+        bool sorted = false;
+    };
+    const std::vector<Strategy> strategies{{"owned integer", &Policy::int_owned_min_rows, "a"},
+                                           {"owned pair", &Policy::pair_owned_min_rows, "a, b"},
+                                           {"radix", &Policy::radix_min_rows, "a, b"},
+                                           {"packed", &Policy::packed_min_rows, "a, b, c"},
+                                           {"sorted", &Policy::sorted_min_rows, "a", true}};
+    for (const auto& strategy : strategies) {
+        INFO(strategy.name);
+        runtime::Table table;
+        Column<std::int64_t> a, b, c;
+        for (std::int64_t row = 0; row < 20'000; ++row) {
+            a.push_back(strategy.sorted
+                            ? row * 1'000'003
+                            : static_cast<std::int64_t>(static_cast<std::uint64_t>(row) *
+                                                        0x9e3779b97f4a7c15ULL));
+            b.push_back(row % 991);
+            c.push_back(row % 3);
+        }
+        table.add_column("a", std::move(a));
+        table.add_column("b", std::move(b));
+        table.add_column("c", std::move(c));
+        runtime::TableRegistry registry;
+        registry.emplace("input", std::move(table));
+        const std::string query =
+            "input[select { n = count() }, by { " + std::string(strategy.keys) + " }];";
+        auto tree = require_ir(query.c_str());
+        const auto plan = runtime::physical::plan_physical(*tree, registry, nullptr);
+        REQUIRE(plan.hash_aggregate.has_value());
+        CHECK(plan.hash_aggregate->discovery.parallelism.row_floor > 20'000);
+        const auto reference = execute_physical_plan(plan, *tree, registry, serial_exec());
+        REQUIRE(reference.has_value());
+        for (const bool lowered : {false, true}) {
+            INFO("lowered=" << lowered);
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = 8;
+            runtime::ParallelPipelineStats stats;
+            exec.parallel_stats = &stats;
+            exec.aggregate_discovery_policy.emplace();
+            (*exec.aggregate_discovery_policy).*strategy.floor = lowered ? 1000 : 1'000'000;
+            exec.aggregate_discovery_policy->sorted_range_rows = 1000;
+            const auto result = execute_physical_plan(plan, *tree, registry, exec);
+            REQUIRE(result.has_value());
+            const auto mismatch = runtime::compare_tables(*reference, *result);
+            INFO((mismatch.has_value() ? mismatch->message() : "tables agree"));
+            CHECK_FALSE(mismatch.has_value());
+            CHECK((stats.parallel_aggregate_partitions.load() > 0) == lowered);
+        }
+    }
+}
+
+TEST_CASE("Aggregate discovery rejects zero floors and grains before execution",
+          "[physical][aggregate][discovery-policy]") {
+    using Policy = runtime::AggregateDiscoveryPolicy;
+    auto tree = require_ir("trades[select { n = count() }, by price];");
+    for (const auto field :
+         {&Policy::packed_min_rows, &Policy::sorted_range_rows, &Policy::async_hot_job_rows,
+          &Policy::pair_owned_max_first_chunk_rows}) {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 8;
+        exec.aggregate_discovery_policy.emplace();
+        (*exec.aggregate_discovery_policy).*field = 0;
+        const auto result =
+            runtime::interpret(*tree, trades_registry(), nullptr, nullptr, nullptr, exec);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("aggregate discovery policy") != std::string::npos);
+    }
+}
+
+TEST_CASE("Aggregate discovery policy controls async job grain and pair strategy cutoff",
+          "[physical][aggregate][discovery-policy]") {
+    runtime::Table table;
+    Column<std::int64_t> a, b, v;
+    for (std::int64_t row = 0; row < 40'000; ++row) {
+        a.push_back((row / 3) * 1'000'003);
+        b.push_back(row % 17);
+        v.push_back(row % 11);
+    }
+    table.add_column("a", std::move(a));
+    table.add_column("b", std::move(b));
+    table.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("input", std::move(table));
+    auto tree = require_ir("input[select { s = sum(v) }, by a];");
+    const auto reference =
+        runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, serial_exec());
+    REQUIRE(reference.has_value());
+    const auto tasks = [&](std::size_t job_rows) {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 8;
+        exec.aggregate_discovery_policy.emplace();
+        exec.aggregate_discovery_policy->int_owned_min_rows = 1000;
+        exec.aggregate_discovery_policy->async_hot_job_rows = job_rows;
+        exec.execution_profile = std::make_shared<runtime::ExecutionProfileState>(8, false);
+        const auto result = runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        CHECK_FALSE(runtime::compare_tables(*reference, *result).has_value());
+        const auto rows = exec.execution_profile->snapshot();
+        const auto row = std::ranges::find_if(
+            rows, [](const auto& r) { return r.label == "Aggregate.Discovery"; });
+        REQUIRE(row != rows.end());
+        return row->pool_tasks;
+    };
+    CHECK(tasks(1000) == tasks(1U << 20U) + 39);
+
+    auto pair = require_ir("input[select { n = count() }, by { a, b }];");
+    for (const std::size_t cutoff : {1U, 2'097'152U}) {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 8;
+        exec.aggregate_discovery_policy.emplace();
+        exec.aggregate_discovery_policy->pair_owned_min_rows = 1000;
+        exec.aggregate_discovery_policy->pair_owned_max_first_chunk_rows = cutoff;
+        runtime::ParallelPipelineStats stats;
+        exec.parallel_stats = &stats;
+        const auto result = runtime::interpret(*pair, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        CHECK((stats.parallel_aggregate_partitions.load() > 0) == (cutoff > 1));
     }
 }

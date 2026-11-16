@@ -2417,7 +2417,7 @@ class HashAggregateState final {
                     // this operator.
                     str_order_[gid] = key;
                 },
-                kDefaultPartitionMinRows,
+                discovery_policy().radix_min_rows,
                 [&](std::uint32_t gid) -> std::string_view { return str_order_[gid]; })) {
             publish_discovered(agg_entries, rows);
             return std::nullopt;
@@ -2554,7 +2554,8 @@ class HashAggregateState final {
             }
 
             if (try_owned<std::int64_t, robin_hood::hash<std::int64_t>>(
-                    key_at, rows, gids, agg_entries, owned_int_partitions_, kIntOwnedMinRows)) {
+                    key_at, rows, gids, agg_entries, owned_int_partitions_,
+                    discovery_policy().int_owned_min_rows)) {
                 publish_fused_accumulation();
                 return std::nullopt;
             }
@@ -2582,7 +2583,8 @@ class HashAggregateState final {
                             first_rows[gid - groups_before] = row;
                         }
                     },
-                    kDefaultPartitionMinRows, [&](std::uint32_t gid) { return int_order_[gid]; })) {
+                    discovery_policy().radix_min_rows,
+                    [&](std::uint32_t gid) { return int_order_[gid]; })) {
                 if (has_discovery_first) {
                     seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
                 }
@@ -2703,22 +2705,9 @@ class HashAggregateState final {
     }
 
     static constexpr std::size_t kOwnedHotSlots = 4096;
-    /// Rows per async hot job when one chunk is split (`try_async_hot_int_sum`):
-    /// about one streamed row group, the chunk size the path was tuned on.
-    static constexpr std::size_t kHotJobRows = std::size_t{1} << 20;
-    /// A FIRST pair-key chunk this large is a whole table handed over at once
-    /// (an in-memory table, a one-row-group file, the REPL statement path),
-    /// not a streamed row group. The async pair sum and the owned pair path
-    /// then lose to the radix path at every cardinality measured: lineitem
-    /// SF-10 in one chunk, one sum, 8 cores, 2k / 200k / 2M / 8M groups ran
-    /// async 736 / 1469 / 2494 / 3500 ms, owned 333 / 312 / 432 / 979 ms,
-    /// radix 294 / 311 / 342 / 796 ms. Their wins come from overlapping
-    /// many streamed chunks with decode and from fusing accumulation; one
-    /// chunk gives no overlap, the async path runs it as a single job, and
-    /// both keep one hash table per worker, too big for cache at high
-    /// cardinality, where radix keeps many small ones. src/runtime/PARALLELISM.md
-    /// I15 collects the other one-chunk cases.
-    static constexpr std::size_t kPairOwnedMaxFirstChunkRows = 2 * kHotJobRows;
+    // Async hot-job grain and the pair first-chunk cutoff are supplied by
+    // AggregateDiscoveryPolicy. The cutoff keeps large one-chunk pair inputs
+    // on the radix strategy; streamed chunks can overlap owned work with input.
 
     struct OwnedHotRecord {
         std::int64_t key = 0;
@@ -2959,12 +2948,13 @@ class HashAggregateState final {
                 plan_[0].func != ir::AggFunc::Sum ||
                 (plan_[0].kind != ExprType::Double && plan_[0].kind != ExprType::Int) ||
                 int_key_kind_ != IntKeyKind::Int64 || scratch_stride_ != 0 || exec_ == nullptr ||
-                on_worker_pool_thread() || std::max(rows_offered_, rows) < kIntOwnedMinRows) {
+                on_worker_pool_thread() ||
+                std::max(rows_offered_, rows) < discovery_policy().int_owned_min_rows) {
                 return false;
             }
             // As `try_owned`: fan-out permission and the worker cap are the
             // plan's Discovery node (src/runtime/PARALLELISM.md);
-            // `kIntOwnedMinRows` stays as this specialization's admission gate.
+            // The integer-owned floor remains this specialization's admission gate.
             if (par_.discovery.decline != physical::FanOutDecline::None ||
                 par_.discovery.worker_cap < 2) {
                 return false;
@@ -2992,15 +2982,15 @@ class HashAggregateState final {
         if (!owned_async_group_.has_value()) {
             invariant_violation("async hot aggregate: task group missing while accepting chunks");
         }
-        // One job per ~kHotJobRows of the chunk, in row order. The jobs run
-        // concurrently, so a source that arrives as ONE big chunk (a whole
-        // decode: the REPL's statement path, an in-memory table, a
-        // single-row-group file) spreads over the pool the way a streamed
-        // scan's per-row-group chunks do, instead of running on one worker
-        // while the rest wait. Each job keeps its own run shortcut, and the
-        // cold merge already joins a run split across consecutive jobs.
-        // A streamed chunk (about one row group) stays one job.
-        const std::size_t jobs = rows >= 2 * kHotJobRows ? rows / kHotJobRows : 1;
+        // Split the chunk by the policy's async hot-job grain, in row order. Jobs
+        // run concurrently, so a source that arrives as ONE big chunk (a whole decode: the REPL's
+        // statement path, an in-memory table, a single-row-group file) spreads over the pool the
+        // way a streamed scan's per-row-group chunks do, instead of running on one worker while the
+        // rest wait. Each job keeps its own run shortcut, and the cold merge already joins a run
+        // split across consecutive jobs. A streamed chunk (about one row group) stays one job.
+        const std::size_t jobs = rows / discovery_policy().async_hot_job_rows >= 2
+                                     ? rows / discovery_policy().async_hot_job_rows
+                                     : 1;
         for (std::size_t j = 0; j < jobs; ++j) {
             const std::size_t begin = rows * j / jobs;
             const std::size_t end = rows * (j + 1) / jobs;
@@ -3132,8 +3122,10 @@ class HashAggregateState final {
                 plan_[0].func != ir::AggFunc::Sum ||
                 (plan_[0].kind != ExprType::Double && plan_[0].kind != ExprType::Int) ||
                 pair_packs_u64_ || scratch_stride_ != 0 || exec_ == nullptr ||
-                on_worker_pool_thread() || std::max(rows_offered_, rows) < kPairOwnedMinRows ||
-                rows >= kPairOwnedMaxFirstChunkRows || group_entries.size() != 2 ||
+                on_worker_pool_thread() ||
+                std::max(rows_offered_, rows) < discovery_policy().pair_owned_min_rows ||
+                rows >= discovery_policy().pair_owned_max_first_chunk_rows ||
+                group_entries.size() != 2 ||
                 !std::holds_alternative<Column<std::int64_t>>(*group_entries[0]->column) ||
                 !std::holds_alternative<Column<std::int64_t>>(*group_entries[1]->column) ||
                 par_.discovery.decline != physical::FanOutDecline::None ||
@@ -3175,23 +3167,8 @@ class HashAggregateState final {
         return true;
     }
 
-    /// Production ownership threshold for the narrow PairIntKey path below,
-    /// backed by a synthetic row/cardinality sweep (32k/64k/128k/262144 rows
-    /// x low/high cardinality, 8 cores, 6 interleaved rounds): 32k showed no
-    /// reliable win (3/6 wins, ~0%), 64k was the first point with a
-    /// consistent, real one (6/6 wins, -6% to -10%), and 128k/262144 stayed
-    /// positive. Deliberately NOT `kDefaultPartitionMinRows` (262144, the
-    /// threshold `try_discover_partitioned` uses): that value was tuned for a
-    /// different mechanism (discovery only, no fused accumulation, no
-    /// deferred merge) and is not evidence for where THIS path's overhead
-    /// breaks even -- q20's own chunks (~150k rows) sit between the two.
-    static constexpr std::size_t kPairOwnedMinRows = 1U << 16U;  // 65536
-
-    /// Same gate for the single-Int64-key slice. Held at the pair path's value
-    /// until the sweep below says otherwise -- the mechanism is identical and
-    /// its break-even has no reason to differ by more than the key's own probe
-    /// cost, which is lower, not higher.
-    static constexpr std::size_t kIntOwnedMinRows = 1U << 16U;  // 65536
+    // Owned integer and pair floors remain separate policy entries even though
+    // their current defaults match: their break-even workloads differ.
 
     /// Production PairIntKey ownership path (TPC-H q20's
     /// `by { l_partkey, l_suppkey }` is the motivating shape; validated
@@ -4103,7 +4080,7 @@ class HashAggregateState final {
                         // reader's own values, and the pack truncates to 32 bits.
                         pair_order_[gid] = {key_a_at(row), key_b_at(row)};
                     },
-                    kDefaultPartitionMinRows,
+                    discovery_policy().radix_min_rows,
                     [&](std::uint32_t gid) {
                         // The pack is a pure function of the pair, so a group's
                         // key is recoverable even though the pack is lossy.
@@ -4205,11 +4182,12 @@ class HashAggregateState final {
         }
 
         // A whole table in one first chunk goes to the radix path below
-        // (`kPairOwnedMaxFirstChunkRows`); later chunks follow the first.
-        if (!pair_dense_active_ && (owned_mode_ || rows < kPairOwnedMaxFirstChunkRows) &&
+        // at the policy's pair-owned cutoff; later chunks follow the first.
+        if (!pair_dense_active_ &&
+            (owned_mode_ || rows < discovery_policy().pair_owned_max_first_chunk_rows) &&
             try_owned<PairIntKey, PairIntKeyHash>(
                 [&](std::size_t row) { return pack(key_a_at(row), key_b_at(row)); }, rows, gids,
-                agg_entries, owned_pair_partitions_, kPairOwnedMinRows)) {
+                agg_entries, owned_pair_partitions_, discovery_policy().pair_owned_min_rows)) {
             publish_fused_accumulation();
             return std::nullopt;
         }
@@ -4227,7 +4205,7 @@ class HashAggregateState final {
                     pair_order_[gid] = {static_cast<std::int64_t>(key.first),
                                         static_cast<std::int64_t>(key.second)};
                 },
-                kDefaultPartitionMinRows,
+                discovery_policy().radix_min_rows,
                 [&](std::uint32_t gid) {
                     return pack(pair_order_[gid].first, pair_order_[gid].second);
                 })) {
@@ -4883,11 +4861,11 @@ class HashAggregateState final {
     /// Set once the one-core sample (`sample_mostly_distinct`) said no.
     mutable bool single_core_sample_declined_ = false;
 
-    /// Rows below which a sorted chunk is left to the serial loop, which
-    /// handles it with comparisons alone; under this the fan-out costs more.
-    static constexpr std::size_t kSortedIntParallelRows = std::size_t{1} << 18;
+    /// Accumulation retains its own sorted-range defaults. Discovery reads
+    /// sorted_min_rows and sorted_range_rows from its runtime policy instead.
+    static constexpr std::size_t kSortedAccumulationMinRows = std::size_t{1} << 18;
     /// Rows per range of the sorted-chunk numbering, at least.
-    static constexpr std::size_t kSortedIntRangeRows = std::size_t{1} << 16;
+    static constexpr std::size_t kSortedAccumulationRangeRows = std::size_t{1} << 16;
     /// Set once a chunk was found not sorted, so later chunks skip the check.
     bool sorted_int_declined_ = false;
     bool sorted_pair_declined_ = false;
@@ -4914,7 +4892,7 @@ class HashAggregateState final {
                              std::vector<std::size_t>* first_rows, bool& declined,
                              bool index_deferred, std::size_t& serial_groups, Key& max_key,
                              const ResizeOrder& resize_order, const StoreOrder& store) -> bool {
-        if (declined || rows < kSortedIntParallelRows || exec_ == nullptr ||
+        if (declined || rows < discovery_policy().sorted_min_rows || exec_ == nullptr ||
             on_worker_pool_thread() || !index_deferred || n_groups_ != serial_groups ||
             partitioned_active_ || owned_mode_ ||
             (par_.discovery.decline != physical::FanOutDecline::None && !discovery_single_core())) {
@@ -4923,8 +4901,8 @@ class HashAggregateState final {
         // On one core the passes run here, inline: the sorted check still
         // pays there, because it keeps a distinct-keyed sorted chunk off the
         // single-core locality partitioning, which hashes every row.
-        const std::size_t ranges =
-            std::clamp<std::size_t>(rows / kSortedIntRangeRows, 1, par_.discovery.worker_cap * 4);
+        const std::size_t ranges = std::clamp<std::size_t>(
+            rows / discovery_policy().sorted_range_rows, 1, par_.discovery.worker_cap * 4);
         const auto range_begin = [&](std::size_t r) { return rows * r / ranges; };
         struct RangeInfo {
             Key first{};
@@ -5129,8 +5107,8 @@ class HashAggregateState final {
         // checks it alone can make -- is it nested, did this operator's input so
         // far clear the floor. `decline != None` folds in `!exec_->can_fan_out()`
         // (the plan resolves `SingleCore` from it). `min_rows` is still the
-        // operator's: it is the radix strategy's own admission gate, stricter
-        // than `try_owned`'s, and lives beside the constant it names.
+        // strategy's: it comes from the resolved Discovery policy, and can be
+        // stricter than the phase's minimum across all strategies.
         if (exec_ == nullptr || on_worker_pool_thread()) {
             return false;
         }
@@ -5167,8 +5145,8 @@ class HashAggregateState final {
     auto try_discover_partitioned(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
                                   std::vector<KeyPartition<Key, Hash, Eq>>& partitions,
                                   const ResizeKeys& resize_keys, const StoreKey& store_key,
-                                  std::size_t min_rows = kDefaultPartitionMinRows,
-                                  const KeyOfGroup& key_of_group = {}) -> bool {
+                                  std::size_t min_rows, const KeyOfGroup& key_of_group = {})
+        -> bool {
         // Below `min_rows` the partition and scatter passes cost more than the
         // serial probe they replace. High cardinality is not checkable up front
         // — it is what discovery is about to find out — so row count is the only
@@ -6609,7 +6587,7 @@ class HashAggregateState final {
                                 static_cast<std::uint32_t>(key.w[c / 2] >> ((c % 2) * 32)));
                     }
                 },
-                kPackedPartitionMinRows,
+                discovery_policy().packed_min_rows,
                 [&](std::uint32_t gid) {
                     return pack([&](std::size_t c) {
                         return multi_cat_codes_flat_[static_cast<std::size_t>(gid) * arity + c];
@@ -6636,14 +6614,6 @@ class HashAggregateState final {
         publish_discovered(agg_entries, rows);
         return std::nullopt;
     }
-
-    /// Row count below which partitioned discovery is not worth its fan-out,
-    /// for the int/string keys it was originally tuned against.
-    static constexpr std::size_t kDefaultPartitionMinRows = 1U << 18U;
-    /// The packed key's break-even is lower: its serial probe hashes and
-    /// compares a multi-column key, so there is more per-row work to move onto
-    /// the workers than a single int key offers.
-    static constexpr std::size_t kPackedPartitionMinRows = 1U << 15U;
 
     /// Everything one packed width needs on the group-by side.
     template <typename Packed, typename Hash>
@@ -6689,7 +6659,7 @@ class HashAggregateState final {
                     new_group_rows.resize(n - groups_before);
                 },
                 StoreFirstRows{.rows = &new_group_rows, .first_gid = groups_before},
-                kPackedPartitionMinRows)) {
+                discovery_policy().packed_min_rows)) {
             fill_new_keys_from_rows(groups_before, group_entries, new_group_rows);
             publish_discovered(agg_entries, rows);
             return std::nullopt;
@@ -6786,7 +6756,7 @@ class HashAggregateState final {
         // As for the packed key: probing this key costs far more per row than
         // an int or a string probe, so partitioning pays off at the lower
         // threshold.
-        if (!may_discover_partitioned(rows, kPackedPartitionMinRows, true,
+        if (!may_discover_partitioned(rows, discovery_policy().packed_min_rows, true,
                                       [&](std::size_t row) { return hash_key_row(cols, row); })) {
             return false;
         }
@@ -6836,8 +6806,8 @@ class HashAggregateState final {
         }
         const bool ran = try_discover_partitioned<GenericGroupSlot, GenericKeyHash, GenericKeyEq>(
             key_at, rows, gids, generic_partitions_, [&](std::size_t n) { group_keys_.resize(n); },
-            [](const GenericGroupSlot&, std::uint32_t, std::size_t) {}, kPackedPartitionMinRows,
-            key_of_group);
+            [](const GenericGroupSlot&, std::uint32_t, std::size_t) {},
+            discovery_policy().packed_min_rows, key_of_group);
         if (ran) {
             fill_new_generic_keys(groups_before, held_before);
         }
@@ -7498,7 +7468,7 @@ class HashAggregateState final {
     auto try_accumulate_ascending(const std::uint32_t* gids,
                                   const std::vector<const ColumnEntry*>& agg_entries,
                                   std::size_t rows, const std::vector<std::uint8_t>* skip) -> bool {
-        if (rows < kSortedIntParallelRows || exec_ == nullptr ||
+        if (rows < kSortedAccumulationMinRows || exec_ == nullptr ||
             par_.accumulation.decline != physical::FanOutDecline::None ||
             par_.accumulation.worker_cap < 2 || on_worker_pool_thread()) {
             return false;
@@ -7513,7 +7483,7 @@ class HashAggregateState final {
             }
         }
         const std::size_t workers = par_.accumulation.worker_cap;
-        const std::size_t ranges = std::min(workers * 4, rows / kSortedIntRangeRows);
+        const std::size_t ranges = std::min(workers * 4, rows / kSortedAccumulationRangeRows);
         if (ranges < 2) {
             return false;
         }
@@ -9967,8 +9937,11 @@ class HashAggregateState final {
     /// reads `par_.<phase>.{decline, worker_cap}` for fan-out permission and the
     /// worker ceiling; it keeps only what the plan cannot know -- nesting
     /// (`on_worker_pool_thread`), the data-derived partition/run terms of each
-    /// cap, and the strategy-specific admission floors (`kPairOwnedMinRows`, the
-    /// ordered-run `1U << 16U`, `parallel_min_rows`).
+    /// cap, and the strategy-specific admission floors from the resolved policy.
+    /// Accumulation retains its ordered-run and dense-GID thresholds.
+    [[nodiscard]] auto discovery_policy() const noexcept -> const AggregateDiscoveryPolicy& {
+        return par_.discovery_policy;
+    }
     physical::AggregateParallelism par_{};
     ExecutionProfileEntry* discovery_profile_ = nullptr;
     ExecutionProfileEntry* accumulation_profile_ = nullptr;

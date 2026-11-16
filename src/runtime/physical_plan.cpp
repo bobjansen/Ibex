@@ -72,21 +72,10 @@ constexpr std::size_t kJoinBuildRowFloor = 1U << 17U;
 constexpr std::size_t kJoinProbeRowFloor = 1U << 14U;
 constexpr std::size_t kJoinMaxWorkers = 64;
 
-/// Hash-aggregate fan-out floors. A phase's plan floor only declines it
-/// outright, and only when the input estimate is confident -- so it must not
-/// exceed the floor of ANY path the operator could take in that phase, or the
-/// plan vetoes a fan-out the operator's own gate admits. Discovery has three
-/// paths with their own run-time gates in aggregate_chunked.cpp: packed keys
-/// from 32768 rows (`kPackedPartitionMinRows`), the partition-owned Int64 and
-/// pair keys from 65536 (`kIntOwnedMinRows` / `kPairOwnedMinRows`), and radix
-/// partitioning from 262144 (`kDefaultPartitionMinRows`). Its plan floor is the
-/// lowest of them; at 262144 it kept 32k-262k-row inputs off the first two.
-/// Accumulation's 131072 is where its row cut first yields two morsels, and
-/// FinalOrdering's matches the merge's own group floor (groups never exceed
-/// input rows, so a decline on input rows is safe there). Discovery,
-/// Accumulation, and FinalOrdering share a 64-worker ceiling; Emission splits
-/// by output column x group range under the shared compute budget.
-constexpr std::size_t kAggDiscoveryRowFloor = 1U << 15U;
+/// Discovery derives its floor from AggregateDiscoveryPolicy so no strategy's
+/// admission is vetoed by a separately maintained phase constant. Accumulation
+/// starts at two 65536-row morsels; FinalOrdering uses the merge's group floor.
+/// Groups never exceed input rows, so an input-estimate decline is safe there.
 constexpr std::size_t kAggFinalizeRowFloor = 1U << 17U;
 constexpr std::size_t kAggMaxWorkers = 64;
 
@@ -1127,12 +1116,13 @@ auto join_probe_parallelism() -> BreakerParallelism {
             .strategy = PartitionStrategy::Range};
 }
 
-auto aggregate_discovery_parallelism(RowEstimate estimate) -> BreakerParallelism {
+auto aggregate_discovery_parallelism(RowEstimate estimate, const AggregateDiscoveryPolicy& policy)
+    -> BreakerParallelism {
     // RadixHash is the general strategy; `try_owned` is a specialization of it
     // (partition-owned key maps instead of whole scattered partitions). The
     // operator resolves which at run time from the key type and cardinality,
     // the way the join resolves its build orientation.
-    return {.row_floor = kAggDiscoveryRowFloor,
+    return {.row_floor = policy.admission_floor(),
             .breaker_max_workers = kAggMaxWorkers,
             .strategy = PartitionStrategy::RadixHash,
             .estimate = estimate};

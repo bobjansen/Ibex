@@ -413,6 +413,14 @@ auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
         .final_ordering = nodes.final_ordering.parallelism,
         .emission = nodes.emission.parallelism,
     };
+    if (exec.aggregate_discovery_policy.has_value()) {
+        if (!exec.aggregate_discovery_policy->valid()) {
+            return std::unexpected(
+                "aggregate discovery policy requires positive row thresholds and grains");
+        }
+        par.discovery_policy = *exec.aggregate_discovery_policy;
+        par.discovery.row_floor = par.discovery_policy.admission_floor();
+    }
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
     physical::resolve_breaker_parallelism(par.discovery, exec, pool_size);
     physical::resolve_breaker_parallelism(par.accumulation, exec, pool_size);

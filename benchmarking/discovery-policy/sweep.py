@@ -33,8 +33,11 @@ def main():
         print(result.stderr, file=sys.stderr)
         return result.returncode
     cases = {}
-    for row in csv.DictReader(io.StringIO(result.stdout)):
-        key = tuple(row[k] for k in ("rows", "cardinality", "chunk_rows", "cores", "shape", "aggregate"))
+    rows = csv.DictReader(io.StringIO(result.stdout))
+    axes = ("rows", "groups", "cores", "operation") if "operation" in (rows.fieldnames or []) else ("rows", "cardinality", "chunk_rows", "cores", "shape", "aggregate")
+    core_axis = axes.index("cores")
+    for row in rows:
+        key = tuple(row[k] for k in axes)
         sides = cases.setdefault(key, {}).setdefault(int(row["repeat"]), {})
         if row["side"] in sides:
             raise ValueError("Duplicate pair side")
@@ -55,18 +58,20 @@ def main():
         summaries.append({"case": key, "default_ms": statistics.median(before), "target_ms": statistics.median(after),
                           "paired_ratio": ratio, "p": pvalue, "wins": sum(b < a for a, b in zip(before, after)),
                           "target_cpu_ms": cpu, "default_cpu_ms": cpu_before, "verdict": verdict,
+                          "tasks": sorted({int(p["target"].get("tasks", 0)) for p in pairs.values()}),
+                          "halo_pieces": sorted({int(p["target"].get("halo_pieces", 0)) for p in pairs.values()}),
                           "fields": sorted({int(p["target"].get("fields", 0)) for p in pairs.values()}),
                           "finalizes": sorted({int(p["target"].get("finalizes", 0)) for p in pairs.values()}),
-                          "fanouts": sorted({int(p["target"]["fanouts"]) for p in pairs.values()})})
+                          "fanouts": sorted({int(p["target"].get("fanouts", 0)) for p in pairs.values()})})
     (args.output_dir / "summary.json").write_text(json.dumps(summaries, indent=2) + "\n")
-    print("rows cardinality chunk cores shape agg default_ms target_ms delta% p verdict cpu_work_x fanouts")
+    print(*axes, "default_ms target_ms delta% p verdict cpu_work_x fanouts tasks halo_pieces")
     for s in summaries:
         key = s["case"]
-        one_core = next((x for x in summaries if x["case"][:3] == key[:3] and x["case"][3] == "1" and x["case"][4:] == key[4:]), None)
+        one_core = next((x for x in summaries if x["case"][:core_axis] == key[:core_axis] and x["case"][core_axis] == "1" and x["case"][core_axis + 1:] == key[core_axis + 1:]), None)
         work = s["target_cpu_ms"] / one_core["target_cpu_ms"] if one_core and one_core["target_cpu_ms"] else math.nan
         print(*key, f'{s["default_ms"]:.3f}', f'{s["target_ms"]:.3f}',
-              f'{100 * (s["paired_ratio"] - 1):+.1f}', f'{s["p"]:.4f}', s["verdict"], f'{work:.2f}', s["fanouts"])
-    print("Each timing was checked cell-for-cell against a serial reference and consumed exactly the prepared input rows.")
+              f'{100 * (s["paired_ratio"] - 1):+.1f}', f'{s["p"]:.4f}', s["verdict"], f'{work:.2f}', s["fanouts"], s["tasks"], s["halo_pieces"])
+    print("All runs passed the harness output checks. CPU ratios screen work inflation; output conservation alone does not count intermediate work.")
     print("Per-case p-values are exploratory; sweep families require independent confirmation before changing defaults.")
     return 0
 

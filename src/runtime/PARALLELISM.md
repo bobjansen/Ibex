@@ -371,6 +371,41 @@ selects LSD versus MSD radix sorting across whole-table, streamed and ranking
 calls; it does not replace the shared sort fan-out or output-cell gates. Query
 execution rejects zero join/sort thresholds. No environment switches were added.
 
+### Remaining row-range grain policy
+
+`ExecutionContext::operator_grain_policy` contains the remaining executor grains:
+
+| Field | Default | Role |
+| --- | ---: | --- |
+| `filter_bounds_rows` | 65536 | Minimum rows per fused-bounds morsel |
+| `update_bucket_rows` | 32768 | Minimum rows per grouped-update bucketing worker |
+| `window_split_rows` | 32768 | Minimum useful grouped-window piece |
+| `decimal_partial_rows` | 65536 | Minimum rows per Decimal sum/mean partial |
+| `map_min_rows` / `map_max_rows` | 4096 / 65536 | Automatic map grain band |
+| `map_morsels_per_worker` | 4 | Automatic map work-piece target |
+
+All grains must be positive, and the map band must be ordered. Query execution
+and the direct filter/update/decimal entry points reject invalid policies.
+The existing `parallel_min_rows` admission gate still applies to filter and
+update kernels: grain controls work division after admission. A large window
+grain is bounded by the input size before splitting. `parallel_grain` remains
+the explicit map-grain override; automatic grain uses sequential division to
+avoid overflow with a large configured morsel target. No environment switches
+were added.
+
+Decimal sum/mean now receive the execution context instead of choosing workers
+from the pool alone. Their own two-partial threshold and existing scratch-cell
+budget remain; workers are also bounded by the query's compute budget. A
+one-core query runs the Decimal loop inline and does not create the pool.
+Other Decimal aggregates retain their existing algorithms.
+
+The [operator-grain sweep](../../benchmarking/discovery-policy/README.md#remaining-i6-executors)
+uses prepared tables, paired timings, output checks and process CPU. These are
+materialized row-range kernels; vary table size and group cardinality rather
+than treating a synthetic chunk size as their grain. Whole-query filter plans
+may instead use the map executor, so the fused-bounds sweep calls that kernel
+directly and records its actual pool tasks.
+
 ## Who owns which decision
 
 The answer depends on the operator category. Map chains and the promoted
@@ -518,6 +553,12 @@ operator-private decisions belong to breaker families that have not completed
 that migration; do not generalize their local thresholds into a second policy
 system.
 
+**I6 is resolved for parallel admission thresholds and row grains.** The
+remaining filter/update/decimal kernels and automatic map grain now read the
+context policy above. Kernel-local constants still describe hash/dense
+algorithms, SIMD blocks, scratch budgets, buffer compaction and output batching;
+those are not competing parallel-admission authorities.
+
 **The remaining limits**, catalogued from 2026-08 onward (the I-numbers are
 cited in code; resolved entries are in the retired plan). Some are deliberate
 capability limits, others are inconsistent policy or incomplete migrations.
@@ -541,11 +582,6 @@ capability limits, others are inconsistent policy or incomplete migrations.
   packed layout can also outgrow its reserved fields and fall back to generic
   grouping. See the categorical transition rules above; generic grouping may
   itself partition, but hashes categorical text rather than compact codes.
-- **I6** — migrated aggregate strategy floors and grains now live in Discovery
-  and phase policies, and join passes and radix sorting read context thresholds.
-  Remaining private choices include the unmigrated filter/update/decimal paths
-  and non-row algorithm constants. Move those with their operator migration and
-  measurements; shared row/cell gates and byte budgets have different units.
 - **I7** — `parallel_min_cells` (width) is consulted by 2 sites
   (`pipeline_executor.cpp`, `sort.cpp`) against ~20 for `parallel_min_rows`,
   though "131k rows won at 6 columns, lost at 2" applies equally to filter
@@ -625,7 +661,7 @@ capability limits, others are inconsistent policy or incomplete migrations.
 Status: **migration record for Distinct, Order, streaming Join and streaming
 Aggregate** (authority landed 2026-08-29). This section preserves the original
 target and completed sequence. The current ownership table and remaining limits
-above take precedence where runtime specialization gates remain (I6, I10).
+above take precedence where runtime specialization gates remain (I10).
 The migration moved policy ownership and tunables onto the plan while
 preserving the kernels and determinism devices.
 
@@ -665,7 +701,7 @@ The migrations centralized phase permission and worker ceilings, including
 Distinct's named floor and the shared join caps. Aggregate Discovery now carries its strategy thresholds through a shared
 runtime policy; its data-dependent admission checks remain in the operator.
 Aggregate Accumulation and FinalOrdering now also carry strategy policies;
-remaining unmigrated breaker families retain local choices (I6, I10).
+remaining algorithm constraints stay local; row-grain policies are context-owned (I10).
 
 ## The descriptor
 

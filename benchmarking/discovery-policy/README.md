@@ -98,3 +98,39 @@ suppresses it to isolate its cost. Raw samples also record `fields` and
 `finalizes` fan-out counts. Fused kernels can submit accumulation-authorized work
 inside the Discovery profile stage; phase timing labels alone do not identify
 which policy admitted that work.
+
+## Remaining I6 executors
+
+Build `ibex_bench_operator_grains` in Release. It benchmarks fused filter
+bounds, grouped-update bucketing, grouped-window halo pieces, Decimal sum/mean,
+and map execution. Input tables and reference outputs are prepared before the
+paired intervals. Query execution uses `parallel_min_rows=0` and
+`parallel_min_cells=0` so shared admission does not conceal the grain being
+swept. Production defaults for those shared gates are unchanged.
+
+```bash
+cmake --build build-release -j 6
+IBEX_CORES=8 IBEX_DECODE_THREADS=8 taskset -c 0,2,4,6,8,10,12,14 \
+  python3 benchmarking/discovery-policy/sweep.py \
+    --binary build-release/tools/ibex_bench_operator_grains \
+    --output-dir benchmarking/discovery-policy/results/operator-filter \
+    -- --operation filter --rows 20000,262144 --groups 2,64 --cores 1,8 \
+    --filter-rows 4096 --repeats 16
+```
+
+Operations: `filter`, `update`, `window`, `decimal`, `map`. Options map directly
+to `OperatorGrainPolicy`: `--filter-rows`, `--bucket-rows`, `--window-rows`,
+`--decimal-rows`, `--map-min-rows`, `--map-max-rows`, `--map-morsels`.
+Omit overrides for same-policy calibration. Vary rows, groups and core budgets.
+Each timed output is checked against a serial reference outside the interval;
+filter indices, grouped cumulative sums, map values and Decimal sums/means also
+have independent generator-based checks. Window output is compared with the
+unsplit serial result. Samples include process CPU, pool tasks and halo pieces.
+Prepared tables have a known row count; output conservation does not establish
+how often an internal loop visited a row. Investigate inflated CPU before
+attributing it to redundant work.
+
+The filter operation calls `filter_selection` directly to exercise fused bounds;
+a whole-query filter can use a morsel map instead. The other operations use
+`interpret` with prepared registry tables. Update clauses add new columns, so
+the same prepared input can be reused without timing fixture copies.

@@ -283,3 +283,8 @@ target_link_libraries(ibex_bench_compact_int32 PRIVATE Ibex::parser Ibex::runtim
 # Runtime-configurable aggregate Discovery policy sweep (prepared chunk inputs).
 add_executable(ibex_bench_discovery_policy bench_aggregate_discovery.cpp)
 target_link_libraries(ibex_bench_discovery_policy PRIVATE Ibex::parser Ibex::runtime Ibex::CompilerOptions CLI11::CLI11)
+
+# Prepared-input sweeps of filter, update, window, decimal and map grains.
+add_executable(ibex_bench_operator_grains bench_operator_grains.cpp)
+target_include_directories(ibex_bench_operator_grains PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+target_link_libraries(ibex_bench_operator_grains PRIVATE Ibex::parser Ibex::runtime Ibex::CompilerOptions CLI11::CLI11)

@@ -288,3 +288,8 @@ target_link_libraries(ibex_bench_discovery_policy PRIVATE Ibex::parser Ibex::run
 add_executable(ibex_bench_operator_grains bench_operator_grains.cpp)
 target_include_directories(ibex_bench_operator_grains PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
 target_link_libraries(ibex_bench_operator_grains PRIVATE Ibex::parser Ibex::runtime Ibex::CompilerOptions CLI11::CLI11)
+
+# I7: isolate output-copy fan-out across rows and widths.
+add_executable(ibex_bench_width bench_width.cpp)
+target_include_directories(ibex_bench_width PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+target_link_libraries(ibex_bench_width PRIVATE Ibex::parser Ibex::runtime Ibex::CompilerOptions CLI11::CLI11)

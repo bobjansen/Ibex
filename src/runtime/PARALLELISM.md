@@ -582,10 +582,26 @@ capability limits, others are inconsistent policy or incomplete migrations.
   packed layout can also outgrow its reserved fields and fall back to generic
   grouping. See the categorical transition rules above; generic grouping may
   itself partition, but hashes categorical text rather than compact codes.
-- **I7** — `parallel_min_cells` (width) is consulted by 2 sites
-  (`pipeline_executor.cpp`, `sort.cpp`) against ~20 for `parallel_min_rows`,
-  though "131k rows won at 6 columns, lost at 2" applies equally to filter
-  gather, join concat and aggregate emission.
+- **I7** — copy admission needs a policy for each path, rather than one shared
+  cell floor everywhere. The old two-site inventory was stale:
+  `runtime_internal.hpp::gather_columns_batched` already applies the width gate
+  to join and reshape payload gathers, as do the materialized map pipeline and
+  sort gather. Their units differ: the pipeline currently counts materialized
+  **input** columns, even when a fused projection returns fewer columns; the
+  projection probe confirms that unused source columns can change admission
+  for the same two-column result. Sort
+  and payload gathers count **output** rows times the columns actually copied
+  in that batch. Join index concatenation copies two index arrays, independent
+  of payload width, and retains its own output-row floor.
+  Aggregate Emission uses output groups, its resolved worker cap and a column
+  by range task grid. It does not read the shared cell floor. That omission is
+  not itself a defect: the fixed-width [I7 sweep](../../benchmarking/width-policy/README.md)
+  finds profitable narrow emission that a pipeline-sized cell floor would
+  suppress. Whole-filter results also show a latency/CPU trade-off. Remaining
+  work is to account for projected/copied width correctly and calibrate each
+  path across rows, width, types and selectivity, validating whole-query CPU and
+  latency before changing defaults. Do not infer one universal crossover from
+  the count of `parallel_min_cells` readers.
 - **I9** — worker-count caps differ: the plan-owned phases and the join /
   semi-anti probes cap at 64, every other site is bounded only by budget and
   pool, undocumented.

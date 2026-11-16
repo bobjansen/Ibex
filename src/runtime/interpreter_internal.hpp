@@ -25,6 +25,7 @@
 #include <ibex/runtime/operator.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -42,6 +43,7 @@
 
 #include "runtime_internal.hpp"
 #include "welford.hpp"
+#include "xxhash_internal.hpp"
 
 namespace ibex::runtime {
 
@@ -176,6 +178,28 @@ template <typename T>
 constexpr bool is_string_like_v =
     std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>;
 
+inline auto key_hash_finalize(std::uint64_t seed) -> std::uint64_t {
+    seed ^= seed >> 33U;
+    seed *= 0xff51afd7ed558ccdULL;
+    seed ^= seed >> 33U;
+    seed *= 0xc4ceb9fe1a85ec53ULL;
+    seed ^= seed >> 33U;
+    return seed;
+}
+
+/// Canonical field words, hashed together with upstream XXH3. The extra
+/// word accommodates KeyHash's null mask. Keys are limited to 64 columns.
+struct CompositeKeyHash {
+    std::array<std::uint64_t, 65> words;
+    std::size_t size = 0;
+};
+inline void key_hash_mix(CompositeKeyHash& key, std::uint64_t value) {
+    key.words[key.size++] = value;
+}
+inline auto key_hash_finalize(const CompositeKeyHash& key) -> std::uint64_t {
+    return XXH3_64bits(key.words.data(), key.size * sizeof(std::uint64_t));
+}
+
 // Grouping key for the row-wise hash-grouping paths (grouped update/aggregate/
 // distinct/head/tail and the chunked operators).
 //
@@ -233,10 +257,8 @@ inline constexpr std::size_t kMaxKeyColumns = 64;
 /// else, without the key having to trust the producer to have blanked the cell.
 struct KeyHash {
     auto operator()(const Key& key) const -> std::size_t {
-        std::size_t seed = 0;
-        auto hash_combine = [&](std::size_t value) {
-            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-        };
+        CompositeKeyHash seed;
+        auto hash_combine = [&](std::size_t value) { key_hash_mix(seed, value); };
         for (std::size_t i = 0; i < key.values.size(); ++i) {
             if (key.is_null(i)) {
                 continue;  // undefined payload — the mask already says "null"
@@ -254,7 +276,7 @@ struct KeyHash {
             hash_combine(h);
         }
         hash_combine(std::hash<std::uint64_t>{}(key.null_mask));
-        return seed;
+        return static_cast<std::size_t>(key_hash_finalize(seed));
     }
 };
 
@@ -386,43 +408,8 @@ inline auto make_key_col(const ColumnEntry& entry) -> std::optional<KeyCol> {
     return make_key_col(*entry.column, entry.validity.has_value() ? &*entry.validity : nullptr);
 }
 
-/// Fold one column's hash into the running key hash.
-///
-/// Shared by `hash_key_row` (live row) and `hash_key_value` (boxed `Key`),
-/// which MUST produce identical results for the same logical key — a
-/// disagreement makes a probe miss the slot its own group occupies and
-/// silently duplicate it. They were two copies of this expression; now there is
-/// one, so they cannot drift.
-inline void key_hash_mix(std::uint64_t& seed, std::uint64_t value) {
-    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-}
-
-/// Final avalanche (murmur3's fmix64), applied once per key.
-///
-/// `key_hash_mix` is boost's `hash_combine`, whose weakness is that it never
-/// diffuses into the LOW bits — and the low bits are exactly what
-/// `KeyRowIndex` masks to pick a slot. `std::hash<int64_t>` is the identity on
-/// libstdc++, so for two small integer keys the combined value is very nearly
-/// `b + (a << 6)`: a linear function of the key values, which linear probing
-/// turns into one long cluster.
-///
-/// Measured, 1M rows, `median(v) by {a, b}` with 9800 groups: **517ms before,
-/// 20ms after**. The pathology needed BOTH multiple keys and a particular table
-/// size, which is why it hid — a single key was always fine (100k groups in
-/// 67ms), and two keys were fine at 5000 groups in an 8192-slot table (20ms)
-/// while collapsing at 9800 in a 16384-slot one. Same load factor, different
-/// mask width: the aliasing pattern depends on how many low bits are taken.
-inline auto key_hash_finalize(std::uint64_t seed) -> std::uint64_t {
-    seed ^= seed >> 33U;
-    seed *= 0xff51afd7ed558ccdULL;
-    seed ^= seed >> 33U;
-    seed *= 0xc4ceb9fe1a85ec53ULL;
-    seed ^= seed >> 33U;
-    return seed;
-}
-
 inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> std::uint64_t {
-    std::uint64_t seed = 0;
+    CompositeKeyHash seed;
     const auto mix = [&seed](std::uint64_t value) { key_hash_mix(seed, value); };
     for (std::size_t i = 0; i < cols.size(); ++i) {
         const KeyCol& col = cols[i];
@@ -478,7 +465,7 @@ inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> st
 /// cases (see the `std::hash` specializations in `time.hpp`), so visiting the
 /// `ScalarValue` by its held type reproduces `hash_key_row` exactly.
 inline auto hash_key_value(const Key& key) -> std::uint64_t {
-    std::uint64_t seed = 0;
+    CompositeKeyHash seed;
     const auto mix = [&seed](std::uint64_t value) { key_hash_mix(seed, value); };
     for (std::size_t i = 0; i < key.values.size(); ++i) {
         if (key.is_null(i)) {

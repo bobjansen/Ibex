@@ -1115,7 +1115,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
             const auto& dict = cat.dictionary();
             std::vector<std::uint64_t> code_hash(dict.size());
             for (std::size_t code = 0; code < dict.size(); ++code) {
-                std::uint64_t seed = 0;
+                CompositeKeyHash seed;
                 key_hash_mix(seed, std::hash<std::string_view>{}(dict[code]));
                 code_hash[code] = key_hash_finalize(seed);
             }

@@ -1,0 +1,11 @@
+# Generated measurements and profiling output stay local.
+results/
+*.log
+*.csv
+*.json
+*.out
+*.perf
+*.asm
+*.symbol
+q18-perf-*.txt
+ibex-perfcmp.*/

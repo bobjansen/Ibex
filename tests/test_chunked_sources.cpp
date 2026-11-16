@@ -33,9 +33,11 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <expected>
 #include <functional>
@@ -4323,5 +4325,301 @@ TEST_CASE("a small last chunk of sorted keys does not start the radix discovery 
             check(run(query, externs, threads), true);
             CHECK(runtime::late_partitioned_seeds().load() == before);
         }
+    }
+}
+
+TEST_CASE("categorical dictionary growth adopts dense groups into partitions",
+          "[runtime][chunked][aggregate][categorical-growth]") {
+    using Cat = Column<Categorical>;
+    for (const std::size_t keys :
+         (std::getenv("IBEX_GROWTH_BENCH") != nullptr ? std::vector<std::size_t>{2, 3}
+                                                      : std::vector<std::size_t>{2, 3, 5, 8})) {
+        INFO("keys=" << keys);
+        std::vector<runtime::Chunk> chunks;
+        std::map<std::pair<std::int32_t, std::int32_t>, std::size_t> ids;
+        std::vector<std::pair<std::int32_t, std::int32_t>> order;
+        std::vector<std::int64_t> counts;
+        for (const std::size_t phase : {0U, 1U, 2U}) {
+            const std::size_t rows = phase == 1 ? 300000 : 7;
+            runtime::Chunk chunk;
+            for (std::size_t k = 0; k < keys; ++k) {
+                Cat dictionary;
+                const std::size_t labels = phase == 0 || k == 2 ? 2 : 2048;
+                for (std::size_t i = 0; i < labels; ++i) {
+                    dictionary.push_back("label" + std::to_string(i));
+                }
+                Cat::codes_storage codes;
+                for (std::size_t row = 0; row < rows; ++row) {
+                    const auto a = static_cast<std::int32_t>(phase == 1 ? row % 2048 : row % 2);
+                    const auto b = static_cast<std::int32_t>(phase == 1 ? row / 2048 : row % 2);
+                    codes.push_back(k == 0 ? a : k == 1 ? b : a % 2);
+                    if (k == 0) {
+                        const auto key = std::make_pair(a, b);
+                        const auto [it, inserted] = ids.emplace(key, order.size());
+                        if (inserted) {
+                            order.push_back(key);
+                            counts.push_back(0);
+                        }
+                        ++counts[it->second];
+                    }
+                }
+                runtime::Table t;
+                t.add_column(
+                    "k" + std::to_string(k),
+                    Cat(dictionary.dictionary_ptr(), dictionary.index_ptr(), std::move(codes)));
+                chunk.columns.push_back(std::move(t.columns.front()));
+            }
+            chunks.push_back(std::move(chunk));
+        }
+        struct GrowingCodes final : runtime::Operator {
+            std::vector<runtime::Chunk> chunks;
+            std::vector<Cat> dictionaries;
+            std::size_t pos = 0;
+            GrowingCodes(std::vector<runtime::Chunk> input, std::size_t arity)
+                : chunks(std::move(input)), dictionaries(arity) {
+                for (auto& dictionary : dictionaries) {
+                    dictionary.push_back("label0");
+                    dictionary.push_back("label1");
+                }
+            }
+            auto next() -> std::expected<std::optional<runtime::Chunk>, std::string> override {
+                if (pos == chunks.size())
+                    return std::optional<runtime::Chunk>{};
+                if (pos == 1) {
+                    for (std::size_t k = 0; k < 2; ++k) {
+                        for (std::size_t i = 2; i < 2048; ++i)
+                            dictionaries[k].push_back("label" + std::to_string(i));
+                    }
+                }
+                auto chunk = std::move(chunks[pos++]);
+                for (std::size_t k = 0; k < dictionaries.size(); ++k) {
+                    const auto& original = std::get<Cat>(*chunk.columns[k].column);
+                    Cat::codes_storage codes(original.codes_data(),
+                                             original.codes_data() + original.size());
+                    auto& dictionary = dictionaries[k];
+                    chunk.columns[k].column = std::make_shared<runtime::ColumnValue>(
+                        Cat(dictionary.dictionary_ptr(), dictionary.index_ptr(), std::move(codes)));
+                }
+                return std::optional<runtime::Chunk>{std::move(chunk)};
+            }
+        };
+        runtime::ExternRegistry externs;
+        externs.register_chunked_table("growing_codes", [&](const runtime::ExternArgs&) {
+            return std::expected<runtime::OperatorPtr, std::string>{
+                std::make_unique<GrowingCodes>(chunks, keys)};
+        });
+        std::string query =
+            "extern fn growing_codes() -> DataFrame from \"x.hpp\"; "
+            "growing_codes()[select { n = count() }, by { k0";
+        for (std::size_t k = 1; k < keys; ++k)
+            query += ", k" + std::to_string(k);
+        query += " }];";
+        auto parsed = parser::parse(query);
+        REQUIRE(parsed.has_value());
+        auto ir = parser::lower(*parsed);
+        REQUIRE(ir.has_value());
+        for (const std::size_t cores : {1U, 8U}) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = cores;
+            runtime::ParallelPipelineStats stats;
+            exec.parallel_stats = &stats;
+            const runtime::TableRegistry registry;
+            const auto start = std::chrono::steady_clock::now();
+            auto out = runtime::interpret(**ir, registry, nullptr, &externs, nullptr, exec);
+            const auto elapsed =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                    .count();
+            const bool measuring = std::getenv("IBEX_GROWTH_BENCH") != nullptr;
+            if (measuring)
+                std::fprintf(stderr, "growth keys=%zu cores=%zu ms=%.6f\n", keys, cores, elapsed);
+            REQUIRE(out.has_value());
+            CHECK(out->rows() == order.size());
+            const auto& a = std::get<Cat>(*out->find("k0"));
+            const auto& b = std::get<Cat>(*out->find("k1"));
+            const auto& n = std::get<Column<std::int64_t>>(*out->find("n"));
+            for (std::size_t g = 0; g < order.size(); ++g) {
+                CHECK(a[g] == "label" + std::to_string(order[g].first));
+                CHECK(b[g] == "label" + std::to_string(order[g].second));
+                CHECK(n[g] == counts[g]);
+                for (std::size_t k = 2; k < keys; ++k) {
+                    const auto& extra = std::get<Cat>(*out->find("k" + std::to_string(k)));
+                    CHECK(extra[g] == "label" + std::to_string(order[g].first % 2));
+                }
+            }
+            if (cores == 8 && !measuring)
+                CHECK(stats.parallel_aggregate_partitions.load() > 0);
+        }
+    }
+}
+
+TEST_CASE("sparse nullable categorical pairs retain compact code keys across chunks",
+          "[runtime][chunked][aggregate][nullable-codes]") {
+    using Cat = Column<Categorical>;
+    for (const std::size_t scenario : {0U, 1U, 2U}) {
+        INFO("scenario=" << scenario);
+        std::vector<runtime::Chunk> chunks;
+        using Pair = std::pair<std::int32_t, std::int32_t>;
+        std::map<Pair, std::size_t> ids;
+        std::vector<Pair> order;
+        std::vector<std::int64_t> counts, sums;
+        for (const std::size_t phase : {0U, 1U, 2U}) {
+            const std::size_t rows = phase == 1 || (phase == 0 && scenario != 1) ? 300000 : 7;
+            const bool nullable = phase == 1 || (phase == 0 && scenario == 0);
+            Cat dictionary;
+            const std::size_t labels = phase == 0 && scenario == 1 ? 2 : 2048;
+            for (std::size_t i = 0; i < labels; ++i)
+                dictionary.push_back("label" + std::to_string(i));
+            Cat::codes_storage ca, cb;
+            runtime::ValidityBitmap va, vb;
+            Column<std::int64_t> values;
+            for (std::size_t row = 0; row < rows; ++row) {
+                const auto a = static_cast<std::int32_t>(rows > 7 ? row % 2048 : row % 2);
+                const auto b = static_cast<std::int32_t>(rows > 7 ? row / 2048 : row % 2);
+                const bool a_valid = !nullable || row % 17 != 0;
+                const bool b_valid = !nullable || row % 19 != 0;
+                // Null payloads are deliberately not valid dictionary codes.
+                const bool measuring = std::getenv("IBEX_NULLABLE_BENCH") != nullptr;
+                ca.push_back(a_valid ? a : measuring ? 0 : 123456789);
+                cb.push_back(b_valid ? b : measuring ? 0 : 987654321);
+                va.push_back(a_valid);
+                vb.push_back(b_valid);
+                const std::int64_t value = static_cast<std::int64_t>(row % 23) - 11;
+                values.push_back(value);
+                const Pair key{a_valid ? a : -1, b_valid ? b : -1};
+                const auto [it, inserted] = ids.emplace(key, order.size());
+                if (inserted) {
+                    order.push_back(key);
+                    counts.push_back(0);
+                    sums.push_back(0);
+                }
+                ++counts[it->second];
+                sums[it->second] += value;
+            }
+            runtime::Table table;
+            table.add_column(
+                "a", Cat(dictionary.dictionary_ptr(), dictionary.index_ptr(), std::move(ca)));
+            table.add_column(
+                "b", Cat(dictionary.dictionary_ptr(), dictionary.index_ptr(), std::move(cb)));
+            table.add_column("v", std::move(values));
+            if (nullable) {
+                table.columns[0].validity = std::move(va);
+                table.columns[1].validity = std::move(vb);
+            }
+            runtime::Chunk chunk;
+            chunk.columns = std::move(table.columns);
+            chunks.push_back(std::move(chunk));
+        }
+        struct Source final : runtime::Operator {
+            std::vector<runtime::Chunk> chunks;
+            std::array<Cat, 2> dictionaries;
+            std::size_t pos = 0;
+            bool grows;
+            Source(std::vector<runtime::Chunk> input, bool grow)
+                : chunks(std::move(input)), grows(grow) {
+                for (auto& dictionary : dictionaries)
+                    for (std::size_t i = 0; i < (grows ? 2U : 2048U); ++i)
+                        dictionary.push_back("label" + std::to_string(i));
+            }
+            auto next() -> std::expected<std::optional<runtime::Chunk>, std::string> override {
+                if (pos == chunks.size())
+                    return std::optional<runtime::Chunk>{};
+                if (pos == 1 && grows)
+                    for (auto& dictionary : dictionaries)
+                        for (std::size_t i = 2; i < 2048; ++i)
+                            dictionary.push_back("label" + std::to_string(i));
+                auto chunk = std::move(chunks[pos++]);
+                for (std::size_t k = 0; k < 2; ++k) {
+                    const auto& original = std::get<Cat>(*chunk.columns[k].column);
+                    Cat::codes_storage codes(original.codes_data(),
+                                             original.codes_data() + original.size());
+                    chunk.columns[k].column = std::make_shared<runtime::ColumnValue>(
+                        Cat(dictionaries[k].dictionary_ptr(), dictionaries[k].index_ptr(),
+                            std::move(codes)));
+                }
+                return std::optional<runtime::Chunk>{std::move(chunk)};
+            }
+        };
+        runtime::ExternRegistry externs;
+        externs.register_chunked_table("nullable_codes", [&](const runtime::ExternArgs&) {
+            return std::expected<runtime::OperatorPtr, std::string>{
+                std::make_unique<Source>(chunks, scenario == 1)};
+        });
+        auto parsed = parser::parse(
+            "extern fn nullable_codes() -> DataFrame from \"x.hpp\"; "
+            "nullable_codes()[select { n = count(), s = sum(v) }, by { a, b }];");
+        REQUIRE(parsed.has_value());
+        auto ir = parser::lower(*parsed);
+        REQUIRE(ir.has_value());
+        for (const std::size_t cores : {1U, 8U}) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = cores;
+            const runtime::TableRegistry registry;
+            const auto before = runtime::nullable_cat_key_chunks().load();
+            const auto start = std::chrono::steady_clock::now();
+            auto out = runtime::interpret(**ir, registry, nullptr, &externs, nullptr, exec);
+            const double elapsed =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                    .count();
+            const bool measuring = std::getenv("IBEX_NULLABLE_BENCH") != nullptr;
+            if (measuring)
+                std::fprintf(stderr, "nullable scenario=%zu cores=%zu ms=%.6f\n", scenario, cores,
+                             elapsed);
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == order.size());
+            for (std::size_t k = 0; k < 2; ++k) {
+                const auto* entry = out->find_entry(k == 0 ? "a" : "b");
+                REQUIRE(entry != nullptr);
+                const auto& col = std::get<Cat>(*entry->column);
+                for (std::size_t g = 0; g < order.size(); ++g) {
+                    const auto code = k == 0 ? order[g].first : order[g].second;
+                    REQUIRE(runtime::is_null(*entry, g) == (code < 0));
+                    if (code >= 0)
+                        CHECK(col[g] == "label" + std::to_string(code));
+                }
+            }
+            const auto& n = std::get<Column<std::int64_t>>(*out->find("n"));
+            const auto& sum = std::get<Column<std::int64_t>>(*out->find("s"));
+            for (std::size_t g = 0; g < order.size(); ++g) {
+                CHECK(n[g] == counts[g]);
+                CHECK(sum[g] == sums[g]);
+            }
+            if (!measuring)
+                CHECK(runtime::nullable_cat_key_chunks().load() - before ==
+                      (scenario == 0 ? 3 : 2));
+        }
+    }
+}
+
+TEST_CASE("generic grouping never reads a categorical null payload",
+          "[runtime][chunked][aggregate][nullable-codes-generic]") {
+    using Cat = Column<Categorical>;
+    Cat dictionary;
+    dictionary.push_back("value");
+    Cat::codes_storage codes;
+    runtime::ValidityBitmap valid;
+    Column<double> f;
+    Column<std::int64_t> b;
+    for (std::size_t row = 0; row < 8; ++row) {
+        codes.push_back(row % 2 == 0 ? 123456789 : 0);
+        valid.push_back(row % 2 != 0);
+        f.push_back(row < 4 ? 0.25 : 0.5);
+        b.push_back(1);
+    }
+    runtime::Table table;
+    table.add_column("a",
+                     Cat(dictionary.dictionary_ptr(), dictionary.index_ptr(), std::move(codes)));
+    table.columns.back().validity = std::move(valid);
+    table.add_column("b", std::move(b));
+    table.add_column("f", std::move(f));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+    const auto out = run("t[select { n = count() }, by { a, b, f }];", registry);
+    REQUIRE(out.rows() == 4);
+    const auto* a = out.find_entry("a");
+    REQUIRE(a != nullptr);
+    const auto& n = std::get<Column<std::int64_t>>(*out.find("n"));
+    for (std::size_t row = 0; row < 4; ++row) {
+        CHECK(runtime::is_null(*a, row) == (row % 2 == 0));
+        CHECK(n[row] == 2);
     }
 }

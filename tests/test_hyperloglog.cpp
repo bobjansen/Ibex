@@ -71,3 +71,38 @@ TEST_CASE("hyperloglog: merging two sketches is the sketch of the union",
     CHECK(left == sketch_of(100000));
     CHECK(std::abs(left.estimate() - 100000.0) <= 10000.0);
 }
+
+TEST_CASE("composite hashes distinguish dense integer pairs", "[runtime][hash]") {
+    using namespace ibex::runtime;
+    std::vector<std::uint64_t> hashes;
+    for (std::int64_t a = 0; a < 100; ++a) {
+        for (std::int64_t b = 0; b < 1000; ++b) {
+            Key key;
+            key.values.emplace_back(a);
+            key.values.emplace_back(b);
+            hashes.push_back(KeyHash{}(key));
+        }
+    }
+    std::sort(hashes.begin(), hashes.end());
+    const auto distinct = std::unique(hashes.begin(), hashes.end()) - hashes.begin();
+    CHECK(distinct > 99000);
+}
+
+TEST_CASE("row and boxed migration hashes agree for signed integer keys", "[runtime][hash]") {
+    using namespace ibex::runtime;
+    ibex::Column<std::int64_t> a;
+    ibex::Column<std::int64_t> b;
+    for (const auto value : {std::int64_t{-1}, std::int64_t{0}, std::int64_t{42}}) {
+        a.push_back(value);
+        b.push_back(value * 7);
+    }
+    ColumnValue av = std::move(a);
+    ColumnValue bv = std::move(b);
+    std::vector<KeyCol> cols{*make_key_col(av, nullptr), *make_key_col(bv, nullptr)};
+    for (std::size_t row = 0; row < 3; ++row) {
+        Key key;
+        key.values.emplace_back(std::get<ibex::Column<std::int64_t>>(av)[row]);
+        key.values.emplace_back(std::get<ibex::Column<std::int64_t>>(bv)[row]);
+        CHECK(hash_key_row(cols, row) == hash_key_value(key));
+    }
+}

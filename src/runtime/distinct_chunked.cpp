@@ -777,7 +777,7 @@ class ChunkedDistinctOperator final : public Operator {
     /// this third copy behind, and the migrated groups promptly duplicated
     /// themselves. Expressed this way the three cannot disagree again.
     static auto mix_one(std::uint64_t value) -> std::uint64_t {
-        std::uint64_t seed = 0;
+        CompositeKeyHash seed;
         key_hash_mix(seed, value);
         return key_hash_finalize(seed);
     }

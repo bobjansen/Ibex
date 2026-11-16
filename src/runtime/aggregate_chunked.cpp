@@ -703,7 +703,8 @@ class GroupKeyStore {
         std::uint64_t mask = 0;
         for (std::size_t i = 0; i < entries.size(); ++i) {
             const ColumnEntry& entry = *entries[i];
-            if (i < kMaxKeyColumns && runtime::is_null(entry, row)) {
+            const bool null_value = i < kMaxKeyColumns && runtime::is_null(entry, row);
+            if (null_value) {
                 mask |= std::uint64_t{1} << i;
             }
             Col& col = cols_[i];
@@ -711,22 +712,27 @@ class GroupKeyStore {
                 [&](const auto& column) {
                     using C = std::decay_t<decltype(column)>;
                     if constexpr (std::is_same_v<C, Column<std::int64_t>>) {
-                        col.put_int(Kind::Int64, gid, column[row], size());
+                        col.put_int(Kind::Int64, gid, null_value ? 0 : column[row], size());
                     } else if constexpr (std::is_same_v<C, Column<double>>) {
-                        col.put_double(gid, column[row], size());
+                        col.put_double(gid, null_value ? 0.0 : column[row], size());
                     } else if constexpr (std::is_same_v<C, Column<bool>>) {
-                        col.put_int(Kind::Bool, gid, column[row] ? 1 : 0, size());
+                        col.put_int(Kind::Bool, gid, !null_value && column[row] ? 1 : 0, size());
                     } else if constexpr (std::is_same_v<C, Column<Categorical>>) {
-                        col.put_cat(gid, std::string_view{column[row]}, column.code_at(row),
+                        col.put_cat(gid,
+                                    null_value ? std::string_view{} : std::string_view{column[row]},
+                                    null_value ? 0 : column.code_at(row),
                                     column.dictionary_identity(), size());
                     } else if constexpr (std::is_same_v<C, Column<std::string>>) {
-                        col.put_text(gid, std::string_view{column[row]}, size());
+                        col.put_text(
+                            gid, null_value ? std::string_view{} : std::string_view{column[row]},
+                            size());
                     } else if constexpr (std::is_same_v<C, Column<Date>>) {
-                        col.put_int(Kind::Date, gid, column[row].days, size());
+                        col.put_int(Kind::Date, gid, null_value ? 0 : column[row].days, size());
                     } else if constexpr (std::is_same_v<C, Column<Timestamp>>) {
-                        col.put_int(Kind::Ts, gid, column[row].nanos, size());
+                        col.put_int(Kind::Ts, gid, null_value ? 0 : column[row].nanos, size());
                     } else if constexpr (std::is_same_v<C, Column<Decimal>>) {
-                        col.put_decimal(gid, column[row].units, decimal_type_of(column), size());
+                        col.put_decimal(gid, null_value ? 0 : column[row].units,
+                                        decimal_type_of(column), size());
                     } else {
                         invariant_violation("group key store: unsupported key column type");
                     }
@@ -806,7 +812,7 @@ class GroupKeyStore {
 
     /// `hash_key_value` of the group's key, without building it.
     [[nodiscard]] auto hash(std::size_t gid) const -> std::uint64_t {
-        std::uint64_t seed = 0;
+        CompositeKeyHash seed;
         const auto mix = [&seed](std::uint64_t value) { key_hash_mix(seed, value); };
         for (std::size_t i = 0; i < cols_.size(); ++i) {
             if (is_null(gid, i)) {
@@ -2091,16 +2097,19 @@ class HashAggregateState final {
                 // so they leave it: two non-null keys for the pair path, which
                 // packs both codes into one word, three or more for the packed
                 // path; both partition their discovery across workers. A
-                // nullable pair goes to the generic path, as before. (PARALLELISM.md
-                // I3; a later chunk whose dictionaries outgrow the dense space
-                // still migrates to the hash index.)
+                // nullable pair keeps the code path with an explicit null
+                // sentinel. (PARALLELISM.md I3; later dictionary growth adopts
+                // existing groups into fixed-code partitions up to eight keys.)
                 std::vector<const Column<Categorical>*> key_cols;
                 std::vector<std::uint8_t> nullable;
                 for (const auto* e : group_entries) {
                     key_cols.push_back(&std::get<Column<Categorical>>(*e->column));
                     nullable.push_back(e->validity.has_value() ? 1U : 0U);
                 }
-                if (!cat_cell_plan(key_cols, nullable).dense_possible) {
+                const bool nullable_pair =
+                    group_entries.size() == 2 &&
+                    std::ranges::any_of(nullable, [](std::uint8_t value) { return value != 0; });
+                if (!nullable_pair && !cat_cell_plan(key_cols, nullable).dense_possible) {
                     all_cat = false;
                 }
             }
@@ -2274,6 +2283,26 @@ class HashAggregateState final {
                 migrate_cat_fast_path_to_generic(group_entries.size());
             } else if (str_fast_path_) {
                 migrate_str_fast_path_to_generic();
+            } else if (pair_int_fast_path_ && int_key_kind_ == IntKeyKind::Cat &&
+                       int_key_kind_b_ == IntKeyKind::Cat) {
+                // A pair can start with bitmap-free chunks and gain nulls
+                // after packed-code discovery. Adopt its gids and slots into
+                // the nullable code index instead of boxing strings per row.
+                translate_deferred_keys();
+                multi_cat_codes_flat_.resize(n_groups_ * 2);
+                for (std::size_t gid = 0; gid < n_groups_; ++gid) {
+                    multi_cat_codes_flat_[gid * 2] =
+                        static_cast<Column<Categorical>::code_type>(pair_order_[gid].first);
+                    multi_cat_codes_flat_[gid * 2 + 1] =
+                        static_cast<Column<Categorical>::code_type>(pair_order_[gid].second);
+                }
+                pair_int_fast_path_ = false;
+                cat_fast_path_ = true;
+                multi_dense_ = false;
+                // The new table uses nullable tuples and its own hasher. It
+                // must seed all existing gids, even if the old table partitioned.
+                partitioned_active_ = false;
+                int_partitions_.clear();
             } else if (pair_int_fast_path_) {
                 migrate_pair_int_fast_path_to_generic();
             } else if (packed_fast_path_) {
@@ -4991,11 +5020,24 @@ class HashAggregateState final {
                         r == 0 ? continues_prior : info[r].first == info[r - 1].last;
                     auto gid = static_cast<std::uint32_t>(first_gid[r] - (continues ? 1 : 0));
                     std::size_t next = first_gid[r];
-                    Key prev{};
-                    for (std::size_t row = begin; row < end; ++row) {
+                    // Settle the range boundary once. Keeping row == begin in
+                    // the all-row loop inhibited unrolling after unrelated
+                    // composite-hash changes (Q18 SF-10, +2.1% at one core).
+                    Key prev = key_at(begin);
+                    if (!continues) {
+                        gid = static_cast<std::uint32_t>(next++);
+                        store(gid, prev);
+                        if (first_rows != nullptr) {
+                            (*first_rows)[gid - groups_before] = begin;
+                        }
+                    }
+                    gids[begin] = gid;
+#if defined(__clang__)
+#pragma clang loop unroll_count(4)
+#endif
+                    for (std::size_t row = begin + 1; row < end; ++row) {
                         const Key key = key_at(row);
-                        const bool opens = row == begin ? !continues : key != prev;
-                        if (opens) {
+                        if (key != prev) {
                             gid = static_cast<std::uint32_t>(next++);
                             store(gid, key);
                             if (first_rows != nullptr) {
@@ -6324,6 +6366,44 @@ class HashAggregateState final {
         const std::size_t n_keys = cat_cols.size();
         const bool single_key = n_keys == 1;
 
+        // Re-evaluate admission after interning this chunk: dictionaries can
+        // outgrow the dense Cartesian space after groups already exist. Move
+        // the lookup, retaining gids and their accumulated slots. The pair
+        // path packs codes without dictionary-size-dependent strides and can
+        // seed its partitions from pair_order_. Three to eight keys use fixed
+        // code tuples and the same late-adoption protocol. Keep the serial
+        // index when no worker fan-out is available: partition passes lose at
+        // one core on the growing-dictionary fixture.
+        if (!single_key && !multi_cat_any_nullable_ &&
+            par_.discovery.decline == physical::FanOutDecline::None &&
+            par_.discovery.worker_cap >= 2 && !on_worker_pool_thread() &&
+            std::ranges::none_of(group_entries,
+                                 [](const ColumnEntry* e) { return e->validity.has_value(); }) &&
+            !cat_cell_plan(cat_cols).dense_possible) {
+            translate_deferred_keys();
+            if (n_keys == 2) {
+                pair_order_.resize(n_groups_);
+                for (std::size_t gid = 0; gid < n_groups_; ++gid) {
+                    pair_order_[gid] = {multi_cat_codes_flat_[gid * 2],
+                                        multi_cat_codes_flat_[gid * 2 + 1]};
+                }
+                cat_fast_path_ = false;
+                pair_int_fast_path_ = true;
+                int_key_kind_ = IntKeyKind::Cat;
+                int_key_kind_b_ = IntKeyKind::Cat;
+                pair_packs_u64_ = true;
+                std::vector<std::uint32_t>().swap(multi_cat_cell_dense_);
+                decltype(multi_cat_codes_flat_)().swap(multi_cat_codes_flat_);
+                return process_rows_int_pair(group_entries, agg_entries, rows);
+            }
+            if (n_keys <= 4) {
+                return process_grown_cat_codes<2>(cat_cols, agg_entries, rows, grown_cat128_);
+            }
+            if (n_keys <= 8) {
+                return process_grown_cat_codes<4>(cat_cols, agg_entries, rows, grown_cat256_);
+            }
+        }
+
         if (!single_key && (multi_cat_any_nullable_ ||
                             std::ranges::any_of(group_entries, [](const ColumnEntry* e) {
                                 return e->validity.has_value();
@@ -6471,6 +6551,88 @@ class HashAggregateState final {
             }
         }
 
+        publish_discovered(agg_entries, rows);
+        return std::nullopt;
+    }
+
+    template <std::size_t Words>
+    struct CatCodeHash {
+        auto operator()(const PackedKeyEncoder::PackedWords<Words>& key) const noexcept
+            -> std::size_t {
+            CompositeKeyHash hash;
+            for (const auto word : key.w)
+                key_hash_mix(hash, word);
+            return static_cast<std::size_t>(key_hash_finalize(hash));
+        }
+    };
+
+    // Unlike data-sized packing, fixed 32-bit code cells do not change their
+    // identity as dictionaries grow. The global code vector remains the output
+    // key store; partition tables hold only packed codes and global gids.
+    template <std::size_t Words>
+    auto process_grown_cat_codes(
+        const std::vector<const Column<Categorical>*>& cols,
+        const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows,
+        std::vector<KeyPartition<PackedKeyEncoder::PackedWords<Words>, CatCodeHash<Words>>>& parts,
+        const std::vector<const ValidityBitmap*>* validity = nullptr)
+        -> std::optional<std::string> {
+        using PackedCode = PackedKeyEncoder::PackedWords<Words>;
+        const std::size_t arity = cols.size();
+        std::vector<const Column<Categorical>::code_type*> raw;
+        for (const auto* col : cols)
+            raw.push_back(col->codes_data());
+        const auto row_code = [&](std::size_t c, std::size_t row) {
+            return validity != nullptr && (*validity)[c] != nullptr && !(*(*validity)[c])[row]
+                       ? Column<Categorical>::code_type{-1}
+                       : raw[c][row];
+        };
+        const auto pack = [&](const auto& code_at) {
+            PackedCode key;
+            for (std::size_t c = 0; c < arity; ++c) {
+                key.w[c / 2] |= static_cast<std::uint64_t>(static_cast<std::uint32_t>(code_at(c)))
+                                << ((c % 2) * 32);
+            }
+            return key;
+        };
+        const auto key_at = [&](std::size_t row) {
+            return pack([&](std::size_t c) { return row_code(c, row); });
+        };
+        gids_buf_.resize(rows);
+        auto* gids = gids_buf_.data();
+        if (try_discover_partitioned<PackedCode, CatCodeHash<Words>>(
+                key_at, rows, gids, parts,
+                [&](std::size_t n) { multi_cat_codes_flat_.resize(n * arity); },
+                [&](const PackedCode& key, std::uint32_t gid, std::size_t) {
+                    for (std::size_t c = 0; c < arity; ++c) {
+                        multi_cat_codes_flat_[static_cast<std::size_t>(gid) * arity + c] =
+                            static_cast<Column<Categorical>::code_type>(
+                                static_cast<std::uint32_t>(key.w[c / 2] >> ((c % 2) * 32)));
+                    }
+                },
+                kPackedPartitionMinRows,
+                [&](std::uint32_t gid) {
+                    return pack([&](std::size_t c) {
+                        return multi_cat_codes_flat_[static_cast<std::size_t>(gid) * arity + c];
+                    });
+                })) {
+            std::vector<std::uint32_t>().swap(multi_cat_cell_dense_);
+            multi_dense_ = false;
+        } else {
+            // Below the partition gate keep the existing code-only index.
+            if (multi_cat_slots_.empty())
+                multi_cat_rehash_groups();
+            std::array<Column<Categorical>::code_type, Words * 2> codes;
+            for (std::size_t row = 0; row < rows; ++row) {
+                for (std::size_t c = 0; c < arity; ++c)
+                    codes[c] = row_code(c, row);
+                gids[row] = multi_cat_find_or_insert(codes.data(), arity, [&] {
+                    multi_cat_codes_flat_.insert(
+                        multi_cat_codes_flat_.end(), codes.begin(),
+                        codes.begin() + static_cast<std::ptrdiff_t>(arity));
+                    return alloc_group();
+                });
+            }
+        }
         publish_discovered(agg_entries, rows);
         return std::nullopt;
     }
@@ -8214,8 +8376,9 @@ class HashAggregateState final {
     /// each nullable column gets one more cell than codes, the last, for its
     /// nulls (`CatCellPlan::nullable`), and a group stores -1 for a null
     /// key. Every later chunk of this operator comes here, bitmap or not, so
-    /// the cell layout never changes under the code-only paths. A cell space
-    /// too big to index densely goes to the generic path.
+    /// the cell layout never changes under the code-only paths. Sparse pairs
+    /// use a fixed-width code tuple with -1 for null; wider sparse keys retain
+    /// the generic fallback.
     auto process_rows_cat_multi_nullable(const std::vector<const ColumnEntry*>& group_entries,
                                          const std::vector<const ColumnEntry*>& agg_entries,
                                          std::size_t rows) -> std::optional<std::string> {
@@ -8236,6 +8399,14 @@ class HashAggregateState final {
         }
         const CatCellPlan plan = cat_cell_plan(cat_cols, multi_cat_nullable_);
         if (!multi_dense_ || !plan.dense_possible) {
+            if (n_keys == 2) {
+                // -1 cannot be a dictionary code. Packing its uint32_t bit
+                // pattern keeps null separate without reading its payload and
+                // remains stable when a dictionary grows or bitmaps disappear.
+                multi_dense_ = false;
+                return process_grown_cat_codes<1>(cat_cols, agg_entries, rows, nullable_cat64_,
+                                                  &valid);
+            }
             migrate_cat_fast_path_to_generic(n_keys);
             return process_rows_generic(group_entries, agg_entries, rows);
         }
@@ -9706,6 +9877,9 @@ class HashAggregateState final {
     PackedGroups<std::uint64_t, robin_hood::hash<std::uint64_t>> packed64_;
     PackedGroups<PackedKeyEncoder::Packed128, PackedKeyEncoder::PackedWordsHash<2>> packed128_;
     PackedGroups<PackedKeyEncoder::Packed256, PackedKeyEncoder::PackedWordsHash<4>> packed256_;
+    std::vector<KeyPartition<PackedKeyEncoder::PackedWords<1>, CatCodeHash<1>>> nullable_cat64_;
+    std::vector<KeyPartition<PackedKeyEncoder::Packed128, CatCodeHash<2>>> grown_cat128_;
+    std::vector<KeyPartition<PackedKeyEncoder::Packed256, CatCodeHash<4>>> grown_cat256_;
     IntKeyKind int_key_kind_b_ = IntKeyKind::Int64;
     robin_hood::unordered_flat_map<PairIntKey, std::uint32_t, PairIntKeyHash> pair_index_;
     /// As `int_index_deferred_`, for the pair path: while every new pair has

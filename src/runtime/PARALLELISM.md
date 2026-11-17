@@ -54,7 +54,11 @@ work stealing.
 - **`TaskGroup`** takes tasks one at a time with a single end-of-stream join —
   the shape a streaming sink wants when its input arrives one chunk at a time
   (used by async aggregate sinks and elastic pipeline producers). Adding a task
-  is not a fork/join round trip.
+  is not a fork/join round trip. `task_group(max_active)` bounds how many of
+  its tasks run at once: bodies queue inside the group and at most
+  `max_active` pool tasks ("lanes") drain them, each body run whole; a lane
+  retires when the queue empties instead of parking. `wait()` rethrows the
+  earliest-submitted failure in either mode.
 
 Three properties the rest of the design depends on:
 
@@ -631,18 +635,16 @@ limits, others are inconsistent policy or incomplete migrations.
   types and selectivity, validating whole-query CPU and latency before changing
   defaults. Do not infer one universal crossover from the count of
   `parallel_min_cells` readers.
-- **I9** — worker ceilings need consistent meaning and enforcement (inventory
-  in "Reference: worker ceilings"). The serious gap: async integer and pair
-  sums use Discovery's resolved worker cap for their partition count, but their
-  `TaskGroup` submits independent jobs without an active-worker limit, so a
-  larger pool can run more Discovery work concurrently than the phase cap
-  permits. Elastic pipeline producers use the same task-group API but enforce
-  `running_ < workers_` themselves. The
-  [worker-cap probe](../../benchmarking/worker-caps/README.md) reproduces the
-  gap with prepared inputs and attributed worker time, on the ordinary
-  compute/decode pool split. Fix async admission first, retaining job
-  boundaries and deterministic merges without blocking pool workers. Do not
-  turn 64 partials or 16 hash shards into a universal thread ceiling.
+- **I9** — worker ceilings need consistent meaning (inventory in "Reference:
+  worker ceilings"): phase ceilings, useful work, memory limits and reduction
+  cuts are different units, and the materialized join probe and semi/anti
+  right passes keep a local 64 outside the phase descriptors. Do not turn 64
+  partials or 16 hash shards into a universal thread ceiling. Enforcement is
+  no longer a gap: async integer and pair sums submit through a
+  `task_group(worker_cap)`, so active jobs, not only partitions, stay within
+  Discovery's cap. Elastic pipeline producers bound themselves with
+  `running_ < workers_`. Any new streaming sink must do one or the other; the
+  [worker-cap probe](../../benchmarking/worker-caps/README.md) checks it.
 - **I10** — plan admission and runtime strategy admission must remain coherent.
   Plan floors for Discovery, Accumulation and FinalOrdering are derived from
   their strategy policies, and context overrides refresh them before
@@ -876,6 +878,7 @@ not a query's context, so the operator must enforce its own limit (see I9).
 | Semi intersection / Decimal partials                                         | Additional private-state limits                                  | Respectively a byte budget and a scratch-cell budget                          |
 | Grouped updates/windows, sorts, gathers, reshape and map runs                | Budget/pool plus groups, tasks or grain                          | No uniform additional 64-worker ceiling                                       |
 | Elastic map/scan producers                                                   | Explicit active-worker bound; sometimes reserve one pool worker  | The reserve is a measured overlap choice; decode has its own budget           |
+| Async aggregate hot/pair sums                                                | Bounded task group: at most Discovery's cap of jobs active       | Partition count and active jobs share the cap                                 |
 
 Do not normalize these numbers by changing partition counts, reduction cuts or
 fixed shard arrays: those have different units and can affect memory use or

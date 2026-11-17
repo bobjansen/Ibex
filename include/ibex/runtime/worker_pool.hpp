@@ -79,6 +79,13 @@ class WorkerPool {
     /// run while the producer keeps adding more work, and profiling records a
     /// single barrier when `wait()` closes the group. This is the scheduler
     /// shape used by streaming sinks whose input arrives one chunk at a time.
+    ///
+    /// A group made with a `max_active` bound runs at most that many of its
+    /// tasks at once. Bodies queue inside the group and up to `max_active`
+    /// pool tasks ("lanes") drain them, each body run whole; a lane retires
+    /// when the queue is empty rather than parking on a pool thread. Without a
+    /// bound, concurrency is limited only by the pool size, which is sized for
+    /// decode and can exceed a query's compute budget.
     class TaskGroup {
        public:
         struct State;
@@ -94,6 +101,7 @@ class WorkerPool {
         void submit(std::function<void()> body);
 
         /// Close the group and wait for every submitted task. Idempotent.
+        /// Rethrows the exception of the earliest-submitted task that threw.
         void wait();
 
        private:
@@ -130,6 +138,10 @@ class WorkerPool {
     /// Create an incrementally populated task group. The group and all its
     /// tasks must finish before the pool is destroyed.
     [[nodiscard]] auto task_group() -> TaskGroup;
+
+    /// As `task_group()`, but at most `max_active` of its tasks run at once
+    /// (see `TaskGroup`). `max_active == 0` means unbounded.
+    [[nodiscard]] auto task_group(std::size_t max_active) -> TaskGroup;
 
     /// Run one queued task on the calling thread, or return false when there is
     /// none it may run. The caller need not be a pool worker.

@@ -67,14 +67,55 @@ struct WorkerPool::Batch::State {
 };
 
 struct WorkerPool::TaskGroup::State {
-    explicit State(WorkerPool* owner)
-        : pool(owner), profile_entry(current_execution_profile_entry()) {}
+    State(WorkerPool* owner, std::size_t active_bound)
+        : pool(owner), profile_entry(current_execution_profile_entry()), max_active(active_bound) {}
 
     WorkerPool* pool = nullptr;
+    /// One per pool task: every body when unbounded, every lane when bounded.
+    /// Touched only by the submitting thread.
     std::vector<WorkerPool::Batch> batches;
     ExecutionProfileEntry* profile_entry = nullptr;
     bool barrier_recorded = false;
     bool waited = false;
+
+    // Bounded mode (`max_active != 0`). Bodies wait in `pending`, tagged with
+    // their submission index, and at most `max_active` lanes drain them. A
+    // lane leaves only after seeing `pending` empty under `mutex`, and
+    // `submit` pushes and decides whether to start a lane under the same lock,
+    // so a body can never be queued with no lane left to run it.
+    std::size_t max_active = 0;
+    std::mutex mutex;
+    std::deque<std::pair<std::size_t, std::function<void()>>> pending;
+    std::size_t active = 0;
+    std::size_t submitted = 0;
+    /// The earliest-submitted body that threw, matching the unbounded mode,
+    /// where `wait()` joins batches in submission order.
+    std::size_t error_index = 0;
+    std::exception_ptr error;
+
+    void run_lane() noexcept {
+        for (;;) {
+            std::pair<std::size_t, std::function<void()>> item;
+            {
+                const std::scoped_lock lock(mutex);
+                if (pending.empty()) {
+                    --active;
+                    return;
+                }
+                item = std::move(pending.front());
+                pending.pop_front();
+            }
+            try {
+                item.second();
+            } catch (...) {
+                const std::scoped_lock lock(mutex);
+                if (error == nullptr || item.first < error_index) {
+                    error = std::current_exception();
+                    error_index = item.first;
+                }
+            }
+        }
+    }
 };
 
 namespace {
@@ -708,7 +749,31 @@ void WorkerPool::TaskGroup::submit(std::function<void()> body) {
     if (state_ == nullptr || state_->waited) {
         invariant_violation("WorkerPool::TaskGroup::submit after wait");
     }
-    state_->batches.push_back(state_->pool->submit_unbarriered(std::move(body)));
+    if (state_->max_active == 0) {
+        state_->batches.push_back(state_->pool->submit_unbarriered(std::move(body)));
+        return;
+    }
+    bool start_lane = false;
+    {
+        const std::scoped_lock lock(state_->mutex);
+        state_->pending.emplace_back(state_->submitted++, std::move(body));
+        if (state_->active < state_->max_active) {
+            ++state_->active;
+            start_lane = true;
+        }
+    }
+    if (!start_lane) {
+        return;
+    }
+    // The lane is joined by `wait()`, which runs before `State` can be freed.
+    try {
+        state_->batches.push_back(
+            state_->pool->submit_unbarriered([state = state_.get()] { state->run_lane(); }));
+    } catch (...) {
+        const std::scoped_lock lock(state_->mutex);
+        --state_->active;
+        throw;
+    }
 }
 
 void WorkerPool::TaskGroup::wait() {
@@ -730,10 +795,18 @@ void WorkerPool::TaskGroup::wait() {
                                               std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                   std::chrono::steady_clock::now() - start));
     }
+    // Every lane has returned, so nothing else touches `error` now.
+    if (state_->error != nullptr) {
+        std::rethrow_exception(state_->error);
+    }
 }
 
 auto WorkerPool::task_group() -> TaskGroup {
-    return TaskGroup{std::make_shared<TaskGroup::State>(this)};
+    return task_group(0);
+}
+
+auto WorkerPool::task_group(std::size_t max_active) -> TaskGroup {
+    return TaskGroup{std::make_shared<TaskGroup::State>(this, max_active)};
 }
 
 auto WorkerPool::submit_unbarriered(std::function<void()> body) -> Batch {

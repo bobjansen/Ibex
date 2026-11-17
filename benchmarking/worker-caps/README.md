@@ -58,10 +58,11 @@ A bound above that cap proves an enforcement gap. Lack of an excess does not
 prove the cap works: short jobs, source preparation, or the final merge can
 hide a brief overrun. Preserve raw results and metadata in ignored `results/`.
 
-`TaskGroup` itself is deliberately generic and has no concurrency argument.
-Elastic pipeline producers enforce their own active-worker count. Async sums
-currently use the phase cap to choose partition count, then submit independent
-jobs without a corresponding active-worker bound. A future fix should bound
-admission or draining worker lanes without parking pool threads on a semaphore;
-it must preserve job boundaries, deterministic merging, exception handling and
-stream overlap. Do not change fixed reduction cuts to enforce worker limits.
+Async sums submit through `WorkerPool::task_group(max_active)` with
+Discovery's resolved cap, so at most that many jobs run at once; jobs queue in
+the group and retire lanes rather than parking pool threads. Before that fix
+every sample above breached the cap at two cores (a peak bound of 3-4 against 2
+on a four-thread pool); after it none did. Expect wall time at a small budget
+to rise towards what the budget actually permits: the overrun was borrowing
+decode threads. Elastic pipeline producers enforce their own active-worker
+count. Do not change fixed reduction cuts to enforce worker limits.

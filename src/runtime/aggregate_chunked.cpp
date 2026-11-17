@@ -2966,7 +2966,11 @@ class HashAggregateState final {
                 owned_async_part_count_ *= 2;
             }
             owned_int_partitions_.resize(owned_async_part_count_);
-            owned_async_group_.emplace(pool.task_group());
+            // Jobs are submitted one per chunk (or hot-job grain) with no
+            // barrier, so the cap must bound active jobs too, not only the
+            // partition count: the pool is sized for decode and can be larger
+            // than this query's compute budget (PARALLELISM.md I9).
+            owned_async_group_.emplace(pool.task_group(workers));
             owned_async_hot_mode_ = true;
             owned_mode_ = true;
             note_partition_fanout();
@@ -3139,7 +3143,8 @@ class HashAggregateState final {
                 owned_async_pair_part_count_ *= 2;
             }
             owned_pair_partitions_.resize(owned_async_pair_part_count_);
-            owned_async_pair_group_.emplace(pool.task_group());
+            // As the async hot sum: bound active jobs by the cap (I9).
+            owned_async_pair_group_.emplace(pool.task_group(workers));
             owned_async_pair_mode_ = true;
             owned_mode_ = true;
             note_partition_fanout();

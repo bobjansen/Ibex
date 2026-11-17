@@ -203,6 +203,91 @@ TEST_CASE("WorkerPool task group runs incremental work and joins once", "[runtim
     CHECK(ran.load(std::memory_order_relaxed) == 32);
 }
 
+namespace {
+
+// Peak number of `group`'s bodies running at once. Each body lingers until the
+// active count exceeds `limit` or 20 ms pass, so an unbounded group on a larger
+// pool reliably shows an overrun while a bounded one only costs the timeouts.
+auto peak_task_group_concurrency(runtime::WorkerPool::TaskGroup& group, std::size_t limit,
+                                 std::size_t bodies) -> std::size_t {
+    std::atomic<std::size_t> active{0};
+    std::atomic<std::size_t> peak{0};
+    std::atomic<std::size_t> ran{0};
+    for (std::size_t i = 0; i < bodies; ++i) {
+        group.submit([&] {
+            const std::size_t now = active.fetch_add(1) + 1;
+            std::size_t seen = peak.load();
+            while (seen < now && !peak.compare_exchange_weak(seen, now)) {
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+            while (active.load() <= limit && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            active.fetch_sub(1);
+            ran.fetch_add(1);
+        });
+    }
+    group.wait();
+    CHECK(ran.load() == bodies);
+    return peak.load();
+}
+
+}  // namespace
+
+TEST_CASE("WorkerPool bounded task group never runs more than its bound",
+          "[runtime][worker_pool]") {
+    runtime::WorkerPool pool(8);
+    {
+        // The probe can see an overrun: without a bound the pool runs more.
+        auto unbounded = pool.task_group();
+        CHECK(peak_task_group_concurrency(unbounded, 2, 16) > 2);
+    }
+    for (const std::size_t bound : {std::size_t{1}, std::size_t{2}, std::size_t{3}}) {
+        CAPTURE(bound);
+        auto group = pool.task_group(bound);
+        const std::size_t peak = peak_task_group_concurrency(group, bound, 16);
+        CHECK(peak <= bound);
+        CHECK(peak >= 1);
+    }
+}
+
+TEST_CASE("WorkerPool bounded task group restarts lanes after draining", "[runtime][worker_pool]") {
+    // Lanes retire once the queue empties; a later submit must start one again
+    // rather than leave the body queued with nobody to run it.
+    runtime::WorkerPool pool(4);
+    auto group = pool.task_group(2);
+    std::atomic<std::size_t> ran{0};
+    for (std::size_t round = 0; round < 20; ++round) {
+        group.submit([&] { ran.fetch_add(1); });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (ran.load() != round + 1 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        REQUIRE(ran.load() == round + 1);
+    }
+    group.wait();
+    CHECK(ran.load() == 20);
+}
+
+TEST_CASE("WorkerPool bounded task group reports the earliest submitted error",
+          "[runtime][worker_pool]") {
+    // Matches the unbounded group, whose wait() joins tasks in submission
+    // order. Bodies after a failure still run: a lane keeps draining.
+    runtime::WorkerPool pool(4);
+    auto group = pool.task_group(2);
+    std::atomic<std::size_t> ran{0};
+    for (std::size_t i = 0; i < 12; ++i) {
+        group.submit([&ran, i] {
+            ran.fetch_add(1);
+            if (i == 3 || i == 7 || i == 10) {
+                throw std::runtime_error("task " + std::to_string(i));
+            }
+        });
+    }
+    CHECK_THROWS_WITH(group.wait(), "task 3");
+    CHECK(ran.load() == 12);
+}
+
 TEST_CASE("WorkerPool cooperatively completes nested batches from every worker",
           "[runtime][worker_pool]") {
     // All outer bodies reach the nested wait together. A conventional fixed

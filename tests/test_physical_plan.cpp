@@ -2778,7 +2778,16 @@ TEST_CASE("Aggregate discovery policy controls async job grain and pair strategy
         REQUIRE(row != rows.end());
         return row->pool_tasks;
     };
-    CHECK(tasks(1000) == tasks(1U << 20U) + 39);
+    // A 1000-row grain makes 40 jobs, the default grain one. Jobs run on at
+    // most `cap` lanes (pool tasks), and each of the first `cap` submits finds
+    // fewer than `cap` lanes active and starts one, so 40 jobs take between
+    // min(cap, 40) and 40 pool tasks while one job takes exactly one.
+    const std::size_t cap = std::min<std::size_t>(8, runtime::process_worker_pool().size());
+    REQUIRE(cap >= 2);
+    CHECK(tasks(1U << 20U) == 1);
+    const std::size_t split = tasks(1000);
+    CHECK(split >= cap);
+    CHECK(split <= 40);
 
     auto pair = require_ir("input[select { n = count() }, by { a, b }];");
     for (const std::size_t cutoff : {1U, 2'097'152U}) {

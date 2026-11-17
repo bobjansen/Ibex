@@ -1037,7 +1037,7 @@ struct ExecutionContext {
     /// `IBEX_CORES=1` drift into meaning different things.
     ///
     /// This says only that fanning out is permitted. Whether it is *worthwhile*
-    /// is each caller's own gate (row and cell floors, morsel counts, merge
+    /// is each caller's own gate (row floors, morsel counts, merge
     /// costs), and whether it is desirable here can also depend on
     /// `on_worker_pool_thread()`, since an outer batch already owns the pool.
     [[nodiscard]] auto can_fan_out() const -> bool;
@@ -1049,19 +1049,12 @@ struct ExecutionContext {
     ///
     /// This is a floor on ROWS, which is the right unit for splitting one
     /// expression across ranges (`evaluate_field_maybe_parallel`, whose work is
-    /// per row). An pipeline also copies per *cell*, so it applies
-    /// `parallel_min_cells` on top of this.
+    /// per row). Pipelines, sort gathers and join/reshape payload gathers use
+    /// it too. A width-scaled cell floor used to sit on top for those copy
+    /// paths; it was removed on 2026-11-17 after `benchmarking/width-policy`
+    /// measured 131,072 x 2 filters and 65,536 x 2 gathers 30-65% faster in
+    /// parallel, and turning it off left PDS-H unchanged.
     std::size_t parallel_min_rows = 65536;
-
-    /// Second pipeline threshold, in cells (rows x output columns), or 0 to skip
-    /// the check.
-    ///
-    /// An pipeline's cost is dominated by copying rows out, which scales with
-    /// table WIDTH — so a row count alone cannot say whether the work is worth
-    /// a fan-out. Measured: 131,072 rows won at 6 columns and *lost* at 2, on
-    /// the same predicate. Both clear any sane row threshold; only the cell
-    /// count separates them.
-    std::size_t parallel_min_cells = 512UL * 1024;
 
     /// Optional pipeline counters, or null to record nothing. Not owned.
     ParallelPipelineStats* parallel_stats = nullptr;

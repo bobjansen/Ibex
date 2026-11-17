@@ -9322,7 +9322,6 @@ TEST_CASE("round in an update is range-native under a split", "[update][parallel
             exec.parallel_threads = (parallel) ? 4 : 1;
             exec.parallel_grain = 256;
             exec.parallel_min_rows = 0;
-            exec.parallel_min_cells = 0;
             auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
             REQUIRE(out.has_value());
             const auto* col = std::get_if<Column<std::int64_t>>(out->find("r"));
@@ -9420,7 +9419,6 @@ TEST_CASE("temporal parts write parallel fixed-width windows", "[update][paralle
         exec.parallel_threads = (parallel) ? 4 : 1;
         exec.parallel_grain = 256;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_stats = stats;
         auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
@@ -9464,7 +9462,6 @@ TEST_CASE("categorical byte lengths write parallel fixed-width windows", "[updat
         exec.parallel_threads = (parallel) ? 4 : 1;
         exec.parallel_grain = 256;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_stats = stats;
         auto out =
             runtime::update_table(runtime::Table{registry.at("t")}, fields, nullptr, nullptr, exec);
@@ -9510,7 +9507,6 @@ TEST_CASE("native predicates write parallel packed bool windows", "[update][para
         // writer's atomic boundary OR contract.
         exec.parallel_grain = 65;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_stats = stats;
         auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
@@ -9569,7 +9565,6 @@ TEST_CASE("interpolation strings write parallel prefix-assigned slabs", "[update
         exec.parallel_threads = (parallel) ? 4 : 1;
         exec.parallel_grain = 127;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_stats = stats;
         auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
@@ -9623,7 +9618,6 @@ TEST_CASE("substring strings write parallel prefix-assigned slabs", "[update][pa
         exec.parallel_threads = parallel ? 4 : 1;
         exec.parallel_grain = 127;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_stats = stats;
         auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
@@ -9705,7 +9699,6 @@ TEST_CASE("nullable fixed-width writes return parallel range validity", "[update
         exec.parallel_threads = (parallel) ? 4 : 1;
         exec.parallel_grain = 65;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_stats = stats;
         auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
@@ -9801,7 +9794,6 @@ TEST_CASE("fill_null and coalesce match a naive reference over adopted validity 
         exec.parallel_threads = parallel ? 4 : 1;
         exec.parallel_grain = 65;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
         const auto column_of = [&](std::string name) -> const Column<double>& {
@@ -9862,7 +9854,6 @@ TEST_CASE("categorical CASE and coalesce use planned dictionary remaps", "[updat
         exec.parallel_threads = (parallel) ? 4 : 1;
         exec.parallel_grain = 65;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_stats = stats;
         auto out = runtime::interpret(*program, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
@@ -9936,7 +9927,6 @@ TEST_CASE("grouped update is deterministic across thread counts", "[update][para
         runtime::ExecutionContext exec;
         exec.parallel_threads = (parallel) ? threads : 1;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
         REQUIRE(out->rows() == kRows);
@@ -10128,7 +10118,6 @@ TEST_CASE("lifted grouped aggregates are deterministic across thread counts",
         runtime::ExecutionContext exec;
         exec.parallel_threads = (parallel) ? threads : 1;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
         const auto& z = std::get<Column<double>>(*out->find("z"));
@@ -10908,7 +10897,6 @@ TEST_CASE("left join: a parallel gather of every column type gives the serial an
     runtime::ExecutionContext parallel;
     parallel.parallel_threads = 4;
     parallel.parallel_min_rows = 0;
-    parallel.parallel_min_cells = 0;
     for (const char* query : {
              "l left join r on k;",
              "l left join r[update { dec = Decimal(n, 12, 2), day = Date(n) }] on k;",
@@ -11760,7 +11748,6 @@ TEST_CASE("rank: fast and general paths agree", "[rank][interpreter]") {
             runtime::ExecutionContext exec;
             exec.parallel_threads = (parallel) ? threads : 1;
             exec.parallel_min_rows = 0;
-            exec.parallel_min_cells = 0;
             auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
             REQUIRE(out.has_value());
             const auto& col = std::get<Column<std::int64_t>>(*out->find("rk"));
@@ -11806,7 +11793,6 @@ TEST_CASE("grouped collect aggregates are deterministic across thread counts",
         runtime::ExecutionContext exec;
         exec.parallel_threads = (parallel) ? threads : 1;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
         REQUIRE(out->rows() == 4);
@@ -11950,7 +11936,6 @@ TEST_CASE("two-key grouped aggregate is deterministic across thread counts",
         runtime::ExecutionContext exec;
         exec.parallel_threads = (parallel) ? threads : 1;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(out.has_value());
         const auto& s = std::get<Column<double>>(*out->find("s"));
@@ -18778,7 +18763,6 @@ auto many_unit_exec(const runtime::DeferredScanRegistry& deferred,
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_stats = &stats;
     return exec;
 }
@@ -18887,7 +18871,6 @@ TEST_CASE("Morsel pipeline on elastic workers keeps every row and group",
     runtime::ExecutionContext exec;
     exec.parallel_threads = 8;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_stats = &stats;
     auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
     REQUIRE(out.has_value());
@@ -19495,7 +19478,6 @@ TEST_CASE("Parallel pipeline: a deferred source decodes once, before fan-out",
     exec.parallel_grain = 256;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_stats = &stats;
 
     auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
@@ -19524,7 +19506,6 @@ TEST_CASE("Scan pipeline decodes source units through row-local maps without mat
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_stats = &stats;
 
     auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
@@ -19557,7 +19538,6 @@ TEST_CASE("Scan pipeline feeds a run that has a serial step above it",
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     // A small grain, so an update that runs on the consumer thread always
     // splits itself -- and counts in `parallel_fields` -- while one inside a
     // streaming worker (a pool thread) never does.
@@ -19602,7 +19582,6 @@ TEST_CASE("Scan pipeline feeds a run that has a serial step above it",
     runtime::ExecutionContext unstreamed{.deferred_scans = &deferred, .execution_profile = nullptr};
     unstreamed.parallel_threads = 4;
     unstreamed.parallel_min_rows = 0;
-    unstreamed.parallel_min_cells = 0;
     unstreamed.parallel_grain = 256;
     unstreamed.parallel_stats = &unstreamed_stats;
     unstreamed.stream_scans = false;
@@ -19631,7 +19610,6 @@ TEST_CASE("Scan pipeline streams a bare row-local update", "[runtime][parallel][
         runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
         exec.parallel_threads = 4;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_grain = 256;
         exec.parallel_stats = &stats;
         exec.stream_scans = stream;
@@ -19675,7 +19653,6 @@ TEST_CASE("Scan pipeline streams an update below its run", "[runtime][parallel][
         runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
         exec.parallel_threads = 4;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_grain = 256;
         exec.parallel_stats = &stats;
         exec.stream_scans = stream;
@@ -19736,7 +19713,6 @@ TEST_CASE("Fused left-join count over a streamed right side", "[runtime][paralle
         runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
         exec.parallel_threads = 4;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_stats = &stats;
         auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
         INFO((out.has_value() ? std::string{} : out.error()));
@@ -19923,7 +19899,6 @@ TEST_CASE("Scan pipeline preserves the schema when every unit is filtered out",
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_stats = &stats;
 
     auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
@@ -21189,7 +21164,6 @@ TEST_CASE("Interpret order gathers every column kind identically in parallel",
         runtime::ExecutionContext exec;
         exec.parallel_threads = (parallel) ? 8 : 1;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(result.has_value());
         return std::move(*result);
@@ -21335,7 +21309,6 @@ TEST_CASE("aligned grouped window splits a group at bucket boundaries",
         runtime::ExecutionContext exec;
         exec.parallel_threads = (parallel) ? 8 : 1;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(result.has_value());
         return std::move(*result);
@@ -21412,7 +21385,6 @@ TEST_CASE("aligned grouped window refuses to split a cross-bucket field",
         runtime::ExecutionContext exec;
         exec.parallel_threads = (parallel) ? 8 : 1;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(result.has_value());
         return std::move(*result);

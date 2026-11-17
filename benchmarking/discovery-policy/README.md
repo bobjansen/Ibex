@@ -104,9 +104,9 @@ which policy admitted that work.
 Build `ibex_bench_operator_grains` in Release. It benchmarks fused filter
 bounds, grouped-update bucketing, grouped-window halo pieces, Decimal sum/mean,
 and map execution. Input tables and reference outputs are prepared before the
-paired intervals. Query execution uses `parallel_min_rows=0` and
-`parallel_min_cells=0` so shared admission does not conceal the grain being
-swept. Production defaults for those shared gates are unchanged.
+paired intervals. Query execution uses `parallel_min_rows=0` so shared
+admission does not conceal the grain being swept. The production default for
+that shared gate is unchanged.
 
 ```bash
 cmake --build build-release -j 6

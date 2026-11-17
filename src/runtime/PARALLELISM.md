@@ -200,11 +200,10 @@ cross-row float reduction, it is exact in floats too.
    downstream batches (the same measured rule as the streamed scan). Both
    executors use `ElasticRingProducers`: a worker retires when no ring slot is
    claimable, rather than parking while holding a pool thread.
-3. **Whether to morselize at all** is a two-dimensional gate on rows _and_
-   cells (`parallel_min_rows` + `parallel_min_cells`), because a morsel's cost
-   is dominated by copying rows out, which scales with table _width_. A refusal
-   runs the chain as **one whole-table chunk**, never a serial sweep of morsels
-   (conflating those measured 100ms vs 36ms).
+3. **Whether to morselize at all** is a row floor (`parallel_min_rows`). A
+   refusal runs the chain as **one whole-table chunk**, never a serial sweep of
+   morsels (conflating those measured 100ms vs 36ms). There is no width gate:
+   see "Measured and dropped".
 4. **`TwoPhaseFilterOperator`** specialization — when the chain is exactly one
    range-native filter (+ a metadata-only project/rename tail): phase A counts
    survivors per morsel, a serial prefix sum turns counts into offsets, phase B
@@ -271,7 +270,7 @@ dispatch lives in `runtime_entry.cpp`, the map/morsel executor in
 | **Join** (streaming inner, one key or two Int64 keys; streaming left, one key)                                                                                              | The plan owns the **structure** — `JoinPlan` names the `JoinBranch` and leaves orientation to run time; typed `HashBuild` / `HashProbe` nodes carry the edge — and **both** fan-out phases: `build_partitions` reads `par_.build`, `probe_parallel_workers` reads `par_.probe`. What stays in the operator is the `parallel_join_probe` toggle (probe only), nesting, and whether this side/chunk cleared the floor. Output assembly is inside `ChunkedInnerJoinOperator`, which the left join shares (`JoinBranch::SingleKeyLeft`: the right side is always the indexed one, and it takes neither a deferred probe nor a streamed-left key filter). Semi/anti streams through its own operator with private gates; every other join shape materializes both sides and names its `JoinDeclineReason`. | **Yes** (structure + both phases, both authoritative). | Structure + both phases.                         |
 | **Aggregate**                                                                                                                                                               | The plan owns the adaptive strategy, positional `AggregateColumnMapping`, and four typed hash-fallback nodes (discovery → accumulation → final ordering → emission). Each node carries and authoritatively supplies its own fan-out policy. A serial coordinator invokes every node: discovery transfers one bounded chunk of group IDs/column bindings to accumulation, or marks a one-pass kernel explicitly fused; final ordering and emission are separate. Data-derived caps (`part_count`, `total/4096`, `run_count/8192`) and strategy admission checks stay next to their kernels.                                                                                                                                                       | **Yes, structural and authoritative.**                 | Strategy + typed chain + all four node policies. |
 | **Distinct**                                                                                                                                                                | The plan owns the `dedup` policy (floor, ceiling, packed-key strategy, optional estimate); the builder resolves it and the operator reads it. Nesting, the first concrete chunk's row count, and the derived partition count remain runtime decisions.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | **Yes, authoritative.**                                | Yes.                                             |
-| **Order**                                                                                                                                                                   | The plan describes one `sort` phase. The actual radix-sort/gather fan-out (`radix_sort`, `gather_rows_parallel` in `sort.cpp`) reads the shared `parallel_min_rows` / `parallel_min_cells` knobs, so this phase is descriptive rather than authoritative; `ChunkedOrderOperator` just buffers and calls `order_table`.                                                                                                                                                                                                                                                                                                                                                                                                         | **Yes, descriptive.**                                  | Yes.                                             |
+| **Order**                                                                                                                                                                   | The plan describes one `sort` phase. The actual radix-sort/gather fan-out (`radix_sort`, `gather_rows_parallel` in `sort.cpp`) reads the shared `parallel_min_rows` knob, so this phase is descriptive rather than authoritative; `ChunkedOrderOperator` just buffers and calls `order_table`.                                                                                                                                                                                                                                                                                                                                                                                                                                 | **Yes, descriptive.**                                  | Yes.                                             |
 | **TopK / Head / Tail / FilterHead / FilterTail**                                                                                                                            | Plan-built serial breaker operators with no fan-out point. TopK (`ChunkedOrderedLimitOperator`) is a one-pass bounded heap, O(n·log k), not a sort; per-range heaps plus a merge would barely pay for small k, and Ibex already wins top-k ~12×. Do not fold it into Order.                                                                                                                                                                                                                                                                                                                                                                                                                                                       | **Yes; no parallel policy.**                           | Serial-by-design reason.                         |
 | **Remaining Layer C fan-out inside operators** (sort, decode, semi/anti build and predicate, the materialized fallbacks, and data-dependent aggregate specialization gates) | The operator owns decisions not yet promoted to the plan. Migrated Distinct, Join, and Aggregate paths instead read their resolved plan policy and retain only runtime/data-dependent admission checks.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Mixed.                                                 | Only promoted phases.                            |
 
@@ -616,25 +615,15 @@ limits, others are inconsistent policy or incomplete migrations.
   which may partition but hashes categorical text rather than compact codes.
   Exceeding the 4M dense-cell limit does not by itself mean serial discovery.
   See "Reference: categorical discovery transitions".
-- **I7** — copy admission needs a policy for each path, rather than one shared
-  cell floor everywhere. `runtime_internal.hpp::gather_columns_batched` applies
-  the width gate to join and reshape payload gathers, as do the materialized
-  map pipeline and sort gather, but their units differ. The pipeline counts
-  materialized **input** columns, even when a fused projection returns fewer
-  columns; the projection probe confirms that unused source columns can change
-  admission for the same two-column result. Sort and payload gathers count
-  **output** rows times the columns actually copied in that batch. Join index
-  concatenation copies two index arrays, independent of payload width, and
-  keeps its own output-row floor. Aggregate Emission uses output groups, its
-  resolved worker cap and a column-by-range task grid, and does not read the
-  shared cell floor; that is not itself a defect: the fixed-width
-  [I7 sweep](../../benchmarking/width-policy/README.md) finds profitable narrow
-  emission that a pipeline-sized cell floor would suppress. Whole-filter
-  results also show a latency/CPU trade-off. Remaining work: account for
-  projected/copied width correctly and calibrate each path across rows, width,
-  types and selectivity, validating whole-query CPU and latency before changing
-  defaults. Do not infer one universal crossover from the count of
-  `parallel_min_cells` readers.
+- **I7** — copy paths admit by rows only. Pipelines, sort gathers and
+  join/reshape payload gathers share `parallel_min_rows`; join index
+  concatenation keeps its own output-row floor; Aggregate Emission uses output
+  groups and its resolved worker cap. A width-scaled cell floor is gone (see
+  "Measured and dropped"). Open: none of the
+  [width probes](../../benchmarking/width-policy/README.md) cover
+  variable-width strings, nulls or complex predicates, and sort's gather has no
+  probe of its own; recalibrate the row floor from those, not by
+  reintroducing a width gate without a measured loss.
 - **I9** — worker ceilings need consistent meaning (inventory in "Reference:
   worker ceilings"): phase ceilings, useful work, memory limits and reduction
   cuts are different units, and the materialized join probe and semi/anti
@@ -707,6 +696,16 @@ limits, others are inconsistent policy or incomplete migrations.
   with a cost-aware gate (skip when both sides are large).
 - **Dropping `try_owned`'s schedule gate.** Output stayed byte-identical, but
   1-core q20/q18 regressed +25%/+40%.
+- **A cell floor on copy admission** (`parallel_min_cells`, 512k rows x
+  columns; removed 2026-11-17). Its premise, that 131,072 rows lost at 2
+  columns, no longer reproduced: the
+  [width probe](../../benchmarking/width-policy/README.md) at 8 cores measured
+  131,072 x 2 projections 56% faster in parallel, 65,536 x 2 filters 30% and
+  65,536 x 2 payload gathers 65%, at 2-3.5x CPU. The pipeline also counted
+  input columns rather than copied ones. On PDS-H SF-10 it refused one
+  pipeline (q21, 66k x 2) and turning it off was a wash (q15/q21/q22 within
+  2%). Ibex runs one query at a time, so the extra CPU does not starve a
+  neighbour.
 
 ---
 
@@ -794,7 +793,7 @@ The join policy lives in `ExecutionContext::join_threshold_policy`; build and
 probe floors are refreshed before resolution. It does not change join
 orientation, key capabilities, byte budgets or worker caps.
 `radix_sort_min_rows` picks the algorithm; it does not replace the shared sort
-fan-out or output-cell gates.
+fan-out row gate.
 
 ### `OperatorGrainPolicy` (`ExecutionContext::operator_grain_policy`)
 

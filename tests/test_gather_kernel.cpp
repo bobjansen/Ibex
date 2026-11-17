@@ -52,7 +52,6 @@ namespace {
 auto parallel_exec() -> runtime::ExecutionContext {
     runtime::ExecutionContext exec;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_threads = 8;
     return exec;
 }
@@ -386,7 +385,7 @@ TEST_CASE("nullable compact batched gather writes its physical output directly",
     if (ibex::runtime::process_worker_pool().size() < 2)
         SKIP("requires two pool workers");
     const ibex::runtime::ExecutionContext exec{
-        .parallel_threads = 2, .parallel_min_rows = 0, .parallel_min_cells = 0};
+        .parallel_threads = 2, .parallel_min_rows = 0};
     auto gathered = ibex::runtime::gather_columns_batched(
         jobs, 3, &exec, [](std::size_t) -> ibex::runtime::GatheredColumn {
             FAIL("the test must reach the ranged compact writer");

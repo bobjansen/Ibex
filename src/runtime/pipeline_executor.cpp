@@ -1387,17 +1387,8 @@ class TwoPhaseFilterOperator final : public Operator {
 /// measured 100ms against 36ms for the plain serial path, and it got worse once
 /// the grain was derived, because that turned 2 morsels into 32. When the
 /// answer is no, the input has to run as ONE whole-table chunk.
-///
-/// Two thresholds, because a pipeline's cost has two dimensions. Rows alone
-/// cannot express it: 131,072 rows won at 6 columns and lost at 2 on the very
-/// same predicate, and every row threshold puts those on the same side.
-[[nodiscard]] auto is_worth_morselizing(const ExecutionContext& exec, std::size_t rows,
-                                        std::size_t columns) -> bool {
-    if (rows < exec.parallel_min_rows) {
-        return false;
-    }
-    return exec.parallel_min_cells == 0 || columns == 0 ||
-           rows * columns >= exec.parallel_min_cells;
+[[nodiscard]] auto is_worth_morselizing(const ExecutionContext& exec, std::size_t rows) -> bool {
+    return rows >= exec.parallel_min_rows;
 }
 
 [[nodiscard]] auto morsel_worker_count(const ExecutionContext& exec, std::uint64_t morsel_count)
@@ -1505,7 +1496,7 @@ auto build_materialized_map_run(const physical::Plan& plan, const std::vector<Ma
     // earn is an honest counter -- see below -- and not doing work whose only
     // consumer is a worker that will not exist.
     const std::size_t worker_count =
-        is_worth_morselizing(exec, owned->rows(), owned->columns.size())
+        is_worth_morselizing(exec, owned->rows())
             ? morsel_worker_count(exec, expected_morsels)
             : 0;
     const bool morselize = worker_count >= 2;

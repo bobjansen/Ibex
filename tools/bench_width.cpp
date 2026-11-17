@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
     enable_huge_pages();
     CLI::App app{"I7 prepared-data rows-by-width fan-out sweep"};
     std::vector<std::size_t> sizes{65536, 131072, 262144}, widths{2, 6, 16};
-    std::size_t repeats = 12, cores = 8, keep_every = 1, cell_floor = 0;
+    std::size_t repeats = 12, cores = 8, keep_every = 1;
     std::string mode = "emit";
     app.add_option("--rows", sizes)->delimiter(',')->check(CLI::PositiveNumber);
     app.add_option("--widths", widths)->delimiter(',')->check(CLI::PositiveNumber);
@@ -39,14 +39,13 @@ int main(int argc, char** argv) {
     app.add_option("--cores", cores)->check(CLI::PositiveNumber);
     app.add_option("--keep-every", keep_every)->check(CLI::PositiveNumber);
     app.add_option("--mode", mode)->check(CLI::IsMember({"emit", "gather", "filter", "project"}));
-    app.add_option("--cell-floor", cell_floor);
     CLI11_PARSE(app, argc, argv);
     if (repeats % 2)
         ++repeats;
     try {
         std::puts(
-            "rows,width,output_rows,cores,mode,repeat,side,ms,total_ms,cpu_ms,pool_ms,tasks,cell_"
-            "floor,pipelines");
+            "rows,width,output_rows,cores,mode,repeat,side,ms,total_ms,cpu_ms,pool_ms,tasks,"
+            "pipelines");
         for (const auto rows : sizes)
             for (const auto width : widths) {
                 if ((mode == "emit" || (mode == "filter" || mode == "project")) && width < 2)
@@ -131,7 +130,6 @@ int main(int argc, char** argv) {
                     ExecutionContext exec;
                     exec.parallel_threads = mode == "emit" ? cores : parallel ? cores : 1;
                     exec.parallel_min_rows = 0;
-                    exec.parallel_min_cells = cell_floor;
                     ParallelPipelineStats stats;
                     exec.parallel_stats = &stats;
                     exec.execution_profile = std::make_shared<ExecutionProfileState>(cores, false);
@@ -190,7 +188,7 @@ int main(int argc, char** argv) {
                         std::chrono::duration<double, std::milli>(end - start).count();
                     if (emit)
                         std::printf(
-                            "%zu,%zu,%zu,%zu,%s,%zu,%s,%.6f,%.6f,%.6f,%.6f,%llu,%zu,%llu\n", rows,
+                            "%zu,%zu,%zu,%zu,%s,%zu,%s,%.6f,%.6f,%.6f,%.6f,%llu,%llu\n", rows,
                             width, output_rows, cores, mode.c_str(), repeat,
                             parallel ? "parallel" : "serial",
                             (mode == "filter" || mode == "project")
@@ -198,7 +196,7 @@ int main(int argc, char** argv) {
                                 : static_cast<double>(stage_ns) / 1e6,
                             total_ms, 1000.0 * static_cast<double>(cpu_end - cpu) / CLOCKS_PER_SEC,
                             static_cast<double>(pool_ns) / 1e6,
-                            static_cast<unsigned long long>(tasks), cell_floor,
+                            static_cast<unsigned long long>(tasks),
                             static_cast<unsigned long long>(stats.parallel_pipelines.load()));
                 };
                 run(false, 0, false);

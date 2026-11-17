@@ -896,10 +896,6 @@ struct ColumnGatherJob {
 /// per-column semantics (the join's sentinel handling) keeps them in one place.
 /// It takes the INDEX rather than the job so a caller can reach its own
 /// parallel array of per-column state.
-///
-/// The admission test consults `parallel_min_cells` as well as
-/// `parallel_min_rows`: the cost scales with output WIDTH as much as with rows,
-/// which is the same reason the pipeline and the sort's gather both test it.
 template <typename GatherWhole>
 [[nodiscard]] auto gather_columns_batched(std::span<const ColumnGatherJob> jobs, std::size_t total,
                                           const ExecutionContext* exec,
@@ -915,8 +911,7 @@ template <typename GatherWhole>
     const std::size_t threads = std::min(budget, pool_size);
     const bool worth_it =
         exec != nullptr && exec->can_fan_out() && !on_worker_pool_thread() && threads >= 2 &&
-        !jobs.empty() && total > 0 && total >= exec->parallel_min_rows &&
-        (exec->parallel_min_cells == 0 || total * jobs.size() >= exec->parallel_min_cells);
+        !jobs.empty() && total > 0 && total >= exec->parallel_min_rows;
 
     if (!worth_it) {
         // Serial by decision: the fan-out choice is made here, once, so the

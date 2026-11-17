@@ -459,7 +459,6 @@ TEST_CASE("A parallel run below a serial step still reaches the workers",
     runtime::ExecutionContext parallel;
     parallel.parallel_threads = 4;
     parallel.parallel_min_rows = 0;
-    parallel.parallel_min_cells = 0;
     parallel.parallel_grain = 4'096;
     parallel.parallel_stats = &stats;
 
@@ -521,7 +520,6 @@ TEST_CASE("A fused step runs over morsels", "[physical][execute][fusion][paralle
     runtime::ExecutionContext parallel;
     parallel.parallel_threads = 4;
     parallel.parallel_min_rows = 0;
-    parallel.parallel_min_cells = 0;
     parallel.parallel_grain = 4'096;
     parallel.parallel_stats = &stats;
 

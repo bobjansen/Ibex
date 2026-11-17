@@ -559,8 +559,7 @@ auto gather_rows_parallel(const Table& input, const std::vector<Idx>& idx,
     const std::size_t threads = std::min(budget, pool_size);
     const bool worth_it =
         exec.can_fan_out() && !on_worker_pool_thread() && threads >= 2 && n_cols != 0 &&
-        rows >= exec.parallel_min_rows &&
-        (exec.parallel_min_cells == 0 || rows * n_cols >= exec.parallel_min_cells);
+        rows >= exec.parallel_min_rows;
     if (!worth_it) {
         return gather_rows(input, idx, ordering);
     }

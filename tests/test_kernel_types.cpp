@@ -1294,7 +1294,6 @@ TEST_CASE("Parallel row-local update splits inside the chunk kernel",
     runtime::ExecutionContext exec;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_grain = 4'096;
     exec.parallel_stats = &stats;
 
@@ -1371,7 +1370,6 @@ TEST_CASE("A compiled numeric tree splits inside the chunk kernel", "[kernel][up
     runtime::ExecutionContext exec;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_grain = 4'096;
     exec.parallel_stats = &stats;
 
@@ -1493,7 +1491,6 @@ TEST_CASE("A parallel multi-field update folds inside the chunk kernel",
     runtime::ExecutionContext exec;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_grain = 4'096;
     exec.parallel_stats = &stats;
 
@@ -1543,7 +1540,6 @@ TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][pa
     runtime::ExecutionContext exec;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_grain = 4'096;
     exec.parallel_stats = &stats;
 
@@ -1586,7 +1582,6 @@ TEST_CASE("Substring with bound scalar bounds takes the direct plan",
     runtime::ExecutionContext exec;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     exec.parallel_grain = 4'096;
     exec.parallel_stats = &stats;
 

@@ -355,7 +355,7 @@ struct BreakerPhase {
 
 /// `order`'s single `sort` phase. Unlike distinct, the fan-out already lives in
 /// `sort.cpp` (`radix_sort_by_key`, `gather_rows_parallel`) gated on the *shared*
-/// `parallel_min_rows` / `parallel_min_cells` knobs, not a private constant --
+/// `parallel_min_rows` knob, not a private constant --
 /// so `row_floor` is left 0, which `resolve_breaker_parallelism` fills from
 /// `exec.parallel_min_rows`. There is no per-breaker worker ceiling. The phase
 /// is descriptive: `ChunkedOrderOperator` buffers and calls `order_table`,

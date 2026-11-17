@@ -3007,7 +3007,6 @@ TEST_CASE("join: a parallel asof join gives the serial, row-order answer",
     runtime::ExecutionContext parallel;
     parallel.parallel_threads = 4;
     parallel.parallel_min_rows = 0;
-    parallel.parallel_min_cells = 0;
     const auto run = [&](const char* src, const runtime::ExecutionContext& exec) {
         auto parsed = parser::parse(src);
         REQUIRE(parsed.has_value());
@@ -3138,7 +3137,6 @@ TEST_CASE("join: a parallel unique-key inner join gives the serial rows in order
     runtime::ExecutionContext parallel;
     parallel.parallel_threads = 4;
     parallel.parallel_min_rows = 0;
-    parallel.parallel_min_cells = 0;
     const auto run = [&](const char* src, const runtime::ExecutionContext& exec) {
         auto parsed = parser::parse(src);
         REQUIRE(parsed.has_value());

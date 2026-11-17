@@ -133,10 +133,6 @@ auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, st
     exec.parallel_grain = grain;
     exec.parallel_threads = threads;
     exec.parallel_min_rows = threads > 1 ? 0 : exec.parallel_min_rows;
-    // The pipeline's size gates are two: a row floor and a cell floor. A test
-    // table clears neither, so both have to be lifted or the worker path is
-    // silently never taken.
-    exec.parallel_min_cells = threads > 1 ? 0 : exec.parallel_min_cells;
     exec.parallel_stats = stats;
     auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
     INFO((result.has_value() ? std::string{} : result.error()));
@@ -2478,7 +2474,6 @@ TEST_CASE("E2E: a bounded morsel producer leaves room for downstream work",
     exec.parallel_threads = pool.size();
     exec.parallel_grain = 7;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
     runtime::ParallelPipelineStats stats;
     exec.parallel_stats = &stats;
     auto plan = runtime::physical::plan_physical(**lowered, tables, nullptr);
@@ -2690,7 +2685,6 @@ auto run_failing_pipeline(bool interrupt_before, bool interrupt_during) -> std::
     exec.parallel_grain = 64;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
 
     if (interrupt_before) {
         runtime::request_interrupt();
@@ -2747,7 +2741,6 @@ TEST_CASE("E2E: morsel pipeline cancels cleanly when interrupted", "[e2e][parall
     exec.parallel_grain = 7;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
-    exec.parallel_min_cells = 0;
 
     runtime::request_interrupt();
     auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
@@ -3040,7 +3033,6 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         runtime::ExecutionContext exec;
         exec.parallel_threads = threads;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         exec.parallel_stats = &stats;
         auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
         REQUIRE(result.has_value());
@@ -3135,7 +3127,6 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         runtime::ExecutionContext exec;
         exec.parallel_threads = 4;
         exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = 0;
         runtime::ParallelPipelineStats stats;
         exec.parallel_stats = &stats;
         auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
@@ -3144,20 +3135,14 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
     }
 }
 
-TEST_CASE("E2E: the pipeline size gate counts cells, not rows", "[e2e][parallel]") {
-    // An pipeline copies rows out, so its cost scales with table WIDTH. Measured:
-    // 131,072 rows won at 6 columns and lost at 2, on the same predicate --
-    // both clear any sane row threshold, and only the cell count separates
-    // them. A row-only gate cannot express that, which is why the narrow case
-    // was the one shape still regressing.
-    //
+TEST_CASE("E2E: the pipeline size gate is a row floor", "[e2e][parallel]") {
     // Asserted in both directions on the SAME table, varying only the
     // threshold: a gate that never fired and a gate that always fired would
     // each pass a one-sided test.
     auto tables = make_wide_pipeline_table(1000);  // 1000 rows x 3 columns
     const auto* src = "t[filter price > 350];";
 
-    auto run_with_cell_gate = [&](std::size_t min_cells, runtime::ParallelPipelineStats& stats) {
+    auto run_with_row_gate = [&](std::size_t min_rows, runtime::ParallelPipelineStats& stats) {
         auto parsed = parser::parse(src);
         REQUIRE(parsed.has_value());
         auto lowered = parser::lower(*parsed);
@@ -3165,33 +3150,25 @@ TEST_CASE("E2E: the pipeline size gate counts cells, not rows", "[e2e][parallel]
         runtime::ExecutionContext exec;
         exec.parallel_grain = 7;
         exec.parallel_threads = 4;
-        exec.parallel_min_rows = 0;
-        exec.parallel_min_cells = min_cells;
+        exec.parallel_min_rows = min_rows;
         exec.parallel_stats = &stats;
         auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
         REQUIRE(result.has_value());
         return std::move(*result);
     };
 
-    SECTION("enough cells fans out") {
+    SECTION("enough rows fans out") {
         runtime::ParallelPipelineStats stats;
-        auto pipeline = run_with_cell_gate(1000, stats);  // 3000 cells >= 1000
+        auto pipeline = run_with_row_gate(1000, stats);  // 1000 rows >= 1000
         CHECK(stats.parallel_pipelines.load() == 1);
         require_tables_equal(run(src, tables), pipeline);
     }
 
-    SECTION("too few cells stays serial, and still answers identically") {
+    SECTION("too few rows stays serial, and still answers identically") {
         runtime::ParallelPipelineStats stats;
-        auto pipeline = run_with_cell_gate(10000, stats);  // 3000 cells < 10000
+        auto pipeline = run_with_row_gate(1001, stats);  // 1000 rows < 1001
         CHECK(stats.parallel_pipelines.load() == 0);
         CHECK(stats.serial_pipelines.load() == 1);
-        require_tables_equal(run(src, tables), pipeline);
-    }
-
-    SECTION("zero disables the gate") {
-        runtime::ParallelPipelineStats stats;
-        auto pipeline = run_with_cell_gate(0, stats);
-        CHECK(stats.parallel_pipelines.load() == 1);
         require_tables_equal(run(src, tables), pipeline);
     }
 }

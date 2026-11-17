@@ -159,7 +159,6 @@ int main(int argc, char** argv) {
                         ExecutionContext exec;
                         exec.parallel_threads = budget;
                         exec.parallel_min_rows = 0;
-                        exec.parallel_min_cells = 0;
                         exec.operator_grain_policy = candidate ? target : OperatorGrainPolicy{};
                         exec.execution_profile =
                             std::make_shared<ExecutionProfileState>(budget, false);

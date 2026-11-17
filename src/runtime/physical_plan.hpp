@@ -267,7 +267,7 @@ struct AggregatePlan {
 /// `strategy=... fused=Join counted=<col>` for tests and `explain physical`.
 [[nodiscard]] auto explain_aggregate(const AggregatePlan& plan) -> std::string;
 
-// --- Breaker parallelism (src/runtime/PARALLELISM.md, "Target: parallelism as
+// --- Breaker parallelism (src/runtime/PARALLELISM.md, "Parallelism as
 // a plan decision"). A breaker's fan-out was private to its operator in
 // `chunked.cpp` — invisible to `explain physical`, un-A/B-able except through
 // `IBEX_CORES`. These types move the *decision* and the *tunable* onto the

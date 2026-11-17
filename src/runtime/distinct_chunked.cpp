@@ -922,7 +922,7 @@ class ChunkedDistinctOperator final : public Operator {
     /// (`build_physical_distinct` from a footer estimate, `distinct_table` from
     /// the input's exact row count). The operator reads it -- see
     /// `dedup_partition_count` -- rather than deciding for itself.
-    /// src/runtime/PARALLELISM.md, "Target: parallelism as a plan decision".
+    /// src/runtime/PARALLELISM.md, "Parallelism as a plan decision".
     physical::BreakerParallelism dedup_plan_{};
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
     TypedDedup<std::int64_t> seen_i64_;

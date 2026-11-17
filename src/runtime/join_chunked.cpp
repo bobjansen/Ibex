@@ -957,7 +957,7 @@ struct JoinProbe {
     /// The floor (`1U << 14U`) and the worker cap (`min(compute_budget, pool,
     /// 64)`) are the `probe` phase of the physical plan
     /// (`physical::join_probe_parallelism`), read from `probe_plan_`.
-    /// src/runtime/PARALLELISM.md, "Target: parallelism as a plan decision".
+    /// src/runtime/PARALLELISM.md, "Parallelism as a plan decision".
     /// The checks that stay here are the ones only the operator can make:
     /// `parallel_join_probe` (a feature toggle), nesting (`on_worker_pool_thread` -- no
     /// nested pool submissions), and whether *this chunk* cleared the floor (a
@@ -2755,7 +2755,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// 64)`) used to be computed here; they are now the `hash-build` phase of
     /// the physical plan (`physical::join_hash_build_parallelism`), resolved by
     /// the builder and read from `par_.build`. src/runtime/PARALLELISM.md,
-    /// "Target: parallelism as a plan decision". The conditions that stay here
+    /// "Parallelism as a plan decision". The conditions that stay here
     /// are the ones only the operator can judge: whether it is nested under
     /// another fan-out
     /// (`on_worker_pool_thread` -- no nested pool submissions), and whether

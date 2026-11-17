@@ -604,7 +604,8 @@ algorithms, SIMD blocks, scratch budgets, buffer compaction and output batching;
 those are not competing parallel-admission authorities.
 
 **The remaining limits**, catalogued from 2026-08 onward (the I-numbers are
-cited in code; resolved entries are in the retired plan). Some are deliberate
+cited in code; entries resolved before 2026-10-05 are in the retired plan,
+later ones are noted above). Some are deliberate
 capability limits, others are inconsistent policy or incomplete migrations.
 
 - **I2** — String/Categorical are excluded from two fan-out decisions, each
@@ -751,7 +752,7 @@ depends on measured row counts a plan cannot know):
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Is this fan-out permitted by the query's budget? (`exec.can_fan_out()`)                                                                                                       | Am I running nested under another fan-out? (`on_worker_pool_thread()`)                                   |
 | The worker **cap** — `min(compute_budget, pool_size, breaker_max_workers)`, computed **once**, in `resolve_breaker_parallelism`, not open-coded per operator                  | Did the observed input clear the path's gate? (per-chunk or cumulative rows, groups, cardinality, and shape)  |
-| The row **floor** — a named constant per breaker category, in `physical_plan.cpp`, not in the operator                                                                        | The partition count — derived from policy and workload; locality partitioning at one core may use more partitions than workers               |
+| The row **floor** — carried on the plan, not in the operator: a named constant (Distinct), derived from a context-overridable policy (Join, Aggregate), or the shared knob (Order) | The partition count — derived from policy and workload; locality partitioning at one core may use more partitions than workers               |
 | The partition **strategy** (`PartitionStrategy`: packed-key, radix-hash, owned, row-range, head-table, range, morsel, column-range)                                           | —                                                                                                        |
 | A row **estimate** when one is available (a registered table's exact count, footer stats for a bare scan, a child's exact count), and the fan-out **prediction** that follows from it | —                                                                                                        |
 
@@ -852,9 +853,10 @@ Breaker(Head)
 ```
 
 Join — the strategy line, the typed edge, the resolved key columns, then one
-line per fan-out node. Both floors (`kJoinBuildRowFloor` = `1U << 17U`,
-`kJoinProbeRowFloor` = `1U << 14U`) and the shared `min(budget, pool, 64)` cap
-live on the plan; `resolved_join_parallelism` fills a
+line per fan-out node. Both floors (`JoinThresholdPolicy::build_min_rows` =
+`1U << 17U`, `probe_min_rows` = `1U << 14U`, overridable through
+`ExecutionContext::join_threshold_policy`) and the shared
+`min(budget, pool, 64)` cap live on the plan; `resolved_join_parallelism` fills a
 `physical::JoinParallelism` at build time and the operator reads it. A streaming
 left join prints the same with `branch=SingleKeyLeft`.
 
@@ -880,7 +882,7 @@ Breaker(Aggregate)
          input estimate 4 rows (table)
   Accumulation: parallel-capable  cap=unresolved  floor 131072  partitions=derived  morsel (deterministic row ranges)
          input estimate 4 rows (table)
-  FinalOrdering: parallel-capable  cap=unresolved  floor 131072  partitions=derived  owned
+  FinalOrdering: parallel-capable  cap=unresolved  floor 65536  partitions=derived  owned
          input estimate 4 rows (table)
   Emission: parallel-capable  cap=unresolved  floor (shared parallel_min_rows)  partitions=derived  column-range (output column x group range)
          input estimate 4 rows (table)

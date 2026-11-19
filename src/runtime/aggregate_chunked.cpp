@@ -5252,7 +5252,8 @@ class HashAggregateState final {
         // The hashes of the rows of sampled keys (`group_sampled`), per range;
         // pass 3 caps its table reserve by the estimate they give.
         std::vector<std::vector<std::uint64_t>> group_samples(ranges);
-        const auto is_head = [&](std::size_t row, std::size_t range_begin) {
+        const auto is_head = [&]([[maybe_unused]] std::size_t row,
+                                 [[maybe_unused]] std::size_t range_begin) {
             if constexpr (kRunHeads) {
                 return row == range_begin || !(row_keys[row] == row_keys[row - 1]);
             } else {

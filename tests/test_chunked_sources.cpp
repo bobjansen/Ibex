@@ -3930,13 +3930,14 @@ TEST_CASE("chunked aggregate: packed keys keep Categorical columns as codes acro
     // reading its text through the dictionary. A later chunk over the same
     // dictionary extends the codes; one over another dictionary (reordered,
     // with a new label) has the text stored first; one whose key turns
-    // nullable migrates the aggregate to the generic path, which then hashes
-    // and compares the stored keys by text. Expected values are computed
-    // here, in first-seen order.
+    // nullable migrates the aggregate to the generic path. The combined
+    // transition keeps comparing labels across different dictionaries.
+    // The reference counts and sums groups in first-seen order.
     constexpr std::size_t kRows = 40'000;  // over the partitioned path's row gate
-    enum class Later : std::uint8_t { SameDictionary, OtherDictionary, Nulls };
+    enum class Later : std::uint8_t { SameDictionary, OtherDictionary, Nulls, OtherWithNulls };
 
-    for (const Later later : {Later::SameDictionary, Later::OtherDictionary, Later::Nulls}) {
+    for (const Later later :
+         {Later::SameDictionary, Later::OtherDictionary, Later::Nulls, Later::OtherWithNulls}) {
         INFO("later chunk " << static_cast<int>(later));
         // Fresh per run, each with an index that matches it: a dictionary is
         // shared append-only, so the output may grow it (here with `t`).
@@ -3949,28 +3950,33 @@ TEST_CASE("chunked aggregate: packed keys keep Categorical columns as codes acro
                              std::move(index)};
         };
         const auto [dict_a, index_a] = dictionary({"p", "q", "r", "s"});
-        const auto [dict_a2, index_a2] = dictionary({"s", "t", "q", "p", "r"});
+        // The reordered chunk opens with the first stored key, "p", whose
+        // code moved from 0 to 1. A new label arrives later in the chunk.
+        const auto [dict_a2, index_a2] = dictionary({"s", "p", "q", "t", "r"});
         const auto [dict_b, index_b] = dictionary({"x", "y", "z"});
         std::vector<std::string> order;
         std::map<std::string, std::pair<std::int64_t, std::int64_t>> want;
         std::vector<runtime::Chunk> chunks;
-        for (std::size_t k = 0; k < 2; ++k) {
-            const bool other = k == 1 && later == Later::OtherDictionary;
+        const std::size_t n_chunks = later == Later::OtherWithNulls ? 3 : 2;
+        for (std::size_t k = 0; k < n_chunks; ++k) {
+            const bool other =
+                k == 1 && (later == Later::OtherDictionary || later == Later::OtherWithNulls);
             const auto& a_dict = other ? dict_a2 : dict_a;
-            const bool nulls = k == 1 && later == Later::Nulls;
+            const bool nulls = k == 1 && (later == Later::Nulls || later == Later::OtherWithNulls);
             Column<Categorical> a{a_dict, other ? index_a2 : index_a};
             Column<Categorical> b{dict_b, index_b};
             Column<std::int64_t> c;
             Column<std::int64_t> v;
             runtime::ValidityBitmap a_valid;
-            for (std::size_t i = 0; i < kRows; ++i) {
+            const std::size_t rows = k == 2 ? 31 : kRows;
+            for (std::size_t i = 0; i < rows; ++i) {
                 const auto a_code =
                     static_cast<Column<Categorical>::code_type>(((i * 7) + k) % a_dict->size());
                 const auto b_code = static_cast<Column<Categorical>::code_type>((i / 3) % 3);
                 const auto c_value = static_cast<std::int64_t>((i * 13) % 997) - 400;
                 const auto value = static_cast<std::int64_t>(i % 101);
                 const bool a_ok = !nulls || i % 11 != 4;
-                a.push_code(a_code);
+                a.push_code(a_ok ? a_code : 123456789);
                 b.push_code(b_code);
                 c.push_back(c_value);
                 v.push_back(value);
@@ -4586,6 +4592,187 @@ TEST_CASE("sparse nullable categorical pairs retain compact code keys across chu
             if (!measuring)
                 CHECK(runtime::nullable_cat_key_chunks().load() - before ==
                       (scenario == 0 ? 3 : 2));
+        }
+    }
+}
+
+TEST_CASE("wide and nullable categorical discovery keeps codes when its layout changes",
+          "[runtime][chunked][aggregate][categorical-transitions]") {
+    using Cat = Column<Categorical>;
+    using Code = Cat::code_type;
+    const bool measuring = std::getenv("IBEX_CAT_TRANSITION_BENCH") != nullptr;
+    struct Scenario {
+        std::size_t arity;
+        bool starts_packed;
+        bool later_nulls;
+        bool mixed = false;
+    };
+    for (const auto scenario :
+         {Scenario{3, false, true}, Scenario{9, false, false}, Scenario{9, false, true},
+          Scenario{3, true, true}, Scenario{9, true, true}, Scenario{3, true, true, true}}) {
+        const auto [arity, starts_packed, later_nulls, mixed] = scenario;
+        INFO("keys=" << arity << " packed=" << starts_packed << " nulls=" << later_nulls
+                     << " mixed=" << mixed);
+        const std::size_t long_chunk = measuring ? 250000 : 40000;
+        // Both packed cases exceed the dense limit and fit the same initial
+        // word size. The later validity bitmap forces a different layout.
+        const std::size_t first_labels = !starts_packed ? 2 : arity == 9 ? 64 : 512;
+        constexpr std::size_t later_labels = 1024;
+
+        using Key = std::vector<Code>;
+        std::map<Key, std::size_t> ids;
+        std::vector<Key> order;
+        std::vector<std::int64_t> counts;
+        struct Source final : runtime::Operator {
+            std::vector<runtime::Chunk> chunks;
+            std::vector<Cat> dictionaries;
+            std::size_t pos = 0;
+            std::size_t first_labels;
+            std::size_t later_labels;
+
+            Source(const std::vector<runtime::Chunk>& input, std::size_t keys, std::size_t first,
+                   std::size_t later)
+                : chunks(input), dictionaries(keys), first_labels(first), later_labels(later) {}
+
+            auto next() -> std::expected<std::optional<runtime::Chunk>, std::string> override {
+                if (pos == chunks.size()) {
+                    return std::optional<runtime::Chunk>{};
+                }
+                auto chunk = std::move(chunks[pos]);
+                for (std::size_t c = 0; c < dictionaries.size(); ++c) {
+                    const auto* col = std::get_if<Cat>(chunk.columns[c].column.get());
+                    if (col == nullptr) {
+                        continue;
+                    }
+                    auto& dict = dictionaries[c];
+                    const std::size_t labels = pos == 0 ? first_labels : later_labels;
+                    for (std::size_t i = dict.dictionary_size(); i < labels; ++i) {
+                        dict.push_back("v" + std::to_string(i));
+                    }
+                    Cat::codes_storage codes(col->codes_data(), col->codes_data() + col->size());
+                    chunk.columns[c].column = std::make_shared<runtime::ColumnValue>(
+                        Cat(dict.dictionary_ptr(), dict.index_ptr(), std::move(codes)));
+                }
+                ++pos;
+                return std::optional<runtime::Chunk>{std::move(chunk)};
+            }
+        };
+
+        std::vector<runtime::Chunk> chunks;
+        for (const std::size_t phase : {0U, 1U, 2U}) {
+            const std::size_t rows = phase == 1 || (phase == 0 && starts_packed) ? long_chunk : 11;
+            const std::size_t width = phase == 1 ? later_labels : first_labels;
+            std::vector<Cat::codes_storage> codes(arity);
+            std::vector<runtime::ValidityBitmap> validity(arity);
+            for (std::size_t row = 0; row < rows; ++row) {
+                const Code a = static_cast<Code>(row % width);
+                const Code b = static_cast<Code>((row / width) % width);
+                Key key(arity);
+                for (std::size_t c = 0; c < arity; ++c) {
+                    const bool has_bitmap = (phase == 0 && starts_packed && c == arity - 2) ||
+                                            (phase == 1 && later_nulls && c == arity - 1);
+                    const bool valid = !has_bitmap || row % 17 != 0;
+                    // Keep null and code zero distinct, including in the last
+                    // field of a key wider than the fixed-width representation.
+                    const auto code = c == 0 ? a : c == arity - 1 ? b : a % 2;
+                    key[c] = valid ? code : -1;
+                    codes[c].push_back(valid ? code : measuring ? 0 : 123456789);
+                    if (has_bitmap) {
+                        validity[c].push_back(valid);
+                    }
+                }
+                const auto [it, fresh] = ids.emplace(key, order.size());
+                if (fresh) {
+                    order.push_back(std::move(key));
+                    counts.push_back(0);
+                }
+                ++counts[it->second];
+            }
+            runtime::Table table;
+            Cat placeholder;
+            for (std::size_t c = 0; c < arity; ++c) {
+                const std::string name = "k" + std::to_string(c);
+                if (mixed && c == arity - 1) {
+                    Column<std::int64_t> ints;
+                    for (const auto code : codes[c]) {
+                        ints.push_back(code);
+                    }
+                    table.add_column(name, std::move(ints));
+                } else {
+                    table.add_column(name, Cat(placeholder.dictionary_ptr(),
+                                               placeholder.index_ptr(), std::move(codes[c])));
+                }
+                if (!validity[c].empty()) {
+                    table.columns[c].validity = std::move(validity[c]);
+                }
+            }
+            runtime::Chunk chunk;
+            chunk.columns = std::move(table.columns);
+            chunks.push_back(std::move(chunk));
+        }
+
+        runtime::ExternRegistry externs;
+        externs.register_chunked_table("cat_transitions", [&](const runtime::ExternArgs&) {
+            return std::expected<runtime::OperatorPtr, std::string>{
+                std::make_unique<Source>(chunks, arity, first_labels, later_labels)};
+        });
+        std::string query =
+            "extern fn cat_transitions() -> DataFrame from \"x.hpp\"; "
+            "cat_transitions()[select { n = count() }, by { k0";
+        for (std::size_t c = 1; c < arity; ++c) {
+            query += ", k" + std::to_string(c);
+        }
+        auto parsed = parser::parse(query + " }];");
+        REQUIRE(parsed.has_value());
+        auto ir = parser::lower(*parsed);
+        REQUIRE(ir.has_value());
+        for (const std::size_t cores : {1U, 8U}) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = cores;
+            const runtime::TableRegistry registry;
+            const auto seeds_before = runtime::late_partitioned_seeds().load();
+            const auto nullable_before = runtime::nullable_cat_key_chunks().load();
+            const auto start = std::chrono::steady_clock::now();
+            auto out = runtime::interpret(**ir, registry, nullptr, &externs, nullptr, exec);
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                    .count();
+            if (measuring) {
+                std::fprintf(stderr,
+                             "transition keys=%zu packed=%d nulls=%d mixed=%d cores=%zu ms=%.6f\n",
+                             arity, starts_packed, later_nulls, mixed, cores, ms);
+            }
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == order.size());
+            const auto& n = std::get<Column<std::int64_t>>(*out->find("n"));
+            bool same = true;
+            for (std::size_t c = 0; c < arity; ++c) {
+                const auto* entry = out->find_entry("k" + std::to_string(c));
+                REQUIRE(entry != nullptr);
+                const auto* cat = std::get_if<Cat>(entry->column.get());
+                for (std::size_t g = 0; g < order.size(); ++g) {
+                    const Code code = order[g][c];
+                    same = same && runtime::is_null(*entry, g) == (code < 0);
+                    if (code >= 0) {
+                        same = same &&
+                               (cat != nullptr
+                                    ? (*cat)[g] == "v" + std::to_string(code)
+                                    : std::get<Column<std::int64_t>>(*entry->column)[g] == code);
+                    }
+                }
+            }
+            CHECK(same);
+            CHECK(std::equal(counts.begin(), counts.end(), n.begin(), n.end()));
+            if (!measuring && cores == 8 && !mixed) {
+                if (starts_packed && arity == 3) {
+                    CHECK(runtime::late_partitioned_seeds().load() == seeds_before);
+                } else {
+                    CHECK(runtime::late_partitioned_seeds().load() > seeds_before);
+                }
+            }
+            if (!measuring && later_nulls && !mixed) {
+                CHECK(runtime::nullable_cat_key_chunks().load() - nullable_before == 2);
+            }
         }
     }
 }

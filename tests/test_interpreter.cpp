@@ -19818,6 +19818,19 @@ TEST_CASE("Scan pipeline workers accumulate a dense Categorical aggregate",
     CHECK(stats.untranslated_categorical_columns.load() == 2 * (kCatUnits - 1));
     same_columns(streamed, reference);
 
+    // f is an input to the aggregate, so the pipeline translates it before
+    // merge. The worker's rows must still identify the correct text after
+    // remapping, and the unrelated grouping column can stay untranslated.
+    const char* text =
+        "df[select { a = first(f), b = last(f), lo = min(f), hi = max(f), "
+        "n = count() }, by { f, s }];";
+    runtime::ParallelPipelineStats text_serial;
+    runtime::ParallelPipelineStats text_stats;
+    same_columns(run(text, 4, text_stats), run(text, 1, text_serial));
+    CHECK(text_stats.pipelined_scans.load() == 1);
+    CHECK(text_stats.parallel_fields.load() == 0);
+    CHECK(text_stats.untranslated_categorical_columns.load() == kCatUnits - 1);
+
     // One key is not the fused shape: the aggregate accumulates as before.
     const char* single = "df[select { total = sum(v), n = count() }, by { f }];";
     runtime::ParallelPipelineStats single_serial;

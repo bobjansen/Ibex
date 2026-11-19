@@ -349,6 +349,8 @@ struct KeyCol {
     const Column<bool>* boolean{nullptr};
     const Column<std::string>* str{nullptr};
     const Column<Categorical>* cat{nullptr};
+    // Optional value hashes indexed by this column's dictionary codes.
+    const std::size_t* cat_hashes{nullptr};
     const Date* date{nullptr};
     const Timestamp* ts{nullptr};
     /// Units only: within one key column every row shares the column's scale,
@@ -442,8 +444,12 @@ inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> st
                 mix(decimal::hash_units(col.dec[row].units));
                 break;
             case KeyCol::Kind::Str:
-            case KeyCol::Kind::Cat:
                 mix(std::hash<std::string_view>{}(col.text(row)));
+                break;
+            case KeyCol::Kind::Cat:
+                mix(col.cat_hashes == nullptr
+                        ? std::hash<std::string_view>{}(col.text(row))
+                        : col.cat_hashes[static_cast<std::size_t>(col.cat->code_at(row))]);
                 break;
         }
     }

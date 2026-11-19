@@ -2,15 +2,18 @@
 // Copyright (C) 2026 Bob Jansen
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/runtime/table_compare.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -354,6 +357,8 @@ TEST_CASE("categorical first and last keep codes, and survive a dictionary chang
           "[aggregate][audit][categorical]") {
     const bool with_nulls = GENERATE(false, true);
     const bool second_dictionary = GENERATE(false, true);
+    const auto workers = GENERATE(std::size_t{1}, std::size_t{2});
+    constexpr std::size_t repeats = 64;
     using Cat = Column<Categorical>;
     const auto shared_dict = std::make_shared<std::vector<std::string>>(
         std::vector<std::string>{"a", "b", "c", "d", "e"});
@@ -372,20 +377,20 @@ TEST_CASE("categorical first and last keep codes, and survive a dictionary chang
                                 std::vector<bool> valid) {
         runtime::Chunk c;
         Column<std::int64_t> k;
-        for (const std::int64_t key : keys) {
-            k.push_back(key);
+        Cat v = own_dictionary ? Cat{} : Cat{shared_dict, shared_index, Cat::codes_storage{}};
+        runtime::ValidityBitmap validity(keys.size() * repeats, true);
+        for (std::size_t row = 0; row < keys.size(); ++row) {
+            for (std::size_t i = 0; i < repeats; ++i) {
+                k.push_back(keys[row]);
+                v.push_back(values[row]);
+                validity.set((row * repeats) + i, valid[row]);
+            }
         }
         c.add_column("k", std::move(k));
-        Cat v = own_dictionary ? Cat{} : Cat{shared_dict, shared_index, Cat::codes_storage{}};
-        for (const auto& value : values) {
-            v.push_back(value);
-        }
-        c.add_column("v", std::move(v));
         if (with_nulls) {
-            c.columns[1].validity = runtime::ValidityBitmap(valid.size(), true);
-            for (std::size_t row = 0; row < valid.size(); ++row) {
-                c.columns[1].validity->set(row, valid[row]);
-            }
+            c.add_column("v", std::move(v), std::move(validity));
+        } else {
+            c.add_column("v", std::move(v));
         }
         return c;
     };
@@ -395,12 +400,27 @@ TEST_CASE("categorical first and last keep codes, and survive a dictionary chang
     const std::vector<ir::ColumnRef> keys{{.name = "k"}};
     const std::vector<ir::AggSpec> aggs{
         {.func = ir::AggFunc::First, .column = {.name = "v"}, .alias = "f"},
-        {.func = ir::AggFunc::Last, .column = {.name = "v"}, .alias = "l"}};
-    auto out = aggregate_chunks(std::move(chunks), keys, aggs);
+        {.func = ir::AggFunc::Last, .column = {.name = "v"}, .alias = "l"},
+        {.func = ir::AggFunc::Count, .column = {}, .alias = "n"}};
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = workers;
+    exec.parallel_stats = &stats;
+    runtime::physical::AggregateParallelism parallelism;
+    parallelism.accumulation.worker_cap = workers;
+    parallelism.phase_policy.accumulation_morsel_rows = 32;
+    auto out =
+        runtime::MaterializeOperator(runtime::make_chunked_aggregate_operator(
+                                         std::make_unique<AggregateChunks>(std::move(chunks), true),
+                                         &keys, &aggs, exec, parallelism, std::nullopt))
+            .run();
     REQUIRE(out.has_value());
+    CHECK(stats.parallel_fields.load() == (workers == 1 ? 0 : 2));
     REQUIRE(out->rows() == 4);
+    const std::array<std::int64_t, 4> counts{3 * repeats, 2 * repeats, 2 * repeats, repeats};
     for (std::size_t g = 0; g < 4; ++g) {
         CHECK(ints(*out, "k")[g] == static_cast<std::int64_t>(g + 1));
+        CHECK(ints(*out, "n")[g] == counts[g]);
     }
     const auto& f = std::get<Cat>(*out->find("f"));
     const auto& l = std::get<Cat>(*out->find("l"));
@@ -430,6 +450,78 @@ TEST_CASE("categorical first and last keep codes, and survive a dictionary chang
     if (!second_dictionary) {
         CHECK(f.dictionary_ptr() == shared_dict);
         CHECK(l.dictionary_ptr() == shared_dict);
+    }
+}
+
+TEST_CASE("text partials retain row order, lexical extrema and nulls",
+          "[aggregate][parallel][text]") {
+    const bool categorical = GENERATE(false, true);
+    const std::string grouping = GENERATE("global", "int", "categorical");
+    CAPTURE(categorical, grouping);
+    constexpr std::size_t repeats = 64;
+    const std::array<std::int64_t, 9> keys{2, 1, 3, 2, 1, 3, 2, 1, 3};
+    const std::array<std::string_view, 9> values{"z", "Z", "bad", "", "z", "bad", "b", "A", "bad"};
+    const std::array<bool, 9> valid{true, true, false, true, false, false, true, true, false};
+    runtime::Chunk chunk;
+    Column<std::int64_t> ints;
+    Column<Categorical> cats, cat_values;
+    Column<std::string> strings;
+    runtime::ValidityBitmap validity(keys.size() * repeats, true);
+    for (std::size_t row = 0; row < keys.size(); ++row) {
+        for (std::size_t i = 0; i < repeats; ++i) {
+            ints.push_back(keys[row]);
+            cats.push_back(std::to_string(keys[row]));
+            cat_values.push_back(values[row]);
+            strings.push_back(values[row]);
+            validity.set((row * repeats) + i, valid[row]);
+        }
+    }
+    if (grouping == "categorical") {
+        chunk.add_column("k", std::move(cats));
+    } else {
+        chunk.add_column("k", std::move(ints));
+    }
+    if (categorical) {
+        chunk.add_column("v", std::move(cat_values), std::move(validity));
+    } else {
+        chunk.add_column("v", std::move(strings), std::move(validity));
+    }
+    const auto by = grouping == "global" ? std::vector<ir::ColumnRef>{}
+                                         : std::vector<ir::ColumnRef>{{.name = "k"}};
+    const std::vector<ir::AggSpec> aggs{
+        {.func = ir::AggFunc::First, .column = {.name = "v"}, .alias = "f"},
+        {.func = ir::AggFunc::Last, .column = {.name = "v"}, .alias = "l"},
+        {.func = ir::AggFunc::Min, .column = {.name = "v"}, .alias = "lo"},
+        {.func = ir::AggFunc::Max, .column = {.name = "v"}, .alias = "hi"}};
+    auto reference = aggregate_chunks({chunk}, by, aggs);
+    REQUIRE(reference.has_value());
+
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 2;
+    exec.parallel_stats = &stats;
+    runtime::physical::AggregateParallelism parallelism;
+    parallelism.accumulation.worker_cap = 2;
+    parallelism.phase_policy.accumulation_morsel_rows = 32;
+    auto out = runtime::MaterializeOperator(
+                   runtime::make_chunked_aggregate_operator(
+                       std::make_unique<AggregateChunks>(std::vector{std::move(chunk)}), &by, &aggs,
+                       exec, parallelism, std::nullopt))
+                   .run();
+    REQUIRE(out.has_value());
+    CHECK(stats.parallel_fields.load() == 1);
+    CHECK_FALSE(runtime::compare_tables(*reference, *out).has_value());
+    CHECK(runtime::text_cell(*out->find("f"), 0) == "z");
+    CHECK(runtime::text_cell(*out->find("l"), 0) == (by.empty() ? "A" : "b"));
+    CHECK(runtime::text_cell(*out->find("lo"), 0).empty());
+    CHECK(runtime::text_cell(*out->find("hi"), 0) == "z");
+    if (!by.empty()) {
+        REQUIRE(out->rows() == 3);
+        CHECK(runtime::text_cell(*out->find("lo"), 1) == "A");
+        CHECK(runtime::text_cell(*out->find("hi"), 1) == "Z");
+        for (const auto& agg : aggs) {
+            CHECK(runtime::is_null(*out->find_entry(agg.alias), 2));
+        }
     }
 }
 

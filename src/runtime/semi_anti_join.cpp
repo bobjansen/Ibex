@@ -44,7 +44,6 @@
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
-#include "physical_plan.hpp"
 #include "runtime_internal.hpp"
 #include "scan_worker_sink_internal.hpp"
 

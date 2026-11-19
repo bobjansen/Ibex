@@ -272,8 +272,12 @@ class CategoricalDictionaryUnifier {
     /// Whether `local` already speaks column `column`'s unified dictionary.
     [[nodiscard]] auto owns(std::size_t column, const Column<Categorical>& local) const noexcept
         -> bool {
-        return column < states_.size() && states_[column].has_value() &&
-               states_[column]->shared.dictionary_identity() == local.dictionary_identity();
+        if (column >= states_.size()) {
+            return false;
+        }
+        const std::optional<State>& state = states_[column];
+        return state.has_value() &&
+               state->shared.dictionary_identity() == local.dictionary_identity();
     }
 
     /// `local`'s rows over column `column`'s unified dictionary. A null row

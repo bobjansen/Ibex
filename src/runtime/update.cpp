@@ -6069,15 +6069,24 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
         if (!variable_output[f]) {
             continue;
         }
-        const bool has_validity = std::ranges::any_of(variable_pieces, [&](const auto& piece) {
-            return piece.fields[f]->validity.has_value();
-        });
-        if (std::holds_alternative<Column<std::string>>(*variable_pieces[0].fields[f]->column)) {
+        // Every group wrote every variable-width field; resolve them once,
+        // outside the row loops.
+        std::vector<const ColumnEntry*> entries(group_count);
+        for (std::size_t group = 0; group < group_count; ++group) {
+            const std::optional<ColumnEntry>& field = variable_pieces[group].fields[f];
+            if (!field.has_value()) {
+                return std::unexpected("update + by: a group did not produce field '" +
+                                       written_field_names[f] + "'");
+            }
+            entries[group] = &*field;
+        }
+        const bool has_validity = std::ranges::any_of(
+            entries, [](const ColumnEntry* entry) { return entry->validity.has_value(); });
+        if (std::holds_alternative<Column<std::string>>(*entries[0]->column)) {
             std::size_t total_chars = 0;
             for (std::size_t row = 0; row < rows; ++row) {
                 const std::size_t group = row_gid[row];
-                const auto& source =
-                    std::get<Column<std::string>>(*variable_pieces[group].fields[f]->column);
+                const auto& source = std::get<Column<std::string>>(*entries[group]->column);
                 const auto local = group_offset[row];
                 const std::size_t count =
                     source.offsets_data()[local + 1] - source.offsets_data()[local];
@@ -6098,7 +6107,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
             }
             for (std::size_t row = 0; row < rows; ++row) {
                 const std::size_t group = row_gid[row];
-                const auto& entry = *variable_pieces[group].fields[f];
+                const ColumnEntry& entry = *entries[group];
                 const auto& source = std::get<Column<std::string>>(*entry.column);
                 const auto local = group_offset[row];
                 const auto begin = source.offsets_data()[local];
@@ -6128,8 +6137,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
         result.reserve(rows);
         std::vector<std::vector<Code>> remaps(group_count);
         for (std::size_t group = 0; group < group_count; ++group) {
-            const auto& source =
-                std::get<CategoricalColumn>(*variable_pieces[group].fields[f]->column);
+            const auto& source = std::get<CategoricalColumn>(*entries[group]->column);
             remaps[group].assign(source.dictionary_size(), kUnmapped);
         }
         std::optional<ValidityBitmap> validity;
@@ -6138,7 +6146,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
         }
         for (std::size_t row = 0; row < rows; ++row) {
             const std::size_t group = row_gid[row];
-            const auto& entry = *variable_pieces[group].fields[f];
+            const ColumnEntry& entry = *entries[group];
             const auto& source = std::get<CategoricalColumn>(*entry.column);
             const auto local = group_offset[row];
             const Code input_code = source.code_at(local);

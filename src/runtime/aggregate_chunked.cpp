@@ -2284,7 +2284,7 @@ class HashAggregateState final {
                 for (std::size_t gid = 0; gid < n_groups_; ++gid) {
                     multi_cat_codes_flat_[gid * 2] =
                         static_cast<Column<Categorical>::code_type>(pair_order_[gid].first);
-                    multi_cat_codes_flat_[gid * 2 + 1] =
+                    multi_cat_codes_flat_[(gid * 2) + 1] =
                         static_cast<Column<Categorical>::code_type>(pair_order_[gid].second);
                 }
                 pair_int_fast_path_ = false;
@@ -5003,7 +5003,7 @@ class HashAggregateState final {
                         }
                     }
                     gids[begin] = gid;
-#if defined(__clang__)
+#ifdef __clang__
 #pragma clang loop unroll_count(4)
 #endif
                     for (std::size_t row = begin + 1; row < end; ++row) {
@@ -5773,7 +5773,7 @@ class HashAggregateState final {
             const auto mask = group_keys_.null_mask(gid);
             for (std::size_t c = 0; c < arity; ++c) {
                 const bool is_null = c < kMaxKeyColumns && (mask & (std::uint64_t{1} << c)) != 0;
-                multi_cat_codes_flat_[gid * arity + c] = is_null ? -1 : key_codes[c][gid];
+                multi_cat_codes_flat_[(gid * arity) + c] = is_null ? -1 : key_codes[c][gid];
                 multi_cat_nullable_[c] |= static_cast<std::uint8_t>(is_null);
             }
             multi_cat_any_nullable_ = multi_cat_any_nullable_ || mask != 0;
@@ -6377,7 +6377,7 @@ class HashAggregateState final {
                 pair_order_.resize(n_groups_);
                 for (std::size_t gid = 0; gid < n_groups_; ++gid) {
                     pair_order_[gid] = {multi_cat_codes_flat_[gid * 2],
-                                        multi_cat_codes_flat_[gid * 2 + 1]};
+                                        multi_cat_codes_flat_[(gid * 2) + 1]};
                 }
                 cat_fast_path_ = false;
                 pair_int_fast_path_ = true;
@@ -6503,7 +6503,7 @@ class HashAggregateState final {
         std::vector<const CatCode*> raw;
         const std::vector<const ValidityBitmap*>* validity;
 
-        auto code(std::size_t column, std::size_t row) const -> CatCode {
+        [[nodiscard]] auto code(std::size_t column, std::size_t row) const -> CatCode {
             const auto* bits = validity == nullptr ? nullptr : (*validity)[column];
             return bits != nullptr && !(*bits)[row] ? CatCode{-1} : raw[column][row];
         }
@@ -6605,7 +6605,7 @@ class HashAggregateState final {
             [&](std::size_t n) { multi_cat_codes_flat_.resize(n * arity); },
             [&](const PackedCode& key, std::uint32_t gid, std::size_t) {
                 for (std::size_t c = 0; c < arity; ++c) {
-                    multi_cat_codes_flat_[static_cast<std::size_t>(gid) * arity + c] =
+                    multi_cat_codes_flat_[(static_cast<std::size_t>(gid) * arity) + c] =
                         static_cast<CatCode>(
                             static_cast<std::uint32_t>(key.w[c / 2] >> ((c % 2) * 32)));
                 }
@@ -6622,7 +6622,10 @@ class HashAggregateState final {
         -> bool {
         const std::size_t arity = cols.raw.size();
         const auto bytes = [arity](const CatCode* codes) {
-            return std::string_view{reinterpret_cast<const char*>(codes), arity * sizeof(CatCode)};
+            // The key is the tuple's bytes; a char view of an object is defined.
+            return std::string_view{
+                reinterpret_cast<const char*>(codes),  // NOLINT(*-reinterpret-cast)
+                arity * sizeof(CatCode)};
         };
         const auto fill_row = [&](CatCode* codes, std::size_t row) {
             for (std::size_t c = 0; c < arity; ++c) {
@@ -6644,15 +6647,15 @@ class HashAggregateState final {
         auto batch = runner.submit(workers, [&](std::size_t worker) {
             const std::size_t end = std::min(rows, (worker + 1) * grain);
             for (std::size_t row = worker * grain; row < end; ++row) {
-                fill_row(row_codes.data() + row * arity, row);
+                fill_row(row_codes.data() + (row * arity), row);
             }
         });
         batch.wait();
         return try_discover_partitioned<std::string_view, StrViewHash, StrViewEq>(
-            [&](std::size_t row) { return bytes(row_codes.data() + row * arity); }, rows, gids,
+            [&](std::size_t row) { return bytes(row_codes.data() + (row * arity)); }, rows, gids,
             wide_cat_partitions_, [&](std::size_t n) { multi_cat_codes_flat_.resize(n * arity); },
             [&](std::string_view key, std::uint32_t gid, std::size_t) {
-                std::memcpy(multi_cat_codes_flat_.data() + static_cast<std::size_t>(gid) * arity,
+                std::memcpy(multi_cat_codes_flat_.data() + (static_cast<std::size_t>(gid) * arity),
                             key.data(), key.size());
             },
             min_rows,
@@ -7246,7 +7249,7 @@ class HashAggregateState final {
             const auto& agg = plan_[a];
             if (!agg_is_combinable(agg.func) ||
                 (agg.kind != ExprType::Int && agg.kind != ExprType::Double &&
-                 !(text_rows && agg.kind == ExprType::String))) {
+                 (!text_rows || agg.kind != ExprType::String))) {
                 return false;
             }
         }
@@ -7503,7 +7506,7 @@ class HashAggregateState final {
         for (std::size_t w0 = 0; w0 < rows;) {
             const std::size_t w1 = w0 + std::min(rows - w0, phase_policy().owned_range_window_rows);
             const std::size_t n_morsels =
-                1 + (w1 - w0 - 1) / phase_policy().owned_range_morsel_rows;
+                1 + ((w1 - w0 - 1) / phase_policy().owned_range_morsel_rows);
             std::vector<Block> blocks(n_morsels);
             fan(n_morsels, [&](std::size_t m) {
                 const std::size_t begin = w0 + (m * phase_policy().owned_range_morsel_rows);

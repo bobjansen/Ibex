@@ -427,8 +427,9 @@ auto environment_json(const Session& session) -> json {
                       {"lazy", table.lazy},
                       {"plan", table.plan},
                       {"columns", std::move(columns)}};
-        if (table.rows.has_value()) {  // a plan has none to report
-            entry["rows"] = *table.rows;
+        if (const std::optional<std::size_t> rows = table.rows;
+            rows.has_value()) {  // a plan has none to report
+            entry["rows"] = *rows;
         }
         tables.push_back(std::move(entry));
     }

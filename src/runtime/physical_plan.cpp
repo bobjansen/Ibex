@@ -10,8 +10,11 @@
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
+#include <ibex/runtime/aggregate_discovery_policy.hpp>
+#include <ibex/runtime/aggregate_phase_policy.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/join_threshold_policy.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>

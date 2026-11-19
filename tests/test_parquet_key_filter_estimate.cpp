@@ -3,7 +3,10 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
+#include <array>
+#include <arrow/array/builder_binary.h>
 #include <arrow/array/builder_primitive.h>
 #include <arrow/io/memory.h>
 #include <arrow/table.h>
@@ -17,7 +20,11 @@
 #include <parquet/metadata.h>
 #include <parquet/properties.h>
 #include <parquet/types.h>
+#include <span>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "../libs/parquet/parquet.hpp"
 
@@ -110,4 +117,102 @@ TEST_CASE("No footer estimate without statistics or without a bitmap", "[parquet
     range_only.min = 0;
     range_only.max = 1999;
     CHECK_FALSE(estimate(*metadata, range_only, 0, 1000).has_value());
+}
+
+TEST_CASE("Parquet dictionary scan keeps candidate rows across mixed encoding",
+          "[parquet][dictionary]") {
+    arrow::StringBuilder builder;
+    const std::string long_value(256, 'x');
+    const std::array<const char*, 12> values{"keep", "drop",  nullptr, "keep",
+                                             "drop", "drop",  "keep",  long_value.c_str(),
+                                             "keep", nullptr, "drop",  "keep"};
+    for (const auto* value : values) {
+        REQUIRE((value == nullptr ? builder.AppendNull() : builder.Append(value)).ok());
+    }
+    auto table = arrow::Table::Make(arrow::schema({arrow::field("v", arrow::utf8())}),
+                                    {builder.Finish().ValueOrDie()});
+    auto output = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    parquet::WriterProperties::Builder properties;
+    properties.dictionary_pagesize_limit(64)->write_batch_size(1);
+    REQUIRE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), output, 6,
+                                       properties.build())
+                .ok());
+    auto buffer = output->Finish().ValueOrDie();
+    auto reader = make_parquet_reader(std::make_shared<arrow::io::BufferReader>(buffer), "memory");
+    const auto& metadata = *reader->parquet_reader()->metadata();
+    const auto groups = whole_file_scan_groups(metadata);
+    REQUIRE(groups.size() == 2);
+    REQUIRE(stats_prove_dictionary(*metadata.RowGroup(0)->ColumnChunk(0)));
+    const auto mixed_chunk = metadata.RowGroup(1)->ColumnChunk(0);
+    REQUIRE(mixed_chunk->has_dictionary_page());
+    REQUIRE_FALSE(stats_prove_dictionary(*mixed_chunk));
+    std::array readers{reader.get()};
+    const ibex::runtime::DictionaryPredicate keep = [](std::span<const std::string_view> values) {
+        std::vector<char> flags;
+        for (const auto value : values) {
+            flags.push_back(value == "keep" ? 1 : 0);
+        }
+        return flags;
+    };
+
+    const ibex::runtime::Selection candidates{0, 1, 2};
+    auto selected = filtered_dictionary_string_selection(readers, 0, keep, &candidates, groups);
+    REQUIRE(selected.has_value());
+    CHECK(*selected == ibex::runtime::Selection{0});
+
+    const ibex::runtime::Selection mixed{0, 2, 6, 7, 9, 10, 11};
+    selected = filtered_dictionary_string_selection(readers, 0, keep, &mixed, groups);
+    REQUIRE(selected);
+    CHECK(*selected == ibex::runtime::Selection{0, 6, 11});
+    selected = filtered_dictionary_string_selection(readers, 0, keep, nullptr, groups);
+    REQUIRE(selected);
+    CHECK(*selected == ibex::runtime::Selection{0, 3, 6, 8, 11});
+}
+
+TEST_CASE("Parquet String scan reads only indexed pages containing candidates",
+          "[parquet][stream_filter]") {
+    const auto indexed = GENERATE(false, true);
+    constexpr std::int64_t rows = 1024;
+    const std::string match(64, 'x');
+    arrow::StringBuilder builder;
+    for (std::int64_t row = 0; row < rows; ++row) {
+        REQUIRE((row % 3 == 0 ? builder.AppendNull() : builder.Append(match)).ok());
+    }
+    auto table = arrow::Table::Make(arrow::schema({arrow::field("v", arrow::utf8())}),
+                                    {builder.Finish().ValueOrDie()});
+    auto output = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    parquet::WriterProperties::Builder properties;
+    properties.disable_dictionary()->data_pagesize(512)->write_batch_size(16);
+    if (indexed) {
+        properties.enable_write_page_index();
+    } else {
+        properties.disable_write_page_index();
+    }
+    REQUIRE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), output, 512,
+                                       properties.build())
+                .ok());
+    auto input = std::make_shared<arrow::io::BufferReader>(output->Finish().ValueOrDie());
+    auto reader = make_parquet_reader(input, "memory");
+    const auto groups = whole_file_scan_groups(*reader->parquet_reader()->metadata());
+    const ibex::runtime::Selection candidates{132, 133, 497, 901};
+    ibex::runtime::StringScanFilter filter;
+    filter.pattern.text = match;
+    const auto stripes = string_page_stripes(*reader, 0, groups, 1, &candidates);
+    CHECK(stripes.has_value() == indexed);
+    std::optional<ibex::runtime::Selection> selected;
+    if (indexed) {
+        REQUIRE(stripes);
+        std::size_t planned_rows = 0;
+        for (const auto& stripe : *stripes) {
+            CHECK_FALSE(string_candidates(candidates, stripe.base, stripe.rows).empty());
+            planned_rows += stripe.rows;
+        }
+        CHECK(planned_rows < 128);
+        selected = filtered_string_page_stripes(input, filter, *stripes, 1, &candidates);
+    } else {
+        const std::array readers{reader.get()};
+        selected = filtered_string_selection(readers, 0, filter, groups, &candidates);
+    }
+    REQUIRE(selected);
+    CHECK(*selected == ibex::runtime::Selection{133, 497, 901});
 }

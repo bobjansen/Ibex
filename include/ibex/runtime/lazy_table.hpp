@@ -47,9 +47,8 @@ using KeyFilterScanFn = std::function<std::expected<std::optional<Selection>, st
 /// predicate's result is one bit per row, so evaluating it as values leave the
 /// page decoder skips the materialization entirely.
 ///
-/// Null is not a value the pattern is matched against: `like(null, p)` is null,
-/// and a filter keeps only true, so a null row fails **both** polarities. That
-/// is why `negated` sits here rather than being applied by the caller.
+/// A string comparison or LIKE on null gives null. The scan tests non-null
+/// values only, so a null row fails both polarities.
 struct StringScanFilter {
     LikePattern pattern;
     bool negated = false;
@@ -60,8 +59,8 @@ struct StringScanFilter {
     }
 };
 
-/// Keep-flags for one dictionary: entry i passes when the result's element i is
-/// non-zero. Called once per dictionary page, never per row.
+/// Keep-flags for dictionary values or a batch of non-null candidate values.
+/// Entry i passes when the result's element i is non-zero.
 using DictionaryPredicate =
     std::function<std::vector<char>(std::span<const std::string_view> dictionary)>;
 
@@ -118,7 +117,8 @@ class LazySourceReader {
     }
 
     /// Evaluate `filter` against `column` during its decode and return the
-    /// passing rows, without materializing the column. nullopt means the
+    /// passing rows, without materializing the column. When present, `within`
+    /// contains ascending source-global candidate rows. nullopt means the
     /// source has no fused answer for this column (a nested or unsupported
     /// encoding), and the caller falls back to decode-then-filter, which is
     /// always correct.
@@ -129,21 +129,22 @@ class LazySourceReader {
     /// needed whatever fraction of rows survives.
     [[nodiscard]] virtual auto string_filter_scan(const std::string& /*column*/,
                                                   const StringScanFilter& /*filter*/,
+                                                  const Selection* /*within*/,
                                                   const SourceUnit* /*unit*/,
                                                   const ExecutionContext& /*exec*/)
         -> std::expected<std::optional<Selection>, std::string> {
         return std::optional<Selection>{};
     }
 
-    /// Evaluate a predicate on the DICTIONARY of a dictionary-encoded string
-    /// column rather than on its rows: `keep` receives each dictionary page's
-    /// distinct values (a handful for a flag or mode column) and answers one
-    /// flag per entry, and the source then scans only the integer codes. So a
-    /// string predicate costs a code comparison per row, and no string column
-    /// is built. Null rows never pass; the caller must only use this for a
-    /// predicate that is not TRUE on null. nullopt means no fused answer (not
-    /// dictionary-encoded throughout, or unsupported), and the caller falls
-    /// back to decode-then-filter.
+    /// Evaluate a predicate during a dictionary-encoded string scan. `keep`
+    /// returns one flag per dictionary value, and the source tests integer
+    /// codes against those flags. On mixed-encoding input, a reader may
+    /// continue by passing batches of plain values to the same callback.
+    /// No string column is materialized by the source. Null rows never pass,
+    /// so the caller must supply a predicate that is not TRUE on null.
+    /// nullopt means the reader cannot answer this scan, and the caller
+    /// falls back to decode-then-filter for the full predicate.
+    /// Both paths return source-global row indices in ascending order.
     ///
     /// `within`, when given, is a sorted candidate selection (a key scan's
     /// answer): only those rows are tested and emitted, so the result is never
@@ -384,13 +385,9 @@ class LazyTable {
         StringScanFilter filter;
     };
 
-    /// The conjuncts eligible for the fused string scan, and the columns they
-    /// consume. A conjunct qualifies only when it is `like`/`not like` over a
-    /// String column against a literal pattern, and that column is read by
-    /// nothing else: not by another conjunct, not by the projection, and not
-    /// already sitting in `cache_` (where testing it in memory beats re-reading
-    /// its pages). Returns nullopt when nothing qualifies, so the caller keeps
-    /// its existing path unchanged.
+    /// Find literal equality, inequality and LIKE predicates over an uncached
+    /// String column used only by that conjunct. Returns false when none
+    /// qualifies.
     [[nodiscard]] auto fusable_string_conjuncts(const std::vector<ir::Expr>& conjuncts,
                                                 const std::set<std::string>& names,
                                                 std::vector<FusedStringConjunct>& fused,
@@ -456,7 +453,8 @@ class LazyTable {
     /// one had no fused answer, so the caller must evaluate them all the
     /// ordinary way (a partial answer would silently drop the rest).
     [[nodiscard]] auto scan_string_filters(const std::vector<FusedStringConjunct>& fused,
-                                           const SourceUnit* unit, const ExecutionContext& exec)
+                                           const SourceUnit* unit, const ExecutionContext& exec,
+                                           const Selection* within = nullptr)
         -> std::expected<std::optional<Selection>, std::string>;
     /// Conjuncts that read exactly one dictionary-encoded (Categorical) column,
     /// are row-local, and are not TRUE on null: those can be decided per

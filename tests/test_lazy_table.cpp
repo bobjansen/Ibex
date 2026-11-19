@@ -171,12 +171,14 @@ auto not_like(std::string name, std::string pattern) -> ir::Expr {
 struct TextSourceState {
     std::vector<std::vector<std::string>> decode_calls;
     std::vector<std::string> scan_calls;
+    std::vector<runtime::Selection> string_candidates;
     std::vector<std::string> key_scan_calls;
     /// When false the reader declines the fused scan, exercising the fallback.
     bool fused = true;
     /// When false the reader reports no decomposition, so `scan_units` is
     /// empty and nothing streams.
     bool units = true;
+    std::optional<std::size_t> null_row;
 };
 
 constexpr std::array<std::string_view, 6> kText{"alpha",    "bad apple", "cherry",
@@ -227,7 +229,16 @@ class TextReader final : public runtime::LazySourceReader {
                 for (auto row : rows) {
                     values.emplace_back(kText[row]);
                 }
-                out.add_column("s", Column<std::string>{std::move(values)});
+                const auto null = state_->null_row.has_value()
+                                      ? std::ranges::find(rows, *state_->null_row)
+                                      : rows.end();
+                if (null == rows.end()) {
+                    out.add_column("s", Column<std::string>{std::move(values)});
+                } else {
+                    runtime::ValidityBitmap valid(rows.size(), true);
+                    valid.set(static_cast<std::size_t>(null - rows.begin()), false);
+                    out.add_column("s", Column<std::string>{std::move(values)}, std::move(valid));
+                }
             } else {
                 std::vector<std::int64_t> values;
                 values.reserve(rows.size());
@@ -242,10 +253,13 @@ class TextReader final : public runtime::LazySourceReader {
     }
 
     auto string_filter_scan(const std::string& column, const runtime::StringScanFilter& filter,
-                            const runtime::SourceUnit* unit,
+                            const runtime::Selection* within, const runtime::SourceUnit* unit,
                             const runtime::ExecutionContext& /*exec*/)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
         state_->scan_calls.push_back(column);
+        if (within != nullptr) {
+            state_->string_candidates.push_back(*within);
+        }
         if (!state_->fused) {
             return std::optional<runtime::Selection>{};
         }
@@ -253,7 +267,8 @@ class TextReader final : public runtime::LazySourceReader {
         const std::size_t end = unit == nullptr ? kText.size() : unit->start + unit->rows;
         runtime::Selection selected;
         for (std::size_t row = begin; row < end; ++row) {
-            if (filter.passes(kText[row])) {
+            if ((within == nullptr || std::ranges::binary_search(*within, row)) &&
+                state_->null_row != row && filter.passes(kText[row])) {
                 selected.push_back(row);
             }
         }
@@ -1191,9 +1206,22 @@ TEST_CASE("LazyTable: a fused string filter ANDs with the conjuncts left behind"
     // rows 0,2,4,5 pass the pattern; n > 1 keeps 2,4,5.
     CHECK(int_column(*table, "n") == std::vector<std::int64_t>{2, 4, 5});
     CHECK(state->scan_calls == std::vector<std::string>{"s"});
+    CHECK(state->string_candidates == std::vector<runtime::Selection>{{2, 3, 4, 5}});
     for (const auto& call : state->decode_calls) {
         CHECK(std::ranges::find(call, "s") == call.end());
     }
+}
+
+TEST_CASE("LazyTable: a static range passes source-global candidates to a String scan",
+          "[runtime][lazy_table][string_filter]") {
+    auto state = std::make_shared<TextSourceState>();
+    auto lazy = make_text_lazy(state);
+    const std::vector<ir::Expr> predicates{greater_than("n", 2), like_call("s", "%bad")};
+    auto table = lazy.project_where_unit({"n"}, predicates, kUnits[1], kExec);
+    REQUIRE(table);
+    CHECK(int_column(*table, "n") == std::vector<std::int64_t>{3});
+    CHECK(state->key_scan_calls == std::vector<std::string>{"n"});
+    CHECK(state->string_candidates == std::vector<runtime::Selection>{{3}});
 }
 
 TEST_CASE("LazyTable: a source that declines the fused scan still filters correctly",
@@ -1227,6 +1255,41 @@ TEST_CASE("LazyTable: an unnegated like fuses too", "[runtime][lazy_table][strin
     REQUIRE(table);
     CHECK(int_column(*table, "n") == std::vector<std::int64_t>{1, 3});
     CHECK(state->scan_calls == std::vector<std::string>{"s"});
+}
+
+TEST_CASE("LazyTable: fused string comparison matches literal bytes and skips nulls",
+          "[runtime][lazy_table][string_filter]") {
+    auto state = std::make_shared<TextSourceState>();
+    state->null_row = 2;
+    auto lazy = make_text_lazy(state);
+    const auto compare = [](ir::CompareOp op, std::string value) {
+        return ir::Expr{
+            .node = ir::CompareExpr{
+                .op = op,
+                .left = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::move(value)}}),
+                .right = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "s"}})}};
+    };
+
+    SECTION("reversed equality through a nonzero unit") {
+        auto table = lazy.project_where_unit({"n"}, {compare(ir::CompareOp::Eq, "very bad")},
+                                             kUnits[1], kExec);
+        REQUIRE(table);
+        CHECK(int_column(*table, "n") == std::vector<std::int64_t>{3});
+    }
+    SECTION("percent is a literal in a comparison") {
+        auto table = lazy.project_where({"n"}, {compare(ir::CompareOp::Eq, "bad%")}, kExec);
+        REQUIRE(table);
+        CHECK(table->rows() == 0);
+    }
+    SECTION("inequality keeps non-matching non-null rows") {
+        auto table = lazy.project_where({"n"}, {compare(ir::CompareOp::Ne, "very bad")}, kExec);
+        REQUIRE(table);
+        CHECK(int_column(*table, "n") == std::vector<std::int64_t>{0, 1, 4, 5});
+    }
+    CHECK(state->scan_calls == std::vector<std::string>{"s"});
+    for (const auto& call : state->decode_calls) {
+        CHECK(std::ranges::find(call, "s") == call.end());
+    }
 }
 
 TEST_CASE("LazyTable: a like whose pattern is a bound scalar still fuses",
@@ -1453,14 +1516,16 @@ class DictReader final : public runtime::LazySourceReader {
     explicit DictReader(std::shared_ptr<DictSourceState> state) : state_(std::move(state)) {}
 
     auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
-                const runtime::SourceUnit* /*unit*/, const runtime::ExecutionContext& /*exec*/)
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/)
         -> std::expected<runtime::Table, std::string> override {
         state_->decode_calls.push_back(names);
         runtime::Selection rows;
         if (selection != nullptr) {
             rows = *selection;
         } else {
-            for (std::size_t r = 0; r < kFlags.size(); ++r) {
+            const std::size_t start = unit == nullptr ? 0 : unit->start;
+            const std::size_t end = unit == nullptr ? kFlags.size() : start + unit->rows;
+            for (std::size_t r = start; r < end; ++r) {
                 rows.push_back(r);
             }
         }
@@ -1496,11 +1561,13 @@ class DictReader final : public runtime::LazySourceReader {
     }
 
     auto key_filter_scan(const std::string& /*key*/, const runtime::DynamicScanFilter& filter,
-                         const runtime::SourceUnit* /*unit*/,
-                         const runtime::ExecutionContext& /*exec*/, Column<std::int64_t>* values)
+                         const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/,
+                         Column<std::int64_t>* values)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
         runtime::Selection selected;
-        for (std::size_t r = 0; r < kFlags.size(); ++r) {
+        const std::size_t start = unit == nullptr ? 0 : unit->start;
+        const std::size_t end = unit == nullptr ? kFlags.size() : start + unit->rows;
+        for (std::size_t r = start; r < end; ++r) {
             if (filter.passes(static_cast<std::int64_t>(10 + r))) {
                 selected.push_back(r);
                 if (values != nullptr && state_->key_values) {
@@ -1676,6 +1743,45 @@ TEST_CASE("LazyTable: join_key_selection falls back when the dictionary scan dec
     REQUIRE(phase->has_value());
     CHECK((*phase)->selected == runtime::Selection{0, 3, 5});
     CHECK(state->dictionary_scans == std::vector<std::string>{"flag"});
+}
+
+TEST_CASE("LazyTable: static range narrows a predicate-only categorical by dictionary",
+          "[runtime][lazy_table][range_filter][dictionary]") {
+    auto state = std::make_shared<DictSourceState>();
+    auto lazy = make_dict_lazy(state);
+    const std::vector<ir::Expr> predicates{greater_than("k", 12), flag_equals("R"),
+                                           greater_than("v", 13)};
+    const runtime::SourceUnit unit{.start = 3, .rows = 3};
+
+    SECTION("the dictionary scan keeps source-global row indices") {
+        auto table = lazy.project_where_unit({"v"}, predicates, unit, kExec);
+        REQUIRE(table);
+        CHECK(int_column(*table, "v") == std::vector<std::int64_t>{15});
+        CHECK(state->dictionary_scans == std::vector<std::string>{"flag"});
+        CHECK(state->candidates_seen == std::vector<runtime::Selection>{{3, 4, 5}});
+        CHECK(state->decode_calls == std::vector<std::vector<std::string>>{{"v"}, {"v"}});
+    }
+
+    SECTION("a reader that declines the dictionary scan falls back") {
+        state->dictionary_fused = false;
+        auto table = lazy.project_where_unit({"v"}, predicates, unit, kExec);
+        REQUIRE(table);
+        CHECK(int_column(*table, "v") == std::vector<std::int64_t>{15});
+        CHECK(state->dictionary_scans == std::vector<std::string>{"flag"});
+    }
+
+    SECTION("a projected categorical is decoded only once") {
+        auto table = lazy.project_where_unit({"flag", "v"}, predicates, unit, kExec);
+        REQUIRE(table);
+        CHECK(int_column(*table, "v") == std::vector<std::int64_t>{15});
+        const auto* flag = std::get_if<Column<Categorical>>(table->find("flag"));
+        REQUIRE(flag != nullptr);
+        CHECK((*flag)[0] == "R");
+        CHECK(state->dictionary_scans.empty());
+        CHECK(std::ranges::count_if(state->decode_calls, [](const auto& call) {
+                  return std::ranges::find(call, "flag") != call.end();
+              }) == 1);
+    }
 }
 
 namespace {

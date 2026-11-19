@@ -487,18 +487,38 @@ auto membership_selection(const KeyColumn<KeyAt>& key, const DynamicScanFilter& 
     return selected;
 }
 
-/// `like(col, "pattern")`, possibly under any number of `not`s. Returns the
-/// column and the compiled filter, or nullopt when the expression is any other
-/// shape — including a `like` whose pattern is not a literal (it would have to
-/// be evaluated per row) or does not compile (the ordinary path reports that
-/// error, and reporting it from here would change nothing but the blame).
-auto as_like_predicate(const ir::Expr& expr, bool negated)
+/// A literal string comparison or LIKE, possibly under `not`. An invalid
+/// LIKE pattern takes the ordinary path so it reports the usual error.
+auto as_string_predicate(const ir::Expr& expr, bool negated)
     -> std::optional<std::pair<std::string, StringScanFilter>> {
     if (const auto* logical = std::get_if<ir::LogicalExpr>(&expr.node)) {
         if (logical->op != ir::LogicalOp::Not || logical->left == nullptr) {
             return std::nullopt;
         }
-        return as_like_predicate(*logical->left, !negated);
+        return as_string_predicate(*logical->left, !negated);
+    }
+    if (const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
+        cmp != nullptr && cmp->left != nullptr && cmp->right != nullptr &&
+        cmp->float_comparison == ir::FloatComparison::IEEE &&
+        (cmp->op == ir::CompareOp::Eq || cmp->op == ir::CompareOp::Ne)) {
+        const auto* column = ir::as_column_ref(*cmp->left);
+        const auto* literal = std::get_if<ir::Literal>(&cmp->right->node);
+        if (column == nullptr) {
+            column = ir::as_column_ref(*cmp->right);
+            literal = std::get_if<ir::Literal>(&cmp->left->node);
+        }
+        const auto* value =
+            literal == nullptr ? nullptr : std::get_if<std::string>(&literal->value);
+        if (column == nullptr || column->lexical || value == nullptr) {
+            return std::nullopt;
+        }
+        // Construct an exact matcher directly: %, _ and escapes are data in
+        // a comparison literal.
+        LikePattern exact;
+        exact.text = *value;
+        return std::pair{column->name,
+                         StringScanFilter{.pattern = std::move(exact),
+                                          .negated = negated != (cmp->op == ir::CompareOp::Ne)}};
     }
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
     if (call == nullptr || call->callee != "like" || call->args.size() != 2 ||
@@ -528,8 +548,8 @@ auto as_like_predicate(const ir::Expr& expr, bool negated)
 namespace {
 
 /// The conjuncts with this execution's bound scalars resolved to literals, or
-/// nullopt when none refers to one. The fused page-decoder `like` takes only a
-/// literal pattern, and the Polars adapter binds every pattern as a scalar
+/// nullopt when none refers to one. The fused page-decoder filter takes only
+/// literals, and the Polars adapter binds every pattern as a scalar
 /// (Q13's `o_comment` filter decoded the column whole). A column of the same
 /// name shadows a non-lexical reference, as in `bind_filter_constants`.
 auto bind_scan_conjuncts(const std::vector<ir::Expr>& conjuncts, const ScalarRegistry* scalars,
@@ -573,7 +593,7 @@ auto LazyTable::fusable_string_conjuncts(const std::vector<ir::Expr>& conjuncts,
     }
 
     for (std::size_t i = 0; i < conjuncts.size(); ++i) {
-        auto predicate = as_like_predicate(conjuncts[i], false);
+        auto predicate = as_string_predicate(conjuncts[i], false);
         // The conjunct must read its column and nothing else, that column must
         // be a plain String in the source (a dictionary column decodes to
         // codes, which is already cheap and would be *slower* value by value),
@@ -596,7 +616,8 @@ auto LazyTable::fusable_string_conjuncts(const std::vector<ir::Expr>& conjuncts,
 }
 
 auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fused,
-                                    const SourceUnit* unit, const ExecutionContext& exec)
+                                    const SourceUnit* unit, const ExecutionContext& exec,
+                                    const Selection* within)
     -> std::expected<std::optional<Selection>, std::string> {
     auto* profile_entry = exec.execution_profile == nullptr
                               ? nullptr
@@ -609,7 +630,10 @@ auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fuse
     }
     std::optional<Selection> selected;
     for (const auto& conjunct : fused) {
-        auto part = (*reader)->string_filter_scan(conjunct.column, conjunct.filter, unit, exec);
+        const Selection* candidates =
+            within != nullptr && selected.has_value() ? &*selected : within;
+        auto part =
+            (*reader)->string_filter_scan(conjunct.column, conjunct.filter, candidates, unit, exec);
         if (!part) {
             return std::unexpected(part.error());
         }
@@ -620,7 +644,7 @@ auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fuse
             release_reader(std::move(*reader));
             return std::optional<Selection>{};
         }
-        if (!selected.has_value()) {
+        if (within != nullptr || !selected.has_value()) {
             selected = std::move(**part);
             continue;
         }
@@ -707,8 +731,8 @@ auto LazyTable::scan_dictionary_filters(const std::vector<ir::Expr>& conjuncts,
         robin_hood::unordered_set<std::string> refs;
         ir::collect_expr_column_refs(conjunct, refs);
         const std::string column = *refs.begin();
-        // Evaluated on the few distinct values of one dictionary page, never per
-        // row, and possibly from several workers at once: a serial context
+        // Evaluated on a dictionary or a batch of plain candidate values,
+        // possibly from several workers at once: a serial context
         // keeps it off the pool. An error here (the probe in
         // split_dictionary_conjuncts makes one unlikely) cannot cross the pool,
         // so it is flagged and the whole answer discarded.
@@ -1683,9 +1707,31 @@ auto LazyTable::static_range_selection(const std::vector<ir::Expr>& conjuncts,
     if (exact_shape_only && (!range->rest.empty() || names.contains(range->column))) {
         return std::optional<Selection>{};
     }
-    // Decided before scanning: an unstageable remainder would waste the scan.
+    std::vector<ir::Expr> dictionary_conjuncts;
+    std::vector<ir::Expr> staged_conjuncts;
+    std::vector<FusedStringConjunct> string_conjuncts;
     if (!range->rest.empty() && !stageable_conjunct_columns(range->rest).has_value()) {
-        return std::optional<Selection>{};
+        // A predicate-only Categorical can be tested on its dictionary and
+        // codes. If the output also needs it, defer to the ordinary path so
+        // the same column is read only once.
+        split_dictionary_conjuncts(range->rest, scalars, dictionary_conjuncts, staged_conjuncts);
+        for (const auto& conjunct : dictionary_conjuncts) {
+            robin_hood::unordered_set<std::string> refs;
+            ir::collect_expr_column_refs(conjunct, refs);
+            if (names.contains(*refs.begin())) {
+                return std::optional<Selection>{};
+            }
+        }
+        std::vector<ir::Expr> unfused;
+        const auto bound = bind_scan_conjuncts(staged_conjuncts, scalars, schema_);
+        if (fusable_string_conjuncts(bound.has_value() ? *bound : staged_conjuncts, names,
+                                     string_conjuncts, unfused)) {
+            staged_conjuncts = std::move(unfused);
+        }
+        if ((dictionary_conjuncts.empty() && string_conjuncts.empty()) ||
+            (!staged_conjuncts.empty() && !stageable_conjunct_columns(staged_conjuncts))) {
+            return std::optional<Selection>{};
+        }
     }
     // When the key is also an output column it is decoded a second time for the
     // rows that pass, so the scan has to reject more to pay for itself.
@@ -1700,26 +1746,45 @@ auto LazyTable::static_range_selection(const std::vector<ir::Expr>& conjuncts,
         return std::optional<Selection>{};  // unsupported type, or nothing rejected
     }
     Selection selected = std::move(**scan);
-    if (range->rest.empty()) {
+    const auto* remainder = &range->rest;
+    if (!selected.empty() && (!dictionary_conjuncts.empty() || !string_conjuncts.empty())) {
+        if (!dictionary_conjuncts.empty()) {
+            auto dictionary =
+                scan_dictionary_filters(dictionary_conjuncts, &selected, scalars, exec, unit);
+            if (!dictionary) {
+                return std::unexpected(dictionary.error());
+            }
+            if (!dictionary->has_value()) {
+                return std::optional<Selection>{};
+            }
+            selected = std::move(**dictionary);
+        }
+        if (!selected.empty() && !string_conjuncts.empty()) {
+            auto strings = scan_string_filters(string_conjuncts, unit, exec, &selected);
+            if (!strings) {
+                return std::unexpected(strings.error());
+            }
+            if (!strings->has_value()) {
+                return std::optional<Selection>{};
+            }
+            selected = std::move(**strings);
+        }
+        remainder = &staged_conjuncts;
+    }
+    if (remainder->empty()) {
         return std::optional{std::move(selected)};
     }
-    // The range left no row to evaluate the remainder on, and most streamed
-    // units are like this. The ordinary path evaluates every conjunct over the
-    // whole column, so it reports a type error in one that the range emptied;
-    // evaluating them over the zero-row schema table reports it here too,
-    // without decoding anything.
+    // The ordinary filter still reports a type error in a remaining conjunct
+    // when no rows pass the range or dictionary. Check the zero-row schema
+    // here so the error still surfaces without decoding any columns.
     if (selected.empty()) {
-        auto checked = filter_selection(schema_, range->rest, exec, scalars);
+        auto checked = filter_selection(schema_, *remainder, exec, scalars);
         if (!checked) {
             return std::unexpected(checked.error());
         }
         return std::optional{std::move(selected)};
     }
-    auto narrowed = narrow_selection(selected, range->rest, exec, scalars);
-    if (!narrowed) {
-        return std::unexpected(narrowed.error());
-    }
-    return narrowed;
+    return narrow_selection(selected, *remainder, exec, scalars, unit);
 }
 
 auto LazyTable::narrow_selection(const Selection& selected, const std::vector<ir::Expr>& conjuncts,

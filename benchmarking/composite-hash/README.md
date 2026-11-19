@@ -41,3 +41,11 @@ costs, paired ratios, wins and Wilcoxon p-values. Redirect reports there too.
 Normal fixture execution checks route assertions and invalid null payloads.
 Timing mode omits route assertions while retaining output checks; nullable
 benchmarks use identical valid placeholder payloads under null bits on both sides.
+
+`IBEX_CAT_TRANSITION_BENCH=1 build-release/tests/ibex_tests '[categorical-transitions]'`
+times dense dictionary growth and packed-layout misses using three or nine key
+columns at one and eight cores. It includes a mixed-key control. The timing
+covers interpretation, and the fixture checks every emitted key and count.
+The scenarios share one process, so allocator reuse can affect comparisons.
+Restrict the scenario list identically on both sides to time a single scenario
+in a fresh process.

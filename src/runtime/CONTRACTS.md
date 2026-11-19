@@ -1,13 +1,24 @@
 # Runtime execution contracts
 
-The one-place statement of the contracts every operator, source, kernel, and
-sink in this directory is bound by. Written 2026-08-22 as Phase 2's opening
-deliverable of the kernel-pipeline migration (plan retired 2026-10-05:
-`git show fbb4f75a:plans/kernel-pipeline-execution-plan.md`)
-— extracting the kernel APIs (`ChunkView`, selection, validity, output
-writer) is stating these contracts in code, so they get stated in prose
-first. Each section names the header that owns the normative doc comment;
+The contracts every operator, source, kernel and sink in this directory is
+bound by. Each section names the header that owns the normative doc comment;
 this file is the map and the cross-file invariants, not a second authority.
+Companions: [PARALLELISM.md](PARALLELISM.md) (which thread runs what, and who
+decides) and [EXPLAIN.md](EXPLAIN.md) (reading `:explain`). Written for the
+kernel-pipeline migration; the retired plan is
+`git show fbb4f75a:plans/kernel-pipeline-execution-plan.md`.
+
+| §                                                            | Contract                                                                         |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| [0](#0-the-execution-architecture-these-contracts-serve)     | The layering: AST → logical IR → physical plan → pipelines → kernels            |
+| [1](#1-chunk--the-unit-of-flow)                              | `Chunk`: stable schema, the empty carrier, one shared dictionary, lazy validity |
+| [2](#2-sequence-and-row_offset--the-source-index-space)      | `sequence` / `row_offset`, morsels, selections in source row space              |
+| [3](#3-operatornext--the-pull-protocol)                      | `next()`: EOF once, single consumer, error selection, interruption             |
+| [4](#4-materialization--the-sink)                            | The sink: `result + 1 chunk` peak, geometric growth                             |
+| [5](#5-tableproperties--derived-claims)                      | `TableProperties` are derived through a `RowTransform`, never asserted          |
+| [6](#6-sources-and-demand)                                   | Sources, deferred scans, join-key filters, column demand                        |
+| [7](#7-determinism-bar-the-contract-behind-every-contract)   | Serial = parallel in rows, order and non-float values                           |
+| [8](#8-compact-int32-storage)                                | Compact Int32: logically Int64, no implicit wide copy                           |
 
 ## 0. The execution architecture these contracts serve
 
@@ -31,9 +42,10 @@ parser AST → logical IR → physical plan → pipelines → morsel executor �
   acceptable.
 - **A pipeline** runs from a partitionable source or a breaker's output to the
   next breaker. A breaker owns its build state and starts the next pipeline
-  when its build completes. The executor runs numbered morsels on the one
-  process pool; no query DAG scheduler, no work stealing, no futures (measured
-  unnecessary: `PARALLELISM.md`, "Measured and dropped").
+  when its build completes. The executors run numbered morsels or source units
+  on the one process pool; no query DAG scheduler, no work stealing, no futures
+  (measured unnecessary: [PARALLELISM.md, "Measured and
+  dropped"](PARALLELISM.md#measured-and-dropped)).
 - **Kernels** are a library of statically compiled specializations behind a few
   interfaces (`kernel_types.hpp`: `ColumnView`, `ChunkView`, `Selection`,
   output writers), dispatched once at pipeline construction, never per row,
@@ -67,9 +79,11 @@ Owner: `include/ibex/runtime/operator.hpp`.
   enforces this on concat and reports a schema mismatch otherwise.
 * Table-level metadata (`ordering`, `time_index`, `grouped_by`) travels on
   the chunk through `properties()`/`set_properties`, but is only *fully*
-  meaningful on a materialized table. Only `TableSourceOperator` (which
-  wraps one) and `make_morsel_chunk` (a `RowTransform::Subset`, under which
-  all three properties survive) stamp it wholesale. Never assemble a
+  meaningful on a materialized table. Copy it unchanged only where every
+  claim provably survives — the rows are untouched (`TableSourceOperator`,
+  table ↔ chunk conversion, the sink's first chunk) or a contiguous range of
+  them (`make_morsel_chunk`, a `RowTransform::Subset`). Anything else derives
+  it through a transform or a `with_*` builder (§5). Never assemble a
   `TableProperties` field by field — `set_properties` normalizes on the way
   in precisely because half-stated claims were a real bug class.
 * A column-less chunk (`Table(n)` scaffolds) carries its row count in
@@ -77,8 +91,8 @@ Owner: `include/ibex/runtime/operator.hpp`.
 * **The empty carrier**: an empty input (with or without columns) emits
   exactly one zero-row chunk carrying schema and metadata, so a materializing
   sink can reconstruct the planned output shape. Every source honors this;
-  an operator that drops rows must keep emitting it (the all-unmatched join
-  bug recorded in the plans was exactly a lost carrier).
+  an operator that drops rows must keep emitting it (an all-unmatched join
+  once lost it).
 * Categorical columns across chunks of one stream **share one backing
   dictionary**; codes are copied verbatim, never re-interned. This is what
   `append_column_values` and `gather_range` rely on. A streamed scan decodes
@@ -136,16 +150,13 @@ Owner: `operator.hpp`.
   operator (fan-out over ranges/morsels with an ordered merge), never
   between pulls.
 * Errors are **deterministically selected**: the lowest sequence / lowest
-  worker id wins, and an interrupt outranks a recorded data error. Every
-  parallel path reconstructs row order positionally (sequence, range order,
-  prefix-summed offset) — never by completion order — so serial and parallel
-  outputs agree in rows, order and non-float values (floats within
-  tolerance, §7), which is what lets every threshold in the engine move
-  without a correctness argument.
-* Per-chunk interruption boundaries: the pipeline executors (morsel
-  pipeline, streamed scan, stage) and the streaming join and semi/anti
-  operators check `interrupt_requested()` between chunks; intra-operator
-  fan-outs do not (documented gap, I13 in `PARALLELISM.md`).
+  worker id wins, and an interrupt outranks a recorded data error. Row order
+  is reconstructed positionally, never by completion order (§7).
+* Interruption boundaries: the pipeline executors (morsel pipeline, streamed
+  scan, stage), the streaming join and semi/anti operators and the sink check
+  `interrupt_requested()` between chunks; `run_materialized_node` checks it
+  between nodes. Intra-operator fan-outs can take longer to observe it. See
+  [I13 cooperative cancellation](PARALLELISM.md#cooperative-cancellation-i13).
 * An operator normally degrades to serial under `on_worker_pool_thread()` —
   "outermost wins" — to avoid needless nested fan-out. A necessary nested
   `WorkerPool::submit` is safe: workers cooperatively execute queued tasks
@@ -167,7 +178,7 @@ Owner: `operator.hpp` (`MaterializeOperator`, `append_column_values`).
   drain takes every chunk, so batching would only copy each row once more.
 * Per-column capacity grows **geometrically**. Reserving exactly
   `size + chunk` per chunk is the recorded trap: the concat goes quadratic
-  in chunk count (93% of runtime in `memmove` on a 20M-row island at 64k
+  in chunk count (93% of runtime in `memmove` on a 20M-row pipeline at a 64k
   grain).
 * First chunk donates its columns and properties; the result's
   `logical_rows` accumulates for column-less frames.
@@ -198,8 +209,8 @@ Owner: `table_properties.hpp`.
 
 ## 6. Sources and demand
 
-* `TableSourceOperator` wraps one materialized `Table` as a single chunk and
-  is the only source that stamps full table metadata.
+* `TableSourceOperator` wraps one materialized `Table` as a single chunk,
+  carrying its full table metadata.
 * `make_table_source` is the single call site for "this table is now a
   source"; `IBEX_CHUNK_ROWS` (test-only) swaps in `ChunkedTableSource` at a
   fixed grain so every cross-chunk operator path can be exercised.
@@ -229,14 +240,19 @@ Owner: `table_properties.hpp`.
 
 The same rows, in the same order, with the same non-float values, between
 serial and parallel execution at any core count, any grain, any threshold.
-Devices: positional order reconstruction, data-derived partition counts,
-first-occurrence group ids assigned after the parallel phase, lowest-sequence
-error selection, interrupt over data error. Floats may differ in their last
-bits: the order of floating-point operations (a parallel sum, a per-unit
-partial) is not part of the contract, and no device exists to fix it.
-Answer checks compare floats with a tolerance (`benchmarking/ab_queries.py`,
-`outputs_match`). A different row, row order, key, count, integer, string or
-decimal is a bug.
+This is what lets every threshold in the engine move without a correctness
+argument. A different row, row order, key, count, integer, string or decimal
+is a bug.
+
+Floats may differ in their last bits: the order of floating-point operations
+(a parallel sum, a per-unit partial) is not part of the contract. Some
+reductions keep a fixed order when only the worker count changes, but that is
+an implementation choice, not a guarantee. Answer checks compare floats with
+a tolerance (`benchmarking/ab_queries.py`, `outputs_match`).
+
+The devices that deliver this (positional order reconstruction,
+first-occurrence group ids, deterministic error selection) are described in
+[PARALLELISM.md, "The determinism contract"](PARALLELISM.md#the-determinism-contract).
 
 ## 8. Compact Int32 storage
 
@@ -273,7 +289,3 @@ diagnoses are in `benchmarking/int32/*/README.md`.
 * **ABI.** The compact tag reuses the otherwise invalid `SIZE_MAX` external
   offset; inline accessors changed, so plugins must be rebuilt against
   matching headers before they can receive compact columns.
-* **Code placement.** Identical code moves 1–3% across builds (e.g.
-  `filter_arith`); a local alignment hint that fixed one loop regressed
-  categorical join and grouped top-K, and was rejected. Judge a placement
-  effect by the paired gate with an unchanged replica control.

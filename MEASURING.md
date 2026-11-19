@@ -574,6 +574,12 @@ whether that operator has anything to do with the edit. Always close the loop
 with `IBEX_PROFILE_OPERATORS` on a per-query win before attributing it, and
 prefer a mechanism you can point at over a p-value you can quote.
 
+Do not fix a layout effect locally either. Identical code moves 1–3% across
+builds (e.g. `filter_arith` during the compact Int32 work); a local alignment
+hint that fixed one loop regressed categorical join and grouped top-K, and was
+rejected. Judge a placement effect by the paired gate with an unchanged replica
+control.
+
 ## 7. Build discipline
 
 * **`-j 6` total across the whole box**, not per invocation. Two concurrent

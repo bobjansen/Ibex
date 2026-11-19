@@ -1742,6 +1742,9 @@ class DeferredScanSourceOperator final : public Operator {
                 }
                 auto chunk = emit(std::move(*slot));
                 if (!chunk.has_value()) {
+                    return std::unexpected(std::move(chunk.error()));
+                }
+                if (!chunk->has_value()) {
                     continue;  // the unit's rows were all filtered out
                 }
                 return chunk;
@@ -1778,7 +1781,7 @@ class DeferredScanSourceOperator final : public Operator {
                     if (empty_schema_carrier_.has_value()) {
                         auto carrier = std::move(*empty_schema_carrier_);
                         empty_schema_carrier_.reset();
-                        return std::optional<Chunk>{emit_schema_carrier(std::move(carrier))};
+                        return emit_schema_carrier(std::move(carrier));
                     }
                     return std::optional<Chunk>{};
                 }
@@ -1868,16 +1871,18 @@ class DeferredScanSourceOperator final : public Operator {
     /// a shape some operators would rather not meet, and dropping it changes no
     /// result. A column-less chunk is a different thing — it carries a row
     /// count for `count()` — and is kept.
-    auto emit(Table table) -> std::optional<Chunk> {
+    auto emit(Table table) -> std::expected<std::optional<Chunk>, std::string> {
         if (!table.columns.empty() && table.rows() == 0) {
             if (!empty_schema_carrier_.has_value()) {
                 empty_schema_carrier_ = std::move(table);
             }
-            return std::nullopt;
+            return std::optional<Chunk>{};
         }
         // A non-empty result makes a deferred carrier unnecessary.
         empty_schema_carrier_.reset();
-        unify_categorical_dictionaries(table);
+        if (auto unified = dictionaries_.unify(table.columns); !unified.has_value()) {
+            return std::unexpected("streamed scan: " + unified.error());
+        }
         Chunk chunk;
         const std::size_t rows = table.rows();
         chunk.set_properties(table.properties());
@@ -1888,7 +1893,7 @@ class DeferredScanSourceOperator final : public Operator {
         chunk.sequence = sequence_++;
         chunk.row_offset = emitted_rows_;
         emitted_rows_ += rows;
-        return chunk;
+        return std::optional<Chunk>{std::move(chunk)};
     }
 
     /// Materialize the one schema carrier retained when scan pushdown rejected
@@ -1896,8 +1901,10 @@ class DeferredScanSourceOperator final : public Operator {
     /// chunk, at row zero.  Dictionary unification remains necessary because a
     /// zero-row categorical still carries dictionary identity as part of its
     /// schema.
-    auto emit_schema_carrier(Table table) -> Chunk {
-        unify_categorical_dictionaries(table);
+    auto emit_schema_carrier(Table table) -> std::expected<std::optional<Chunk>, std::string> {
+        if (auto unified = dictionaries_.unify(table.columns); !unified.has_value()) {
+            return std::unexpected("streamed scan: " + unified.error());
+        }
         Chunk chunk;
         chunk.set_properties(table.properties());
         chunk.columns = std::move(table.columns);
@@ -1906,11 +1913,18 @@ class DeferredScanSourceOperator final : public Operator {
         }
         chunk.sequence = sequence_++;
         chunk.row_offset = emitted_rows_;
-        return chunk;
+        return std::optional<Chunk>{std::move(chunk)};
     }
 
-    /// Remap every Categorical column onto a dictionary shared by all this
-    /// source's chunks.
+    const DeferredScan* scan_;
+    // Planned on first use, not at construction: a scan built as a join's
+    // left input is built before the join's right side, and the join fills
+    // the scan's `stream_filter` only once it has that side.
+    std::optional<DeferredScanPlan> plan_;
+    std::vector<SourceUnit> units_;
+    const ExecutionContext* exec_;
+    /// Every Categorical column, remapped at emission onto a dictionary shared
+    /// by all this source's chunks.
     ///
     /// Parquet writes one dictionary PER ROW GROUP, and a unit is one row
     /// group, so without this each chunk's codes would mean something different
@@ -1929,55 +1943,7 @@ class DeferredScanSourceOperator final : public Operator {
     /// regression against the materialized path, on the calling thread where
     /// nothing could overlap it. A dictionary has a handful of entries and a
     /// unit has a million rows; the difference is the whole cost.
-    void unify_categorical_dictionaries(Table& table) {
-        using code_type = Column<Categorical>::code_type;
-        for (std::size_t i = 0; i < table.columns.size(); ++i) {
-            const auto* local = std::get_if<Column<Categorical>>(table.columns[i].column.get());
-            if (local == nullptr) {
-                continue;
-            }
-            if (cat_states_.size() <= i) {
-                cat_states_.resize(table.columns.size());
-            }
-            auto& state = cat_states_[i];
-            if (!state.has_value()) {
-                state.emplace();
-            }
-            if (state->dictionary_identity() == local->dictionary_identity()) {
-                continue;  // already speaks the shared dictionary
-            }
-            // Intern this chunk's dictionary into the shared one, reading back
-            // the code each entry landed on. `clear()` drops the codes and
-            // keeps the dictionary, which is exactly what an accumulator wants.
-            const auto& dictionary = local->dictionary();
-            state->clear();
-            for (const auto& value : dictionary) {
-                state->push_back(value);
-            }
-            std::vector<code_type> remap(dictionary.size());
-            for (std::size_t entry = 0; entry < dictionary.size(); ++entry) {
-                remap[entry] = state->code_at(entry);
-            }
-            state->clear();
-
-            const auto& local_codes = local->codes();
-            Column<Categorical>::codes_storage codes(local_codes.size());
-            for (std::size_t row = 0; row < local_codes.size(); ++row) {
-                codes[row] = remap[static_cast<std::size_t>(local_codes[row])];
-            }
-            table.columns[i].column = std::make_shared<ColumnValue>(
-                Column<Categorical>{state->dictionary_ptr(), state->index_ptr(), std::move(codes)});
-        }
-    }
-
-    const DeferredScan* scan_;
-    // Planned on first use, not at construction: a scan built as a join's
-    // left input is built before the join's right side, and the join fills
-    // the scan's `stream_filter` only once it has that side.
-    std::optional<DeferredScanPlan> plan_;
-    std::vector<SourceUnit> units_;
-    const ExecutionContext* exec_;
-    std::vector<std::optional<Column<Categorical>>> cat_states_;
+    CategoricalDictionaryUnifier dictionaries_;
 
     /// Units decoded and waiting to be served, in unit order, and how many of
     /// them have been.
@@ -2148,7 +2114,10 @@ class PipelinedScanOperator final : public Operator {
             empty_schema_carrier_.reset();
             const std::size_t unit = next_sequence_ - 1;
             if (emit_batch_rows_ != 0) {
-                normalize_categorical_dictionaries(chunk);
+                if (auto unified = normalize_categorical_dictionaries(chunk);
+                    !unified.has_value()) {
+                    return fail(std::move(unified.error()));
+                }
                 batch_rows_ += chunk.rows();
                 batch_chunks_.push_back(std::move(chunk));
                 if (batch_rows_ >= emit_batch_rows_) {
@@ -2157,11 +2126,17 @@ class PipelinedScanOperator final : public Operator {
                 continue;
             }
             if (sink_ == nullptr) {
-                normalize_categorical_dictionaries(chunk);
+                if (auto unified = normalize_categorical_dictionaries(chunk);
+                    !unified.has_value()) {
+                    return fail(std::move(unified.error()));
+                }
             } else {
                 std::vector<DeferredCategoricalRemap> deferred;
-                normalize_categorical_dictionaries(chunk, sink_->untranslated_columns(unit, chunk),
-                                                   &deferred);
+                if (auto unified = normalize_categorical_dictionaries(
+                        chunk, sink_->untranslated_columns(unit, chunk), &deferred);
+                    !unified.has_value()) {
+                    return fail(std::move(unified.error()));
+                }
                 if (!sink_->on_emit(unit, chunk, deferred)) {
                     for (const auto& remap : deferred) {
                         auto& entry = chunk.columns[remap.column];
@@ -2185,7 +2160,9 @@ class PipelinedScanOperator final : public Operator {
         if (empty_schema_carrier_.has_value()) {
             auto carrier = std::move(*empty_schema_carrier_);
             empty_schema_carrier_.reset();
-            normalize_categorical_dictionaries(carrier);
+            if (auto unified = normalize_categorical_dictionaries(carrier); !unified.has_value()) {
+                return fail(std::move(unified.error()));
+            }
             restamp(carrier);
             return std::optional<Chunk>{std::move(carrier)};
         }
@@ -2363,47 +2340,31 @@ class PipelinedScanOperator final : public Operator {
     // shared dictionary -- the dictionary grows exactly as if it had been
     // remapped -- but keeps its unit-local codes; its remap goes to `deferred`
     // for the sink's consumer, which translates the rows only if it reads them.
-    void normalize_categorical_dictionaries(
+    [[nodiscard]] auto normalize_categorical_dictionaries(
         Chunk& chunk, const std::vector<std::size_t>& untranslated = {},
-        std::vector<DeferredCategoricalRemap>* deferred = nullptr) {
-        using code_type = Column<Categorical>::code_type;
-        if (cat_states_.size() < chunk.columns.size()) {
-            cat_states_.resize(chunk.columns.size());
-        }
+        std::vector<DeferredCategoricalRemap>* deferred = nullptr)
+        -> std::expected<void, std::string> {
         for (std::size_t i = 0; i < chunk.columns.size(); ++i) {
-            const auto* local = std::get_if<Column<Categorical>>(chunk.columns[i].column.get());
-            if (local == nullptr) {
+            auto& entry = chunk.columns[i];
+            const auto* local = std::get_if<Column<Categorical>>(entry.column.get());
+            if (local == nullptr || dictionaries_.owns(i, *local)) {
                 continue;
             }
-            auto& state = cat_states_[i];
-            if (!state.has_value()) {
-                state.emplace();
-            }
-            if (state->dictionary_identity() == local->dictionary_identity()) {
-                continue;
-            }
-            const auto& dictionary = local->dictionary();
-            state->clear();
-            for (const auto& value : dictionary) {
-                state->push_back(value);
-            }
-            std::vector<code_type> remap(dictionary.size());
-            for (std::size_t entry = 0; entry < dictionary.size(); ++entry) {
-                remap[entry] = state->code_at(entry);
-            }
-            state->clear();
-            DeferredCategoricalRemap translation{
-                .column = i,
-                .shared = Column<Categorical>{state->dictionary_ptr(), state->index_ptr()},
-                .remap = std::move(remap)};
-            if (deferred != nullptr && !chunk.columns[i].validity.has_value() &&
+            if (deferred != nullptr && !entry.validity.has_value() &&
                 std::ranges::find(untranslated, i) != untranslated.end()) {
-                deferred->push_back(std::move(translation));
+                const auto& remap = dictionaries_.remap(i, *local);
+                deferred->push_back(DeferredCategoricalRemap{
+                    .column = i, .shared = dictionaries_.shared(i), .remap = remap});
                 continue;
             }
-            chunk.columns[i].column =
-                std::make_shared<ColumnValue>(translate_deferred_categorical(*local, translation));
+            auto translated = dictionaries_.translate(i, *local, entry.validity);
+            if (!translated.has_value()) {
+                return std::unexpected("scan pipeline: column '" + entry.name +
+                                       "': " + translated.error());
+            }
+            entry.column = std::make_shared<ColumnValue>(std::move(*translated));
         }
+        return {};
     }
 
     void finish_workers() {
@@ -2464,7 +2425,7 @@ class PipelinedScanOperator final : public Operator {
     // The same ordered handoff the morsel executor uses: one implementation of
     // the bounded, sequence-ordered producer/consumer shape.
     OrderedChunkRing ring_;
-    std::vector<std::optional<Column<Categorical>>> cat_states_;
+    CategoricalDictionaryUnifier dictionaries_;
     std::optional<Chunk> empty_schema_carrier_;
     std::size_t emit_batch_rows_ = 0;
     std::vector<Chunk> batch_chunks_;

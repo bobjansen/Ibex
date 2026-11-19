@@ -96,16 +96,17 @@ Owner: `include/ibex/runtime/operator.hpp`.
 * Categorical columns across chunks of one stream **share one backing
   dictionary**; codes are copied verbatim, never re-interned. This is what
   `append_column_values` and `gather_range` rely on. A streamed scan decodes
-  each unit over that unit's own dictionary, so `PipelinedScanOperator`
-  remaps onto a shared one as it emits (`normalize_categorical_dictionaries`).
+  each unit over that unit's own dictionary, so `PipelinedScanOperator` and
+  `DeferredScanSourceOperator` remap onto a shared one as they emit.
   The one sanctioned exception is a `ScanWorkerSink` consumer that names
   `untranslated_columns`: it receives the remap and owns the translation
   before anything reads those codes as shared ones. An extern chunked source
   may build each chunk over its own dictionary (an Arrow stream does, batch
   by batch): the runtime wraps it in `CategoricalUnifyingOperator`, and
-  `MaterializeOperator` unifies a mismatch it sees itself, both through
-  `CategoricalDictionaryUnifier` (`operator.hpp`). A null row's code is never
-  read; a valid row's code outside its own dictionary is an error.
+  `MaterializeOperator` unifies a mismatch it sees itself. All of these remap
+  through one `CategoricalDictionaryUnifier` (`operator.hpp`): one lookup per
+  dictionary entry, never per row. A null row's code is never read; a valid
+  row's code outside its own dictionary is an error.
 * Validity is `optional<ValidityBitmap>`; `nullopt` means all rows valid.
   Concat widens lazily: the result stays `nullopt` until some chunk carries
   nulls, backfilling the accumulated prefix as valid

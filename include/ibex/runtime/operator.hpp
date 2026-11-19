@@ -280,59 +280,104 @@ class CategoricalDictionaryUnifier {
                state->shared.dictionary_identity() == local.dictionary_identity();
     }
 
+    /// The translation for `local`'s dictionary: `remap[local code]` is the
+    /// unified code. Only entries not translated before are interned -- one
+    /// lookup per dictionary entry, never per row. The reference is valid
+    /// until the next call for this column.
+    [[nodiscard]] auto remap(std::size_t column, const Column<Categorical>& local)
+        -> const std::vector<code_type>& {
+        State& state = state_for(column);
+        if (state.source.get() != local.dictionary_identity()) {
+            // Held, not just compared: a freed dictionary's address can be
+            // reused by the next chunk's.
+            state.source = local.dictionary_ptr();
+            state.remap.clear();
+        }
+        const std::vector<std::string>& dictionary = *state.source;
+        if (state.remap.size() < dictionary.size()) {
+            // Intern the new entries, then read back the code each landed on.
+            // `clear()` drops those scratch codes and keeps the dictionary.
+            const std::size_t first = state.remap.size();
+            for (std::size_t entry = first; entry < dictionary.size(); ++entry) {
+                state.shared.push_back(dictionary[entry]);
+            }
+            for (std::size_t entry = first; entry < dictionary.size(); ++entry) {
+                state.remap.push_back(state.shared.code_at(entry - first));
+            }
+            state.shared.clear();
+        }
+        return state.remap;
+    }
+
+    /// A column with no rows over column `column`'s unified dictionary.
+    [[nodiscard]] auto shared(std::size_t column) -> Column<Categorical> {
+        return state_for(column).shared.with_codes();
+    }
+
     /// `local`'s rows over column `column`'s unified dictionary. A null row
     /// (per `validity`) becomes code 0: its payload is unspecified and must not
     /// be read. A valid row whose code is not in its own dictionary is an error.
     [[nodiscard]] auto translate(std::size_t column, const Column<Categorical>& local,
                                  const std::optional<ValidityBitmap>& validity)
         -> std::expected<Column<Categorical>, std::string> {
-        if (states_.size() <= column) {
-            states_.resize(column + 1);
-        }
-        auto& state = states_[column];
-        if (!state.has_value()) {
-            state.emplace();
-        }
-        if (state->source.get() != local.dictionary_identity()) {
-            // Held, not just compared: a freed dictionary's address can be
-            // reused by the next chunk's.
-            state->source = local.dictionary_ptr();
-            state->remap.clear();
-        }
-        const std::vector<std::string>& dictionary = *state->source;
-        if (state->remap.size() < dictionary.size()) {
-            // Intern the new entries, then read back the code each landed on.
-            // `clear()` drops those scratch codes and keeps the dictionary.
-            const std::size_t first = state->remap.size();
-            for (std::size_t entry = first; entry < dictionary.size(); ++entry) {
-                state->shared.push_back(dictionary[entry]);
-            }
-            for (std::size_t entry = first; entry < dictionary.size(); ++entry) {
-                state->remap.push_back(state->shared.code_at(entry - first));
-            }
-            state->shared.clear();
-        }
-
+        const std::vector<code_type>& table = remap(column, local);
+        const auto entries = static_cast<std::uint32_t>(table.size());
+        // Out-of-range codes read entry 0 (or this zero, for an empty
+        // dictionary) and are reported after the loop, which keeps the loop a
+        // plain gather.
+        const code_type empty = 0;
+        const code_type* lookup = table.empty() ? &empty : table.data();
         const std::size_t rows = local.size();
         const code_type* codes = local.codes_data();
-        const auto entries = static_cast<code_type>(state->remap.size());
         Column<Categorical>::codes_storage out(rows);
-        for (std::size_t row = 0; row < rows; ++row) {
-            if (validity.has_value() && !(*validity)[row]) {
-                out[row] = 0;
-                continue;
+        bool out_of_range = false;
+        if (!validity.has_value()) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                const auto code = static_cast<std::uint32_t>(codes[row]);
+                out_of_range |= code >= entries;
+                out[row] = lookup[code < entries ? code : 0U];
             }
-            const code_type code = codes[row];
-            if (code < 0 || code >= entries) {
-                return std::unexpected("Categorical code " + std::to_string(code) +
-                                       " is outside its dictionary of " + std::to_string(entries) +
-                                       " entries");
+        } else {
+            for (std::size_t row = 0; row < rows; ++row) {
+                const bool valid = (*validity)[row];
+                const auto code = valid ? static_cast<std::uint32_t>(codes[row]) : 0U;
+                out_of_range |= valid && code >= entries;
+                out[row] = valid ? lookup[code < entries ? code : 0U] : 0;
             }
-            out[row] = state->remap[static_cast<std::size_t>(code)];
         }
-        Column<Categorical> translated = state->shared.with_codes(std::move(out));
+        if (out_of_range) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                const auto code = static_cast<std::uint32_t>(codes[row]);
+                if ((!validity.has_value() || (*validity)[row]) && code >= entries) {
+                    return std::unexpected("Categorical code " + std::to_string(codes[row]) +
+                                           " is outside its dictionary of " +
+                                           std::to_string(entries) + " entries");
+                }
+            }
+        }
+        Column<Categorical> translated = shared(column).with_codes(std::move(out));
         translated.set_meta(local.meta());
         return translated;
+    }
+
+    /// Translate every Categorical column of `columns` that does not already
+    /// speak its unified dictionary. Column `i` is unified with column `i` of
+    /// every earlier call.
+    [[nodiscard]] auto unify(std::vector<ColumnEntry>& columns)
+        -> std::expected<void, std::string> {
+        for (std::size_t i = 0; i < columns.size(); ++i) {
+            auto& entry = columns[i];
+            const auto* local = std::get_if<Column<Categorical>>(entry.column.get());
+            if (local == nullptr || owns(i, *local)) {
+                continue;
+            }
+            auto translated = translate(i, *local, entry.validity);
+            if (!translated.has_value()) {
+                return std::unexpected("column '" + entry.name + "': " + translated.error());
+            }
+            entry.column = std::make_shared<ColumnValue>(std::move(*translated));
+        }
+        return {};
     }
 
    private:
@@ -341,6 +386,17 @@ class CategoricalDictionaryUnifier {
         std::shared_ptr<std::vector<std::string>> source;  ///< last dictionary translated
         std::vector<code_type> remap;                      ///< `remap[source code]` = unified code
     };
+    auto state_for(std::size_t column) -> State& {
+        if (states_.size() <= column) {
+            states_.resize(column + 1);
+        }
+        std::optional<State>& state = states_[column];
+        if (!state.has_value()) {
+            state.emplace();
+        }
+        return *state;
+    }
+
     std::vector<std::optional<State>> states_;
 };
 
@@ -491,18 +547,8 @@ class CategoricalUnifyingOperator final : public Operator {
         if (!pulled.has_value() || !pulled->has_value()) {
             return pulled;
         }
-        Chunk& chunk = **pulled;
-        for (std::size_t i = 0; i < chunk.columns.size(); ++i) {
-            auto& entry = chunk.columns[i];
-            const auto* local = std::get_if<Column<Categorical>>(entry.column.get());
-            if (local == nullptr || dictionaries_.owns(i, *local)) {
-                continue;
-            }
-            auto translated = dictionaries_.translate(i, *local, entry.validity);
-            if (!translated.has_value()) {
-                return std::unexpected("column '" + entry.name + "': " + translated.error());
-            }
-            entry.column = std::make_shared<ColumnValue>(std::move(*translated));
+        if (auto unified = dictionaries_.unify((*pulled)->columns); !unified.has_value()) {
+            return std::unexpected(std::move(unified.error()));
         }
         return pulled;
     }

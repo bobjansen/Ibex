@@ -20,6 +20,10 @@ usage: scripts/clang-format.sh [clang-format args] <files...>
                     argument that does not start with `-` is a path, so pass
                     clang-format options in their `--opt=value` form.
 
+Vendored code (any `vendor/` directory) is never formatted, in either mode and
+whether named explicitly or not: clang-format itself skips every file matched
+by the repository's `.clang-format-ignore`. Add new third-party trees there.
+
 Examples:
   scripts/clang-format.sh -i src/core/foo.cpp
   scripts/clang-format.sh -ir                    # the whole repository, in place

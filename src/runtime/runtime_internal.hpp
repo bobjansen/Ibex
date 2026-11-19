@@ -909,9 +909,9 @@ template <typename GatherWhole>
     // context, but reading it is not.
     const std::size_t budget = exec != nullptr ? exec->compute_budget() : pool_size;
     const std::size_t threads = std::min(budget, pool_size);
-    const bool worth_it =
-        exec != nullptr && exec->can_fan_out() && !on_worker_pool_thread() && threads >= 2 &&
-        !jobs.empty() && total > 0 && total >= exec->parallel_min_rows;
+    const bool worth_it = exec != nullptr && exec->can_fan_out() && !on_worker_pool_thread() &&
+                          threads >= 2 && !jobs.empty() && total > 0 &&
+                          total >= exec->parallel_min_rows;
 
     if (!worth_it) {
         // Serial by decision: the fan-out choice is made here, once, so the

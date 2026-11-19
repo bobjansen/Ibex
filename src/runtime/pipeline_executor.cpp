@@ -1496,9 +1496,7 @@ auto build_materialized_map_run(const physical::Plan& plan, const std::vector<Ma
     // earn is an honest counter -- see below -- and not doing work whose only
     // consumer is a worker that will not exist.
     const std::size_t worker_count =
-        is_worth_morselizing(exec, owned->rows())
-            ? morsel_worker_count(exec, expected_morsels)
-            : 0;
+        is_worth_morselizing(exec, owned->rows()) ? morsel_worker_count(exec, expected_morsels) : 0;
     const bool morselize = worker_count >= 2;
     if (exec.parallel_stats != nullptr) {
         auto& stats = *exec.parallel_stats;

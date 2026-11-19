@@ -146,7 +146,8 @@ target_link_libraries(ibex_tests
 )
 
 if(TARGET ibex_parquet)
-    target_sources(ibex_tests PRIVATE test_parquet_int32_ingestion.cpp
+    target_sources(ibex_tests PRIVATE test_parquet_chunked_source.cpp
+                                      test_parquet_int32_ingestion.cpp
                                       test_parquet_key_filter_estimate.cpp)
     target_include_directories(ibex_tests SYSTEM PRIVATE
         $<TARGET_PROPERTY:ibex_parquet,INCLUDE_DIRECTORIES>)

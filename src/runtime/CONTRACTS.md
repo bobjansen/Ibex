@@ -102,10 +102,11 @@ Owner: `include/ibex/runtime/operator.hpp`.
   `untranslated_columns`: it receives the remap and owns the translation
   before anything reads those codes as shared ones. An extern chunked source
   may build each chunk over its own dictionary (an Arrow stream does, batch
-  by batch): the runtime wraps it in `CategoricalUnifyingOperator`, and
-  `MaterializeOperator` unifies a mismatch it sees itself. All of these remap
-  through one `CategoricalDictionaryUnifier` (`operator.hpp`): one lookup per
-  dictionary entry, never per row. A null row's code is never read; a valid
+  by batch, and Parquet row group by row group): the runtime wraps it in
+  `CategoricalUnifyingOperator`, and `MaterializeOperator` unifies a
+  mismatch it sees itself. All of these remap through one
+  `CategoricalDictionaryUnifier` (`operator.hpp`): one lookup per dictionary
+  entry, never per row. A null row's code is never read; a valid
   row's code outside its own dictionary is an error.
 * Validity is `optional<ValidityBitmap>`; `nullopt` means all rows valid.
   Concat widens lazily: the result stays `nullopt` until some chunk carries

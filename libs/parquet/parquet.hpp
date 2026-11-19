@@ -5041,9 +5041,12 @@ inline auto read(std::string_view path) -> ibex::runtime::Table {
 /// Row-group streaming source for `parquet::read`, registered via
 /// `ExternRegistry::register_chunked_table` alongside the whole-file
 /// `parquet::read()` above. Each row group is decoded directly into an Ibex
-/// chunk, without an intermediate Arrow RecordBatch or Table. Categorical
-/// chunks are remapped onto shared dictionaries, preserving the streaming
-/// operator contract across row-group dictionary boundaries.
+/// chunk, without an intermediate Arrow RecordBatch or Table. Each row group's
+/// Categorical columns keep that group's own dictionary: every consumer of an
+/// extern chunked source unifies them (`CategoricalUnifyingOperator` on the
+/// streamed path, `MaterializeOperator` on the materializing ones), so the
+/// streaming operator contract holds above this operator without a second
+/// remap here.
 class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
    public:
     static auto create(std::string path) -> std::expected<ibex::runtime::OperatorPtr, std::string> {
@@ -5081,23 +5084,6 @@ class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
             auto table = direct_decode_table(*reader_, *schema_, field_indices_, nullptr,
                                              source_rows_, groups);
 
-            for (std::size_t i = 0; i < table.columns.size(); ++i) {
-                auto* local =
-                    std::get_if<ibex::Column<ibex::Categorical>>(table.columns[i].column.get());
-                if (local == nullptr) {
-                    continue;
-                }
-                auto& state = *categorical_states_[i];
-                ibex::Column<ibex::Categorical> remapped{
-                    state.dictionary_ptr(), state.index_ptr(), {}};
-                remapped.reserve(local->size());
-                for (std::size_t row = 0; row < local->size(); ++row) {
-                    remapped.push_back((*local)[row]);
-                }
-                table.columns[i].column =
-                    std::make_shared<ibex::runtime::ColumnValue>(std::move(remapped));
-            }
-
             ibex::runtime::Chunk chunk;
             chunk.columns = std::move(table.columns);
             if (chunk.columns.empty()) {
@@ -5128,21 +5114,13 @@ class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
         group_count_ = metadata.num_row_groups();
         source_rows_ = static_cast<std::size_t>(metadata.num_rows());
         field_indices_.resize(static_cast<std::size_t>(schema_->num_fields()));
-        categorical_states_.resize(field_indices_.size());
-        for (int i = 0; i < schema_->num_fields(); ++i) {
-            const auto pos = static_cast<std::size_t>(i);
-            field_indices_[pos] = i;
-            if (schema_->field(i)->type()->id() == arrow::Type::DICTIONARY) {
-                categorical_states_[pos].emplace();
-            }
-        }
+        std::iota(field_indices_.begin(), field_indices_.end(), 0);
     }
 
     std::string path_;
     std::unique_ptr<parquet::arrow::FileReader> reader_;
     std::shared_ptr<arrow::Schema> schema_;
     std::vector<int> field_indices_;
-    std::vector<std::optional<ibex::Column<ibex::Categorical>>> categorical_states_;
     std::size_t source_rows_ = 0;
     std::size_t next_source_row_ = 0;
     int next_group_ = 0;

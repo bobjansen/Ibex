@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Run the prepared-input Discovery policy sweep and summarize balanced pairs."""
 import argparse
 import csv

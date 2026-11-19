@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Paired timings of the cross-chunk fixture; preparation and checks are excluded."""
 import json
 import os

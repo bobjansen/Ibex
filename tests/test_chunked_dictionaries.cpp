@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Categorical dictionaries across the chunks of one extern chunked source.
 //
 // The chunk contract (src/runtime/CONTRACTS.md §1) says every chunk of a stream

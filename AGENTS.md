@@ -9,6 +9,9 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - Do not commit raw benchmark measurements, run logs, profiles, disassemblies, or experiment result dumps. Keep them in persistent ignored storage. Commit reusable harnesses and fixtures; document reproduction separately from run output.
 - If generated artifacts were accidentally committed in unpushed work, rewrite the offending commits to remove them from branch history; do not add a deletion-only cleanup commit.
 
+## Commits
+- Commit completed, verified changes without waiting for a separate prompt. Stage only the changes from the task unless the user asks for a broader commit.
+
 ## Build
 - Clang 20, CMake 3.31+, Ninja. Debug/Release: `cmake -B build{-release} -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE={Debug,Release}`
 - **Always benchmark `build-release/`, not debug (4× slower)**

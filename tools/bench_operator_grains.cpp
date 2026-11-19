@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 #include <ibex/core/column.hpp>
+#include <ibex/core/decimal.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -136,8 +137,10 @@ int main(int argc, char** argv) {
                         for (std::size_t g = 0; g < groups; ++g) {
                             if (actual[g].units != sums[g])
                                 throw std::runtime_error("Incorrect decimal reference sum");
-                            const double want = static_cast<double>(sums[g]) / 100.0 /
-                                                static_cast<double>(counts[g]);
+                            // decimal::to_double, not static_cast: MSVC's Int128
+                            // (std::_Signed128) has no conversion to double.
+                            const double want =
+                                decimal::to_double(sums[g], 2) / static_cast<double>(counts[g]);
                             if (std::abs(mean[g] - want) > 1e-12)
                                 throw std::runtime_error("Incorrect decimal reference mean");
                         }

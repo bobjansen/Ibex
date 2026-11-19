@@ -1156,7 +1156,9 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             if (args_ok) {
                 auto op = fn->chunked_table_func(args);
                 if (op.has_value()) {
-                    return std::move(op.value());
+                    // An extern source may build each chunk over its own
+                    // Categorical dictionary; the operators above assume one.
+                    return std::make_unique<CategoricalUnifyingOperator>(std::move(op.value()));
                 }
             }
         }

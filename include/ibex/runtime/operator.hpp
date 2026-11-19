@@ -229,8 +229,8 @@ inline void append_column_values(ColumnValue& dst_value, const ColumnValue& src_
             if constexpr (std::is_same_v<Col, Column<Categorical>>) {
                 // Codes are copied as-is rather than re-interned, which is only
                 // sound because the chunks share one dictionary — the contract
-                // every caller of this already relies on (see
-                // `MaterializeOperator`, and the scan's own dictionary unifier).
+                // every caller of this relies on (`MaterializeOperator` unifies
+                // a chunk that breaks it; see `CategoricalDictionaryUnifier`).
                 const auto& codes = src.codes();
                 dst.append_codes(codes.begin(), codes.end());
             } else if constexpr (std::is_same_v<Col, Column<std::string>>) {
@@ -251,6 +251,94 @@ inline void append_column_values(ColumnValue& dst_value, const ColumnValue& src_
         },
         dst_value);
 }
+
+/// Puts the Categorical columns of one chunk stream onto one dictionary per
+/// column, owned by this object.
+///
+/// The chunk contract is that every chunk of a stream shares one dictionary,
+/// so codes can be copied verbatim. Sources inside the runtime honor it (the
+/// streamed scan remaps each unit at emission), but an extern source is free to
+/// build every chunk over its own dictionary -- an Arrow stream does, batch by
+/// batch -- and verbatim codes would then read the wrong labels, or past the
+/// end of the dictionary.
+///
+/// Dictionaries only grow, so the translation for the last source dictionary
+/// seen is kept and extended by its new entries: a source that shares one
+/// growing dictionary pays for each entry once, plus one pass over the codes.
+class CategoricalDictionaryUnifier {
+   public:
+    using code_type = Column<Categorical>::code_type;
+
+    /// Whether `local` already speaks column `column`'s unified dictionary.
+    [[nodiscard]] auto owns(std::size_t column, const Column<Categorical>& local) const noexcept
+        -> bool {
+        return column < states_.size() && states_[column].has_value() &&
+               states_[column]->shared.dictionary_identity() == local.dictionary_identity();
+    }
+
+    /// `local`'s rows over column `column`'s unified dictionary. A null row
+    /// (per `validity`) becomes code 0: its payload is unspecified and must not
+    /// be read. A valid row whose code is not in its own dictionary is an error.
+    [[nodiscard]] auto translate(std::size_t column, const Column<Categorical>& local,
+                                 const std::optional<ValidityBitmap>& validity)
+        -> std::expected<Column<Categorical>, std::string> {
+        if (states_.size() <= column) {
+            states_.resize(column + 1);
+        }
+        auto& state = states_[column];
+        if (!state.has_value()) {
+            state.emplace();
+        }
+        if (state->source.get() != local.dictionary_identity()) {
+            // Held, not just compared: a freed dictionary's address can be
+            // reused by the next chunk's.
+            state->source = local.dictionary_ptr();
+            state->remap.clear();
+        }
+        const std::vector<std::string>& dictionary = *state->source;
+        if (state->remap.size() < dictionary.size()) {
+            // Intern the new entries, then read back the code each landed on.
+            // `clear()` drops those scratch codes and keeps the dictionary.
+            const std::size_t first = state->remap.size();
+            for (std::size_t entry = first; entry < dictionary.size(); ++entry) {
+                state->shared.push_back(dictionary[entry]);
+            }
+            for (std::size_t entry = first; entry < dictionary.size(); ++entry) {
+                state->remap.push_back(state->shared.code_at(entry - first));
+            }
+            state->shared.clear();
+        }
+
+        const std::size_t rows = local.size();
+        const code_type* codes = local.codes_data();
+        const auto entries = static_cast<code_type>(state->remap.size());
+        Column<Categorical>::codes_storage out(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            if (validity.has_value() && !(*validity)[row]) {
+                out[row] = 0;
+                continue;
+            }
+            const code_type code = codes[row];
+            if (code < 0 || code >= entries) {
+                return std::unexpected("Categorical code " + std::to_string(code) +
+                                       " is outside its dictionary of " + std::to_string(entries) +
+                                       " entries");
+            }
+            out[row] = state->remap[static_cast<std::size_t>(code)];
+        }
+        Column<Categorical> translated = state->shared.with_codes(std::move(out));
+        translated.set_meta(local.meta());
+        return translated;
+    }
+
+   private:
+    struct State {
+        Column<Categorical> shared;                        ///< no rows; owns the unified dictionary
+        std::shared_ptr<std::vector<std::string>> source;  ///< last dictionary translated
+        std::vector<code_type> remap;                      ///< `remap[source code]` = unified code
+    };
+    std::vector<std::optional<State>> states_;
+};
 
 class MaterializeOperator {
    public:
@@ -339,6 +427,30 @@ class MaterializeOperator {
             for (std::size_t i = 0; i < n_cols; ++i) {
                 const std::size_t src_rows = column_size(*chunk.columns[i].column);
                 auto& dst_col = result.mutable_column(i);
+                // A chunk over another dictionary than the rows so far: move
+                // those rows onto a dictionary this sink owns (once per column),
+                // then translate the chunk onto it. Free while they share one.
+                if (const auto* src_cat =
+                        std::get_if<Column<Categorical>>(chunk.columns[i].column.get())) {
+                    const auto& dst_cat = std::get<Column<Categorical>>(dst_col);
+                    if (dst_cat.dictionary_identity() != src_cat->dictionary_identity()) {
+                        if (!dictionaries_.owns(i, dst_cat)) {
+                            auto moved =
+                                dictionaries_.translate(i, dst_cat, result.columns[i].validity);
+                            if (!moved.has_value()) {
+                                return std::unexpected("MaterializeOperator: " + moved.error());
+                            }
+                            dst_col = std::move(*moved);
+                        }
+                        auto translated =
+                            dictionaries_.translate(i, *src_cat, chunk.columns[i].validity);
+                        if (!translated.has_value()) {
+                            return std::unexpected("MaterializeOperator: " + translated.error());
+                        }
+                        chunk.columns[i].column =
+                            std::make_shared<ColumnValue>(std::move(*translated));
+                    }
+                }
                 const std::size_t needed = prev_rows + src_rows;
                 const bool grow = needed > reserved[i];
                 if (grow) {
@@ -360,6 +472,40 @@ class MaterializeOperator {
 
    private:
     OperatorPtr child_;
+    CategoricalDictionaryUnifier dictionaries_;
+};
+
+/// Forwards `child`'s chunks with every Categorical column on one dictionary
+/// per column (`CategoricalDictionaryUnifier`). Wraps a source the runtime did
+/// not build, so the operators above it may copy codes verbatim.
+class CategoricalUnifyingOperator final : public Operator {
+   public:
+    explicit CategoricalUnifyingOperator(OperatorPtr child) : child_(std::move(child)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        auto pulled = child_->next();
+        if (!pulled.has_value() || !pulled->has_value()) {
+            return pulled;
+        }
+        Chunk& chunk = **pulled;
+        for (std::size_t i = 0; i < chunk.columns.size(); ++i) {
+            auto& entry = chunk.columns[i];
+            const auto* local = std::get_if<Column<Categorical>>(entry.column.get());
+            if (local == nullptr || dictionaries_.owns(i, *local)) {
+                continue;
+            }
+            auto translated = dictionaries_.translate(i, *local, entry.validity);
+            if (!translated.has_value()) {
+                return std::unexpected("column '" + entry.name + "': " + translated.error());
+            }
+            entry.column = std::make_shared<ColumnValue>(std::move(*translated));
+        }
+        return pulled;
+    }
+
+   private:
+    OperatorPtr child_;
+    CategoricalDictionaryUnifier dictionaries_;
 };
 
 }  // namespace ibex::runtime

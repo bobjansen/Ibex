@@ -86,9 +86,12 @@ Owner: `include/ibex/runtime/operator.hpp`.
   remaps onto a shared one as it emits (`normalize_categorical_dictionaries`).
   The one sanctioned exception is a `ScanWorkerSink` consumer that names
   `untranslated_columns`: it receives the remap and owns the translation
-  before anything reads those codes as shared ones. *Known hardening debt*:
-  extern chunked sources with independent per-chunk dictionaries violate the
-  rule silently.
+  before anything reads those codes as shared ones. An extern chunked source
+  may build each chunk over its own dictionary (an Arrow stream does, batch
+  by batch): the runtime wraps it in `CategoricalUnifyingOperator`, and
+  `MaterializeOperator` unifies a mismatch it sees itself, both through
+  `CategoricalDictionaryUnifier` (`operator.hpp`). A null row's code is never
+  read; a valid row's code outside its own dictionary is an error.
 * Validity is `optional<ValidityBitmap>`; `nullopt` means all rows valid.
   Concat widens lazily: the result stays `nullopt` until some chunk carries
   nulls, backfilling the accumulated prefix as valid
@@ -168,10 +171,10 @@ Owner: `operator.hpp` (`MaterializeOperator`, `append_column_values`).
   grain).
 * First chunk donates its columns and properties; the result's
   `logical_rows` accumulates for column-less frames.
-* *Known hardening debt* (Phase 2 validity work): schema agreement is
-  checked (count/name/type), dictionary sharing is assumed, and validity is
-  widened on demand — a hostile source can violate the dictionary
-  assumption silently.
+* Schema agreement is checked (count/name/type) and validity is widened on
+  demand. A chunk over another dictionary than the rows so far moves those
+  rows, once per column, onto a dictionary the sink owns and is translated
+  onto it (§1); while the chunks share one, codes are copied verbatim.
 
 ## 5. `TableProperties` — derived claims
 
@@ -218,9 +221,9 @@ Owner: `table_properties.hpp`.
   if it participates in the result. Predicate-only columns are never
   materialized.
 * The extern chunked-source **contract** (stable schema, ownership/lifetime,
-  dictionary expectations, EOF/error signalling) is the one source contract
-  still documented only by its implementations (`csv::read`, ADBC, Parquet);
-  writing it down is outstanding.
+  EOF/error signalling) is the one source contract still documented only by
+  its implementations (`csv::read`, ADBC, Parquet); writing it down is
+  outstanding. Dictionaries are the exception: the runtime unifies them (§1).
 
 ## 7. Determinism bar (the contract behind every contract)
 

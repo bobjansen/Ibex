@@ -81,6 +81,7 @@ set(IBEX_TEST_SOURCES
     test_join_predicate_keys.cpp
     test_lazy_table.cpp
     test_chunked_sources.cpp
+    test_chunked_dictionaries.cpp
     test_aggregate_prefilter.cpp
     test_bound_plan.cpp
     test_dictionary_laziness.cpp

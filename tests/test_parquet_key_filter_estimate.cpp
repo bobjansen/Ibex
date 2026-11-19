@@ -147,9 +147,9 @@ TEST_CASE("Parquet dictionary scan keeps candidate rows across mixed encoding",
     REQUIRE(mixed_chunk->has_dictionary_page());
     REQUIRE_FALSE(stats_prove_dictionary(*mixed_chunk));
     std::array readers{reader.get()};
-    const ibex::runtime::DictionaryPredicate keep = [](std::span<const std::string_view> values) {
+    const ibex::runtime::DictionaryPredicate keep = [](std::span<const std::string_view> entries) {
         std::vector<char> flags;
-        for (const auto value : values) {
+        for (const auto value : entries) {
             flags.push_back(value == "keep" ? 1 : 0);
         }
         return flags;

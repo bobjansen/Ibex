@@ -6,7 +6,11 @@
 #include <ibex/runtime/operator.hpp>
 
 #include <cstddef>
+#include <expected>
 #include <memory>
+#include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace ibex::runtime {
@@ -14,18 +18,26 @@ namespace ibex::runtime {
 /// A Categorical column the pipeline emitted still over its unit's OWN
 /// dictionary, because the consumer asked to translate it itself: `shared` is
 /// the shared dictionary (no rows) the pipeline would have remapped it onto,
-/// and `remap[local code]` the shared code.
+/// and `remap[local code]` the shared code. `remap` is a copy: by the time
+/// the consumer translates, the pipeline's unifier may have moved on to a
+/// later unit's dictionary.
 struct DeferredCategoricalRemap {
     std::size_t column = 0;
     Column<Categorical> shared;
     std::vector<Column<Categorical>::code_type> remap;
-};
 
-/// `local`'s rows over `deferred.shared`: the per-row translation the pipeline
-/// skipped.
-[[nodiscard]] auto translate_deferred_categorical(const Column<Categorical>& local,
-                                                  const DeferredCategoricalRemap& deferred)
-    -> Column<Categorical>;
+    /// `entry`'s rows over `shared`: the per-row translation the pipeline
+    /// skipped, done in place. An error names the column.
+    [[nodiscard]] auto translate(ColumnEntry& entry) const -> std::expected<void, std::string> {
+        auto translated = CategoricalDictionaryUnifier::gather(
+            remap, shared, std::get<Column<Categorical>>(*entry.column), entry.validity);
+        if (!translated.has_value()) {
+            return std::unexpected("column '" + entry.name + "': " + translated.error());
+        }
+        entry.column = std::make_shared<ColumnValue>(std::move(*translated));
+        return {};
+    }
+};
 
 /// A consumer's hook into a streamed scan pipeline: work the consumer would do
 /// on each chunk, done instead on the pipeline worker that produced it, while

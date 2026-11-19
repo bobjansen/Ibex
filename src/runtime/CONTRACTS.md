@@ -106,8 +106,9 @@ Owner: `include/ibex/runtime/operator.hpp`.
   `CategoricalUnifyingOperator`, and `MaterializeOperator` unifies a
   mismatch it sees itself. All of these remap through one
   `CategoricalDictionaryUnifier` (`operator.hpp`): one lookup per dictionary
-  entry, never per row. A null row's code is never read; a valid
-  row's code outside its own dictionary is an error.
+  entry, never per row. The sink consumer's deferred translation runs the
+  same `gather` over the remap it was handed. A null row's code is never
+  read; a valid row's code outside its own dictionary is an error.
 * Validity is `optional<ValidityBitmap>`; `nullopt` means all rows valid.
   Concat widens lazily: the result stays `nullopt` until some chunk carries
   nulls, backfilling the accumulated prefix as valid

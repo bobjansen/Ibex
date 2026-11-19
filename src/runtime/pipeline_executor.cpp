@@ -2139,9 +2139,10 @@ class PipelinedScanOperator final : public Operator {
                 }
                 if (!sink_->on_emit(unit, chunk, deferred)) {
                     for (const auto& remap : deferred) {
-                        auto& entry = chunk.columns[remap.column];
-                        entry.column = std::make_shared<ColumnValue>(translate_deferred_categorical(
-                            std::get<Column<Categorical>>(*entry.column), remap));
+                        if (auto translated = remap.translate(chunk.columns[remap.column]);
+                            !translated.has_value()) {
+                            return fail("scan pipeline: " + translated.error());
+                        }
                     }
                 } else if (!deferred.empty() && exec_->parallel_stats != nullptr) {
                     exec_->parallel_stats->untranslated_categorical_columns.fetch_add(
@@ -2834,21 +2835,6 @@ ScanWorkerSinkOffer::ScanWorkerSinkOffer(std::shared_ptr<ScanWorkerSink> sink)
 
 ScanWorkerSinkOffer::~ScanWorkerSinkOffer() {
     offered_scan_worker_sink = std::move(previous_);
-}
-
-auto translate_deferred_categorical(const Column<Categorical>& local,
-                                    const DeferredCategoricalRemap& deferred)
-    -> Column<Categorical> {
-    using code_type = Column<Categorical>::code_type;
-    const std::size_t rows = local.size();
-    const code_type* local_codes = local.codes_data();
-    const code_type* remap = deferred.remap.data();
-    Column<Categorical>::codes_storage codes(rows);
-    for (std::size_t row = 0; row < rows; ++row) {
-        codes[row] = remap[static_cast<std::size_t>(local_codes[row])];
-    }
-    return Column<Categorical>{deferred.shared.dictionary_ptr(), deferred.shared.index_ptr(),
-                               std::move(codes)};
 }
 
 auto take_offered_scan_worker_sink() -> std::shared_ptr<ScanWorkerSink> {

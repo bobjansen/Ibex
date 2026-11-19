@@ -2279,7 +2279,9 @@ class HashAggregateState final {
                 // A pair can start with bitmap-free chunks and gain nulls
                 // after packed-code discovery. Adopt its gids and slots into
                 // the nullable code index instead of boxing strings per row.
-                translate_deferred_keys();
+                if (auto error = translate_deferred_keys(); error.has_value()) {
+                    return error;
+                }
                 multi_cat_codes_flat_.resize(n_groups_ * 2);
                 for (std::size_t gid = 0; gid < n_groups_; ++gid) {
                     multi_cat_codes_flat_[gid * 2] =
@@ -2301,7 +2303,9 @@ class HashAggregateState final {
         // Only the multi-key Categorical path can merge a partial over
         // untranslated keys; every other one reads the codes.
         if (!cat_fast_path_ || group_entries.size() < 2) {
-            translate_deferred_keys();
+            if (auto error = translate_deferred_keys(); error.has_value()) {
+                return error;
+            }
         }
         if (cat_fast_path_) {
             return process_rows_cat(group_entries, agg_entries, rows);
@@ -6184,25 +6188,29 @@ class HashAggregateState final {
         }
         if (!scan_sink_active_ || !on_worker_partial_path() || !keys_valid ||
             worker_emission_.partial == nullptr || worker_emission_.partial->rows != chunk.rows()) {
-            translate_deferred_keys();
+            if (auto error = translate_deferred_keys(); error.has_value()) {
+                return error;
+            }
         }
         return std::nullopt;
     }
 
     /// The per-row translation the pipeline skipped. The ColumnEntry objects
     /// stay put, so pointers taken to them remain valid.
-    void translate_deferred_keys() {
+    [[nodiscard]] auto translate_deferred_keys() -> std::optional<std::string> {
+        const std::vector<DeferredCategoricalRemap> pending =
+            std::exchange(worker_emission_.deferred, {});
         if (!active_chunk_.has_value()) {
-            worker_emission_.deferred.clear();
-            return;
+            return std::nullopt;
         }
         Chunk& chunk = *active_chunk_;
-        for (const auto& deferred : worker_emission_.deferred) {
-            auto& entry = chunk.columns[deferred.column];
-            entry.column = std::make_shared<ColumnValue>(translate_deferred_categorical(
-                std::get<Column<Categorical>>(*entry.column), deferred));
+        for (const auto& deferred : pending) {
+            if (auto translated = deferred.translate(chunk.columns[deferred.column]);
+                !translated.has_value()) {
+                return "aggregate: " + translated.error();
+            }
         }
-        worker_emission_.deferred.clear();
+        return std::nullopt;
     }
 
     /// `try_process_rows_cat_multi_parallel`'s merge, over keys the pipeline
@@ -6363,7 +6371,9 @@ class HashAggregateState final {
                 publish_fused_accumulation();
                 return std::nullopt;
             }
-            translate_deferred_keys();
+            if (auto error = translate_deferred_keys(); error.has_value()) {
+                return error;
+            }
             for (std::size_t c = 0; c < n_keys; ++c) {
                 cat_cols[c] = &std::get<Column<Categorical>>(*group_entries[c]->column);
             }
@@ -8464,7 +8474,9 @@ class HashAggregateState final {
                                          const std::vector<const ColumnEntry*>& agg_entries,
                                          std::size_t rows) -> std::optional<std::string> {
         nullable_cat_key_chunks().fetch_add(1, std::memory_order_relaxed);
-        translate_deferred_keys();
+        if (auto error = translate_deferred_keys(); error.has_value()) {
+            return error;
+        }
         const std::size_t n_keys = group_entries.size();
         multi_cat_nullable_.resize(n_keys, 0U);
         std::vector<const Column<Categorical>*> cat_cols(n_keys);

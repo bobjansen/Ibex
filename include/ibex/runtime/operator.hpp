@@ -314,13 +314,24 @@ class CategoricalDictionaryUnifier {
         return state_for(column).shared.with_codes();
     }
 
-    /// `local`'s rows over column `column`'s unified dictionary. A null row
-    /// (per `validity`) becomes code 0: its payload is unspecified and must not
-    /// be read. A valid row whose code is not in its own dictionary is an error.
+    /// `local`'s rows over column `column`'s unified dictionary; see `gather`.
     [[nodiscard]] auto translate(std::size_t column, const Column<Categorical>& local,
                                  const std::optional<ValidityBitmap>& validity)
         -> std::expected<Column<Categorical>, std::string> {
         const std::vector<code_type>& table = remap(column, local);
+        return gather(table, state_for(column).shared, local, validity);
+    }
+
+    /// `local`'s rows over `shared`'s dictionary, where `table[local code]` is
+    /// the shared code (a `remap` result, possibly kept from an earlier call).
+    /// A null row (per `validity`) becomes code 0: its payload is unspecified
+    /// and must not be read. A valid row whose code is not in its own
+    /// dictionary is an error.
+    [[nodiscard]] static auto gather(const std::vector<code_type>& table,
+                                     const Column<Categorical>& shared,
+                                     const Column<Categorical>& local,
+                                     const std::optional<ValidityBitmap>& validity)
+        -> std::expected<Column<Categorical>, std::string> {
         const auto entries = static_cast<std::uint32_t>(table.size());
         // Out-of-range codes read entry 0 (or this zero, for an empty
         // dictionary) and are reported after the loop, which keeps the loop a
@@ -355,7 +366,7 @@ class CategoricalDictionaryUnifier {
                 }
             }
         }
-        Column<Categorical> translated = shared(column).with_codes(std::move(out));
+        Column<Categorical> translated = shared.with_codes(std::move(out));
         translated.set_meta(local.meta());
         return translated;
     }

@@ -120,6 +120,12 @@ jobs:
         shell: bash
         run: |
           choco install -y --no-progress ccache ninja
+          # Arrow links the system zlib (libs/parquet), which Windows lacks.
+          # Same static-md triplet as release.yml: static zlib, dynamic CRT.
+          vcpkg install zlib:x64-windows-static-md
+          # Forward slashes: CMAKE_ARGS is split like a shell command line.
+          vcpkg_root=$(cygpath -m "$VCPKG_INSTALLATION_ROOT")
+          echo "CMAKE_ARGS=-DCMAKE_TOOLCHAIN_FILE=$vcpkg_root/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static-md" >> "$GITHUB_ENV"
           # pyproject builds in <drive>:/ibx/<tag>, outside the checkout, so
           # the base directory is the drive root (e.g. D:\).
           {

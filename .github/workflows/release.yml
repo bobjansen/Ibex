@@ -305,7 +305,7 @@ jobs:
 
           Or download the archive for your platform below, unpack it anywhere and run \`bin/ibex\`.
 
-          ## Polars engine (Python 3.11+, Linux x86_64, macOS Apple silicon, Windows x86_64)
+          ## Polars engine (Python 3.11+, Linux x86_64 and Windows x86_64)
 
           \`\`\`sh
           pip install ibex-polars --find-links https://github.com/${GH_REPO}/releases/expanded_assets/${RELEASE_TAG}

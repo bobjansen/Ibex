@@ -14,12 +14,18 @@ result = query.collect(engine=engine)
 
 ## Install
 
-Wheels for Python 3.11–3.14 on Linux x86_64 (glibc 2.28+), macOS Apple
-silicon (15+) and Windows x86_64 are attached to each [GitHub release](https://github.com/bobjansen/Ibex/releases):
+Wheels for Python 3.11–3.14 on Linux x86_64 (glibc 2.28+) and Windows
+x86_64 are attached to each [GitHub release](https://github.com/bobjansen/Ibex/releases),
+and CI republishes the current `main` as the rolling `wheels-latest`
+prerelease. No compiler is needed:
 
 ```bash
 pip install ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/<tag>
+pip install --pre ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/wheels-latest
 ```
+
+macOS (Apple silicon) wheels are built only on request, by running the
+"Python wheels" workflow by hand with the macOS option.
 
 The wheel bundles the native bridge and its Arrow/Parquet libraries and pulls
 in `polars==2.0.0`, `pyarrow` and `numpy`. To build one from a checkout

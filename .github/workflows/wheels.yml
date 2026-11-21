@@ -2,10 +2,26 @@ name: Python wheels
 
 # Builds the `ibex-polars` wheels (python/pyproject.toml) with cibuildwheel and
 # runs python/test_wheel_smoke.py against each installed wheel on a clean
-# interpreter. release.yml calls this and attaches the wheels to the release;
-# run it by hand to get wheels for an untagged commit.
+# interpreter.
+#
+# - push to main: also republishes the wheels as the rolling `wheels-latest`
+#   prerelease, so a machine without a compiler can install the current main:
+#     pip install --pre ibex-polars --find-links https://github.com/<repo>/releases/expanded_assets/wheels-latest
+# - release.yml calls this and attaches the wheels to the tagged release.
+# - Run it by hand to build any ref, optionally with macOS (Apple silicon).
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - python/**
+      - include/**
+      - src/**
+      - libs/parquet/**
+      - cmake/**
+      - CMakeLists.txt
+      - .github/workflows/wheels.yml
   workflow_call:
     inputs:
       ref:
@@ -18,24 +34,46 @@ on:
         description: "Git ref to build (default: the selected branch)"
         required: false
         type: string
+      macos:
+        description: Also build macOS arm64 wheels
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: wheels-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set.outputs.include }}
+    steps:
+      - id: set
+        env:
+          MACOS: ${{ inputs.macos || false }}
+        run: |
+          include='[{"os":"ubuntu-24.04","platform":"linux-x86_64"},{"os":"windows-latest","platform":"windows-x86_64"}'
+          if [ "$MACOS" = "true" ]; then
+            include="$include"',{"os":"macos-15","platform":"macos-arm64"}'
+          fi
+          echo "include=$include]" >> "$GITHUB_OUTPUT"
+
   wheels:
+    needs: matrix
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            platform: linux-x86_64
-          - os: macos-15
-            platform: macos-arm64
-          - os: windows-latest
-            platform: windows-x86_64
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
 
     runs-on: ${{ matrix.os }}
+
+    env:
+      CCACHE_MAXSIZE: 2G
 
     steps:
       - name: Checkout
@@ -45,11 +83,66 @@ jobs:
           # setuptools-scm derives the wheel version from the latest tag.
           fetch-depth: 0
 
+      # Outside the checkout: cibuildwheel copies the whole checkout into the
+      # manylinux container.
+      - name: Locate ccache
+        shell: bash
+        run: echo "CCACHE_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+
+      # Every Python version compiles the same Arrow and Ibex sources; ccache,
+      # kept across runs, makes all but the first compile cheap.
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: wheels-ccache-${{ matrix.platform }}-${{ github.sha }}
+          restore-keys: wheels-ccache-${{ matrix.platform }}-
+
+      # The Linux builds run in the manylinux container, which sees the runner's
+      # filesystem under /host. This replaces pyproject's Linux environment.
+      - name: Point the manylinux container at the cache
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "CIBW_ENVIRONMENT_LINUX=CCACHE_DIR=/host$CCACHE_DIR CCACHE_MAXSIZE=$CCACHE_MAXSIZE CCACHE_BASEDIR=/project CMAKE_BUILD_PARALLEL_LEVEL=4" >> "$GITHUB_ENV"
+
+      # Compiler launchers (ccache) need a single-config generator, so build
+      # with Ninja inside the MSVC developer environment instead of the
+      # Visual Studio generator.
+      - name: MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install ccache (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install -y --no-progress ccache ninja
+          # pyproject builds in <drive>:/ibx/<tag>, outside the checkout, so
+          # the base directory is the drive root (e.g. D:\).
+          {
+            echo "CMAKE_GENERATOR=Ninja"
+            echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE:0:3}"
+          } >> "$GITHUB_ENV"
+
+      - name: Install ccache (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ccache
+          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.2.1
         with:
           package-dir: python
           output-dir: wheelhouse
+
+      - name: ccache statistics
+        if: always() && runner.os != 'Linux'
+        shell: bash
+        run: ccache --show-stats || true
 
       - name: Upload wheels
         uses: actions/upload-artifact@v7
@@ -57,3 +150,40 @@ jobs:
           name: wheels-${{ matrix.platform }}
           path: wheelhouse/*.whl
           if-no-files-found: error
+
+  # Rolling prerelease of main's wheels: delete and recreate, so it only ever
+  # holds the current commit's wheels and its tag points at that commit.
+  publish-latest:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: wheels
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: wheels-latest
+      cancel-in-progress: false
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish wheels-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          (cd dist && sha256sum *.whl > SHA256SUMS && cat SHA256SUMS)
+          gh release delete wheels-latest --cleanup-tag --yes || true
+          cat > notes.md <<EOF
+          Python wheels of \`main\` at ${GITHUB_SHA}, rebuilt on every push.
+          Not a release; for tagged releases see the latest \`v*\` release.
+
+          \`\`\`sh
+          pip install --pre ibex-polars --find-links https://github.com/${GH_REPO}/releases/expanded_assets/wheels-latest
+          \`\`\`
+          EOF
+          gh release create wheels-latest dist/* --prerelease --target "$GITHUB_SHA" \
+            --title "Python wheels (main)" --notes-file notes.md

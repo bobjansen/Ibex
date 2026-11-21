@@ -63,12 +63,14 @@
     <p>
       Each <a href="https://github.com/bobjansen/Ibex/releases" target="_blank" rel="noopener">release</a>
       attaches <code>ibex-polars</code> wheels for Python 3.11&ndash;3.14 on
-      Linux x86_64 (glibc 2.28+), macOS Apple silicon (15+) and Windows x86_64.
-      They bundle the
+      Linux x86_64 (glibc 2.28+) and Windows x86_64, and the rolling
+      <code>wheels-latest</code> prerelease holds the current <code>main</code>.
+      No compiler is needed. They bundle the
       native bridge and its Arrow libraries, and pull in
       <code>polars==2.0.0</code>, <code>pyarrow</code> and <code>numpy</code>:
     </p>
-<pre><code>pip install ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/&lt;tag&gt;</code></pre>
+<pre><code>pip install ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/&lt;tag&gt;
+pip install --pre ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/wheels-latest</code></pre>
     <p>
       To build the same wheel from a checkout, run
       <code>pip wheel --no-deps ./python</code> (it compiles Arrow, so the

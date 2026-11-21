@@ -55,11 +55,12 @@ sdist.include = ["../"]
 metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
 
 # Arrow's deep object paths under the CI checkout overrun MSVC's 260-character
-# path limit; build close to the drive root there.
+# path limit; build at the root of the checkout's drive there (same drive, so
+# ccache can still rewrite source paths relative to the build directory).
 [[tool.scikit-build.overrides]]
 if.platform-system = "^win32"
 if.env.CIBUILDWHEEL = true
-build-dir = "C:/ibx/{wheel_tag}"
+build-dir = "/ibx/{wheel_tag}"
 
 [tool.scikit-build.cmake.define]
 IBEX_MINIMAL_RUNTIME = "ON"

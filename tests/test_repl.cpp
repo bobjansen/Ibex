@@ -36,6 +36,7 @@
 #include <io.h>
 #include <process.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 #include <utility>
@@ -2412,6 +2413,19 @@ auto file_descriptor(std::FILE* stream) -> int {
 #endif
 }
 
+/// What file descriptor 1 refers to. On Windows this is the OS handle value
+/// itself: hosts such as IPython's prompt_toolkit cache it, so capture must
+/// leave that exact value in place, not merely an equivalent duplicate.
+auto stdout_identity() -> std::pair<std::int64_t, std::int64_t> {
+#ifdef _WIN32
+    return {static_cast<std::int64_t>(_get_osfhandle(1)), 0};
+#else
+    struct stat info{};
+    REQUIRE(fstat(1, &info) == 0);
+    return {static_cast<std::int64_t>(info.st_dev), static_cast<std::int64_t>(info.st_ino)};
+#endif
+}
+
 /// Runs `source` with planner reporting on; returns what the REPL wrote to stderr.
 /// The `planner:` line there is what bench_ibex.py reads to record which engine
 /// path each query measured, so its shape is a contract, not just a log line.
@@ -3967,4 +3981,39 @@ TEST_CASE("ReplSession: infer_schema lowers against the session's bindings", "[r
     CHECK(schema->fields()[1].name == "w");
     CHECK(schema->fields()[1].type == ibex::ir::ColumnType::Float64);
     CHECK_FALSE(session.infer_schema("t[filter missing > 1]", {}).has_value());
+}
+
+TEST_CASE("ReplSession::execute captures output without redirecting fd 1", "[repl][session]") {
+    const auto before = stdout_identity();
+    bool unchanged_during_execution = false;
+    ibex::runtime::ExternRegistry registry;
+    registry.register_scalar(
+        "stdout_probe", ibex::runtime::ScalarKind::Int,
+        [&](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            unchanged_during_execution = stdout_identity() == before;
+            return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{std::int64_t{1}}};
+        });
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+
+    const auto result = session.execute(
+        "extern fn stdout_probe() -> Int from \"probe.hpp\";\n"
+        "print(\"before-table\");\n"
+        "print(Table { x = [7, 8] });\n"
+        "print(\"after-table\");\n"
+        "stdout_probe();");
+
+    INFO(result.error);
+    INFO(result.output);
+    REQUIRE(result.ok);
+    CHECK(unchanged_during_execution);
+    CHECK(stdout_identity() == before);
+    const auto first = result.output.find("before-table");
+    const auto table = result.output.find('7');
+    const auto last = result.output.find("after-table");
+    REQUIRE(first != std::string::npos);
+    REQUIRE(table != std::string::npos);
+    REQUIRE(last != std::string::npos);
+    CHECK(first < table);
+    CHECK(table < last);
 }

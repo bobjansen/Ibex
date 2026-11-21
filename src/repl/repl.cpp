@@ -76,14 +76,8 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
-// NOLINTNEXTLINE(modernize-deprecated-headers) // Required for fdopen and fileno.
-#include <stdio.h>
 // NOLINTNEXTLINE(modernize-deprecated-headers, misc-include-cleaner) // Required for strdup.
 #include <string.h>
-#include <unistd.h>
-#endif
-#ifdef __linux__
-#include <sys/mman.h>
 #endif
 #include <filesystem>
 #include <fstream>
@@ -92,6 +86,7 @@
 #include <optional>
 #include <robin_hood.h>
 #include <set>
+#include <streambuf>
 #include <string>
 #include <system_error>
 #include <variant>
@@ -7563,55 +7558,44 @@ namespace {
 // The mature statement evaluator reports diagnostics to stdout because it was
 // written for the terminal REPL. Keep that behavior intact, but capture it at
 // the programmatic boundary until diagnostics have a native structured sink.
-// This process-wide redirect is serialized and is only used by the local UI
-// server; ordinary REPL and batch execution never take this path.
+// This process-wide capture is serialized and is only used by embedders (the UI
+// server, the Python module); ordinary REPL and batch execution never take it.
 auto execution_capture_mutex() -> std::mutex& {
     static std::mutex mutex;
     return mutex;
 }
 
-// Backing store for the stdout redirect. `std::tmpfile()` opens under /tmp,
-// which the local UI server's Landlock sandbox forbids — there, a NULL file
-// silently disables capture and the interpreter's diagnostics leak to the
-// server's own stdout. On Linux, back the capture with an anonymous
-// `memfd_create` fd instead: it needs no filesystem path, so the sandbox
-// leaves it alone. Other platforms keep `tmpfile()`.
-auto open_capture_file() -> FILE* {
-#ifdef __linux__
-    // Linux memfd_create(2): anonymous in-memory file, closed on exec. Returns
-    // int on every libc that provides it (it is Linux-only).
-    const int fd = memfd_create("ibex-stdout-capture", MFD_CLOEXEC);
-    if (fd >= 0) {
-        if (FILE* file = fdopen(fd, "w+")) {
-            return file;
-        }
-        close(fd);
-    }
-#endif
-    return std::tmpfile();
-}
+// Feeds `std::cout` writes into the same sink as `ibex::formatting::print`,
+// so captured output keeps the order the evaluator wrote it in.
+class SinkStreambuf final : public std::streambuf {
+   public:
+    explicit SinkStreambuf(ibex::formatting::StdoutSink& sink) : sink_(&sink) {}
 
+   protected:
+    auto overflow(int_type ch) -> int_type override {
+        if (!traits_type::eq_int_type(ch, traits_type::eof())) {
+            const char c = traits_type::to_char_type(ch);
+            sink_->append(std::string_view(&c, 1));
+        }
+        return traits_type::not_eof(ch);
+    }
+    auto xsputn(const char* data, std::streamsize count) -> std::streamsize override {
+        sink_->append(std::string_view(data, static_cast<std::size_t>(count)));
+        return count;
+    }
+
+   private:
+    ibex::formatting::StdoutSink* sink_;
+};
+
+// Captures the evaluator's stdout at the stream level (see StdoutSink for why
+// file descriptor 1 is never redirected).
 class StdoutCapture {
    public:
-    // C FILE ownership is acquired from open_capture_file() and released with fclose().
-    StdoutCapture() : file_(open_capture_file()) {
-        static_cast<void>(std::fflush(stdout));
-        std::cout.flush();
-        if (file_ == nullptr) {
-            return;
-        }
-#ifdef _WIN32
-        original_fd_ = _dup(_fileno(stdout));
-        if (original_fd_ >= 0 && _dup2(_fileno(file_), _fileno(stdout)) == 0) {
-            active_ = true;
-        }
-#else
-        original_fd_ = dup(fileno(stdout));
-        if (original_fd_ >= 0 && dup2(fileno(file_), fileno(stdout)) >= 0) {
-            active_ = true;
-        }
-#endif
-    }
+    StdoutCapture()
+        : buffer_(sink_),
+          previous_buffer_(redirect_cout(&buffer_)),
+          previous_sink_(ibex::formatting::install_stdout_sink(&sink_)) {}
 
     ~StdoutCapture() { restore(); }
 
@@ -7621,49 +7605,34 @@ class StdoutCapture {
     auto operator=(StdoutCapture&&) -> StdoutCapture& = delete;
 
     [[nodiscard]] auto take() -> std::string {
-        restore(false);
-        if (file_ == nullptr) {
-            return {};
-        }
-        if (std::fseek(file_, 0, SEEK_SET) != 0) {
-            static_cast<void>(std::fclose(file_));
-            file_ = nullptr;
-            return {};
-        }
-        std::string output;
-        std::array<char, 4096> buffer{};
-        while (const auto count = std::fread(buffer.data(), 1, buffer.size(), file_)) {
-            output.append(buffer.data(), count);
-        }
-        static_cast<void>(std::fclose(file_));
-        file_ = nullptr;
-        return output;
+        restore();
+        return sink_.take();
     }
 
    private:
-    void restore(bool close_file = true) {
-        if (active_) {
-            static_cast<void>(std::fflush(stdout));
-            std::cout.flush();
-#ifdef _WIN32
-            static_cast<void>(_dup2(original_fd_, _fileno(stdout)));
-            static_cast<void>(_close(original_fd_));
-#else
-            static_cast<void>(dup2(original_fd_, fileno(stdout)));
-            static_cast<void>(close(original_fd_));
-#endif
-            original_fd_ = -1;
-            active_ = false;
-        }
-        if (close_file && file_ != nullptr) {
-            static_cast<void>(std::fclose(file_));
-            file_ = nullptr;
-        }
+    // Flushes what was written before the capture so it reaches the terminal,
+    // then points std::cout at `buffer`.
+    static auto redirect_cout(std::streambuf* buffer) -> std::streambuf* {
+        static_cast<void>(std::fflush(stdout));
+        std::cout.flush();
+        return std::cout.rdbuf(buffer);
     }
 
-    FILE* file_ = nullptr;
-    int original_fd_ = -1;
-    bool active_ = false;
+    void restore() {
+        if (!active_) {
+            return;
+        }
+        std::cout.flush();
+        static_cast<void>(ibex::formatting::install_stdout_sink(previous_sink_));
+        std::cout.rdbuf(previous_buffer_);
+        active_ = false;
+    }
+
+    ibex::formatting::StdoutSink sink_;
+    SinkStreambuf buffer_;
+    std::streambuf* previous_buffer_ = nullptr;
+    ibex::formatting::StdoutSink* previous_sink_ = nullptr;
+    bool active_ = true;
 };
 
 auto error_from_output(std::string output) -> std::string {

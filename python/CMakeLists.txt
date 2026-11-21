@@ -75,6 +75,83 @@ install(TARGETS ibex_pyarrow
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
 )
 
+# ── Wheel layout: the `python` install component ─────────────────────────────
+# scikit-build-core (python/pyproject.toml) installs only this component into
+# the wheel root, beside the pure-Python `ibex` and `ibex_polars` packages:
+#
+#   ibex_pyarrow.<soabi>.so
+#   ibex_pyarrow.libs/       Arrow/Parquet shared libraries, by SONAME
+#
+# The extension finds them through its RPATH and the Arrow libraries find one
+# another via ARROW_RPATH_ORIGIN (libs/parquet). Windows has no RPATH, so the
+# DLLs go beside the extension, where the loader searches.
+if(WIN32)
+    set(_ibex_wheel_libdir ".")
+else()
+    set(_ibex_wheel_libdir "ibex_pyarrow.libs")
+    if(APPLE)
+        set(_ibex_wheel_rpath "@loader_path/${_ibex_wheel_libdir}")
+    else()
+        set(_ibex_wheel_rpath "$ORIGIN/${_ibex_wheel_libdir}")
+    endif()
+    set_target_properties(ibex_pyarrow PROPERTIES INSTALL_RPATH "${_ibex_wheel_rpath}")
+    unset(_ibex_wheel_rpath)
+endif()
+install(TARGETS ibex_pyarrow
+    LIBRARY DESTINATION "." COMPONENT python EXCLUDE_FROM_ALL
+    RUNTIME DESTINATION "." COMPONENT python EXCLUDE_FROM_ALL
+)
+if(TARGET Ibex::parquet)
+    foreach(_ibex_arrow_target arrow_shared parquet_shared arrow_ipc_shared)
+        if(NOT TARGET ${_ibex_arrow_target})
+            continue()
+        endif()
+        get_target_property(_ibex_arrow_type ${_ibex_arrow_target} TYPE)
+        if(NOT _ibex_arrow_type STREQUAL "SHARED_LIBRARY")
+            continue()
+        endif()
+        if(WIN32)
+            install(TARGETS ${_ibex_arrow_target}
+                RUNTIME DESTINATION "${_ibex_wheel_libdir}" COMPONENT python EXCLUDE_FROM_ALL
+            )
+        else()
+            install(TARGETS ${_ibex_arrow_target}
+                LIBRARY DESTINATION "${_ibex_wheel_libdir}" COMPONENT python
+                    NAMELINK_SKIP EXCLUDE_FROM_ALL
+            )
+            # A wheel cannot hold symlinks, so the SONAME link would ship as a
+            # second copy of the library. Keep one file, under the SONAME the
+            # loader looks up (libarrow.so.2200).
+            install(CODE "
+                set(_dir \"\${CMAKE_INSTALL_PREFIX}/${_ibex_wheel_libdir}\")
+                set(_real \"\${_dir}/$<TARGET_FILE_NAME:${_ibex_arrow_target}>\")
+                set(_soname \"\${_dir}/$<TARGET_SONAME_FILE_NAME:${_ibex_arrow_target}>\")
+                if(NOT _real STREQUAL _soname)
+                    file(REMOVE \"\${_soname}\")
+                    file(RENAME \"\${_real}\" \"\${_soname}\")
+                endif()
+                " COMPONENT python EXCLUDE_FROM_ALL)
+        endif()
+    endforeach()
+    unset(_ibex_arrow_target)
+    unset(_ibex_arrow_type)
+endif()
+# Python ships vcruntime140*.dll but not the C++ library (msvcp140.dll).
+if(MSVC)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION "${_ibex_wheel_libdir}")
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT python)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP ON)
+    include(InstallRequiredSystemLibraries)
+    foreach(_ibex_msvc_dll IN LISTS CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+        if(_ibex_msvc_dll MATCHES "msvcp140[^/\\]*\\.dll$")
+            install(PROGRAMS "${_ibex_msvc_dll}" DESTINATION "${_ibex_wheel_libdir}"
+                COMPONENT python EXCLUDE_FROM_ALL)
+        endif()
+    endforeach()
+    unset(_ibex_msvc_dll)
+endif()
+unset(_ibex_wheel_libdir)
+
 if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_pyarrow PRIVATE Ibex::Sanitizers)
 endif()

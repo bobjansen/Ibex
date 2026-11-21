@@ -596,8 +596,9 @@ result = query.collect(engine=engine)
 ```
 
 Reuse the Engine and query to retain prepared resident inputs; every collection
-executes again. Unsupported plans fail explicitly. This source-tree experiment
-pins Polars 2.0.0 and its private plan visitor. See
+executes again. Unsupported plans fail explicitly. The experiment pins
+Polars 2.0.0 and its private plan visitor. Each release attaches
+`ibex-polars` wheels (Linux x86_64, macOS Apple silicon, Windows x86_64). See
 [scope and setup](python/ibex_polars/README.md) and
 [resident-table measurements](python/performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl).
 The [PDS-H comparison](python/performance.md#pds-h-through-ibexengine-scale-10) runs all 22 unchanged

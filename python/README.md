@@ -24,8 +24,9 @@ PYTHONPATH=build-release/python:python .venv/bin/python python/test_ibex_lazy.py
 
 If CMake has cached headers from a different interpreter, also set
 `Python3_INCLUDE_DIR` to the selected interpreter's include directory.
-This is a source-tree prototype; standalone wheels and distribution naming
-are follow-up work.
+For an installable package instead of a source tree, build the `ibex-polars`
+wheel (`pip wheel --no-deps ./python`); it contains `ibex`, `ibex_polars` and
+the extension. See [the engine README](ibex_polars/README.md#install).
 
 Python has to find both `build-release/python` (the extension) and `python/`
 (the packages) from whatever directory it runs in. Register them with the

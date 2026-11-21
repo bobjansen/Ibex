@@ -234,6 +234,10 @@ elseif(NOT IBEX_MINIMAL_RUNTIME)
     if(IBEX_BUILD_KAFKA)
         add_subdirectory(libs/kafka)
     endif()
+elseif(IBEX_BUILD_PYTHON_BRIDGE AND IBEX_BUILD_PARQUET)
+    # The Python wheel (python/pyproject.toml) builds the minimal runtime, but
+    # the bridge's scan_parquet still needs the Parquet backend (Ibex::parquet).
+    add_subdirectory(libs/parquet)
 endif()
 
 if(IBEX_WASM)

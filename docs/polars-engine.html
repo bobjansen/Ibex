@@ -50,18 +50,33 @@
     <p>
       The engine runs every query of the
       <a href="https://github.com/pola-rs/polars-benchmark" target="_blank" rel="noopener">PDS-H benchmark</a>
-      unchanged, with results that match Polars in full. It is still a
-      source-tree prototype: there is no wheel yet, and the adapter is pinned
-      to <strong>Polars 2.0.0</strong>, because it reads Polars' internal plan
-      format, which can change between releases.
+      unchanged, with results that match Polars in full. It is still
+      experimental, and the adapter is pinned to <strong>Polars 2.0.0</strong>,
+      because it reads Polars' internal plan format, which can change between
+      releases.
     </p>
   </section>
 
   <section class="section" id="install">
     <p class="section-label">Install</p>
-    <h2>Build the native bridge</h2>
+    <h2>Install the wheel</h2>
     <p>
-      You need Clang 20, CMake 3.31+, Ninja, and a Python with development
+      Each <a href="https://github.com/bobjansen/Ibex/releases" target="_blank" rel="noopener">release</a>
+      attaches <code>ibex-polars</code> wheels for Python 3.11&ndash;3.14 on
+      Linux x86_64 (glibc 2.28+), macOS Apple silicon (15+) and Windows x86_64.
+      They bundle the
+      native bridge and its Arrow libraries, and pull in
+      <code>polars==2.0.0</code>, <code>pyarrow</code> and <code>numpy</code>:
+    </p>
+<pre><code>pip install ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/&lt;tag&gt;</code></pre>
+    <p>
+      To build the same wheel from a checkout, run
+      <code>pip wheel --no-deps ./python</code> (it compiles Arrow, so the
+      first build is slow).
+    </p>
+    <h2>Or build the native bridge</h2>
+    <p>
+      For development, you need Clang 20, CMake 3.31+, Ninja, and a Python with development
       headers, <code>pyarrow</code> and <code>polars==2.0.0</code> installed.
       Build Ibex with the Python bridge and Parquet support, pointing CMake at
       that Python:

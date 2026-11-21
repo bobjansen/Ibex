@@ -12,20 +12,27 @@ query = trades.lazy().group_by("symbol", "day").agg(avg_price=pl.mean("price"))
 result = query.collect(engine=engine)
 ```
 
-The source-tree prototype uses the same native extension as the independent
-API; follow the [build instructions](../README.md). Install `polars==2.0.0`.
-There is no standalone wheel yet. Register both directories with the venv
-once:
+## Install
+
+Wheels for Python 3.11–3.14 on Linux x86_64 (glibc 2.28+), macOS Apple
+silicon (15+) and Windows x86_64 are attached to each [GitHub release](https://github.com/bobjansen/Ibex/releases):
 
 ```bash
-.venv/bin/python -c 'import pathlib, site; root = pathlib.Path.cwd(); pathlib.Path(site.getsitepackages()[0], "ibex.pth").write_text(f"{root}/build-release/python\n{root}/python\n")'
+pip install ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/<tag>
 ```
 
-Run it from the repository root. The venv's Python then imports `ibex_polars`
-and `ibex_pyarrow` from any directory. Alternatively, set
-`PYTHONPATH="$PWD/build-release/python:$PWD/python"` from the repository root
-in every shell; the relative form `build-release/python:python` only works
-while the current directory is the repository root.
+The wheel bundles the native bridge and its Arrow/Parquet libraries and pulls
+in `polars==2.0.0`, `pyarrow` and `numpy`. To build one from a checkout
+(compiles Arrow, so the first build takes a while):
+
+```bash
+pip wheel --no-deps ./python -w dist    # or: uv build --wheel python
+```
+
+For development against a source build instead, see the
+[build instructions](https://github.com/bobjansen/Ibex/blob/main/python/README.md).
+
+## Semantics
 
 Imports and upstream q01/q06 query bodies remain unchanged; select
 the Engine at collection. `pl.Config.set_engine_affinity(engine)` can select

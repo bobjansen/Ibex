@@ -1,0 +1,59 @@
+name: Python wheels
+
+# Builds the `ibex-polars` wheels (python/pyproject.toml) with cibuildwheel and
+# runs python/test_wheel_smoke.py against each installed wheel on a clean
+# interpreter. release.yml calls this and attaches the wheels to the release;
+# run it by hand to get wheels for an untagged commit.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (default: the selected branch)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+          - os: macos-15
+            platform: macos-arm64
+          - os: windows-latest
+            platform: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # setuptools-scm derives the wheel version from the latest tag.
+          fetch-depth: 0
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.2.1
+        with:
+          package-dir: python
+          output-dir: wheelhouse
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error

@@ -384,6 +384,13 @@ if(WIN32 AND TARGET parquet_shared)
     # so the two can never collide.
     set_target_properties(parquet_shared PROPERTIES OUTPUT_NAME arrow_parquet)
 endif()
+if(WIN32 AND TARGET arrow_shared)
+    # The Windows loader reuses an already-loaded DLL of the same base name.
+    # In Python, pyarrow (another Arrow release) always loads its arrow.dll
+    # before ibex_pyarrow, which would then bind to pyarrow's copy. A distinct
+    # name keeps the two Arrows apart.
+    set_target_properties(arrow_shared PROPERTIES OUTPUT_NAME ibex_arrow)
+endif()
 
 add_library(ibex_parquet STATIC backend.cpp)
 add_library(Ibex::parquet ALIAS ibex_parquet)

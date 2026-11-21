@@ -237,12 +237,8 @@ inline void append_column_values(ColumnValue& dst_value, const ColumnValue& src_
                 // One block of bytes, and the offsets shifted by a constant.
                 dst.append(src);
             } else if constexpr (std::is_same_v<Col, Column<bool>>) {
-                // Packed many rows per word, so not a flat copy. No exact
-                // reserve first: that is the quadratic trap described above,
-                // and push_back already grows geometrically.
-                for (std::size_t r = 0; r < src.size(); ++r) {
-                    dst.push_back(src[r]);
-                }
+                // Packed many rows per word, so shifted a word at a time.
+                dst.append(src);
             } else if constexpr (std::is_same_v<Col, Column<std::int64_t>>) {
                 dst.append_integer_values(src);
             } else {

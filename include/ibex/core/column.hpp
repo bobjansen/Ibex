@@ -2063,6 +2063,57 @@ class Column<bool> {
         words_.reserve(words_for_bits(n));
     }
 
+    /// Append every value of `src`, 64 at a time. A per-row `push_back` (which
+    /// also re-tests for external storage per row) made gluing 41 chunks of a
+    /// 10M-row Bool column back together ~80 ms on one thread.
+    void append(const Column& src) {
+        if (&src == this) {
+            append(Column(src));
+            return;
+        }
+        const size_type n = src.size();
+        if (n == 0) {
+            return;
+        }
+        detach_external();
+        const size_type start = size_bits_;
+        // Growth stays geometric (see append_column_values): resize only
+        // forwards to the vector, and the new words start out zero, as does
+        // the old last word's tail (clear_unused_tail_bits).
+        words_.resize(words_for_bits(start + n), 0);
+        const std::uint8_t* const bytes = src.buffer_data();
+        const size_type first_bit = src.buffer_offset();
+        const size_type end_byte = (first_bit + n + 7) / 8;
+        for (size_type done = 0; done < n; done += kBitsPerWord) {
+            const size_type count = std::min<size_type>(kBitsPerWord, n - done);
+            // Source bits [bit, bit + count), from at most 9 bytes, none past
+            // the source's last byte.
+            const size_type bit = first_bit + done;
+            const size_type byte = bit / 8;
+            const size_type shift = bit % 8;
+            word_type low = 0;
+            std::uint8_t high = 0;
+            for (size_type k = 0; k < 8 && byte + k < end_byte; ++k) {
+                low |= static_cast<word_type>(bytes[byte + k]) << (8 * k);
+            }
+            if (shift != 0 && byte + 8 < end_byte) {
+                high = bytes[byte + 8];
+            }
+            word_type value = shift == 0 ? low
+                                         : (low >> shift) | (static_cast<word_type>(high)
+                                                             << (kBitsPerWord - shift));
+            value &= low_bits_mask(count);
+            const size_type dst_bit = start + done;
+            const size_type word = word_index(dst_bit);
+            const size_type offset = bit_offset(dst_bit);
+            words_[word] |= value << offset;
+            if (offset != 0 && count > kBitsPerWord - offset) {
+                words_[word + 1] |= value >> (kBitsPerWord - offset);
+            }
+        }
+        size_bits_ = start + n;
+    }
+
     // zero-initialises (false) for resize-based fill in lag/lead paths
     void resize(size_type n) { resize(n, false); }
     void resize(size_type n, bool value) {

@@ -4,11 +4,13 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -164,6 +166,92 @@ TEST_CASE("Column<bool> supports mutation and resize", "[core][column][bool]") {
     REQUIRE(col.word_count() == 2);
     REQUIRE(col[0] == false);
     REQUIRE(col[69] == false);
+}
+
+TEST_CASE("Column<bool> append shifts whole words across every alignment", "[core][column][bool]") {
+    // Destinations and sources whose lengths straddle word boundaries, sources
+    // owned or external at a bit offset (an Arrow slice), each checked against
+    // a plain vector of the same values. An external source's bytes are sized
+    // exactly, so a read past its last byte would leave the buffer.
+    const auto value_at = [](std::size_t seed, std::size_t i) {
+        return ((i * 2654435761U) ^ (seed * 40503U)) % 3 == 0;
+    };
+    for (const std::size_t dst_size :
+         std::initializer_list<std::size_t>{0, 1, 7, 63, 64, 65, 130}) {
+        for (const std::size_t src_size :
+             std::initializer_list<std::size_t>{0, 1, 8, 63, 64, 65, 200}) {
+            for (const std::size_t offset : std::initializer_list<std::size_t>{0, 1, 5, 7, 8, 13}) {
+                for (const bool external_src : {false, true}) {
+                    for (const bool external_dst : {false, true}) {
+                        INFO("dst " << dst_size << " src " << src_size << " offset " << offset
+                                    << " external src " << external_src << " external dst "
+                                    << external_dst);
+                        std::vector<bool> want;
+                        ibex::Column<bool> owned_dst;
+                        for (std::size_t i = 0; i < dst_size; ++i) {
+                            owned_dst.push_back(value_at(1, i));
+                            want.push_back(value_at(1, i));
+                        }
+                        ibex::Column<bool> dst;
+                        if (external_dst) {
+                            const auto bytes = std::make_shared<std::vector<std::uint8_t>>(
+                                ((dst_size + 7) / 8) + 1, 0);
+                            for (std::size_t i = 0; i < dst_size; ++i) {
+                                if (value_at(1, i)) {
+                                    (*bytes)[i / 8] |= static_cast<std::uint8_t>(1U << (i % 8));
+                                }
+                            }
+                            dst = ibex::Column<bool>::from_external(bytes, bytes->data(), 0,
+                                                                    dst_size);
+                        } else {
+                            dst = owned_dst;
+                        }
+                        ibex::Column<bool> src;
+                        if (external_src) {
+                            const auto bytes = std::make_shared<std::vector<std::uint8_t>>(
+                                (offset + src_size + 7) / 8, 0xA5);
+                            for (std::size_t i = 0; i < src_size; ++i) {
+                                const std::size_t bit = offset + i;
+                                const auto mask = static_cast<std::uint8_t>(1U << (bit % 8));
+                                (*bytes)[bit / 8] = static_cast<std::uint8_t>(
+                                    value_at(2, i) ? ((*bytes)[bit / 8] | mask)
+                                                   : ((*bytes)[bit / 8] & ~mask));
+                            }
+                            src = ibex::Column<bool>::from_external(bytes, bytes->data(), offset,
+                                                                    src_size);
+                        } else {
+                            for (std::size_t i = 0; i < src_size; ++i) {
+                                src.push_back(value_at(2, i));
+                            }
+                        }
+                        for (std::size_t i = 0; i < src_size; ++i) {
+                            want.push_back(value_at(2, i));
+                        }
+                        dst.append(src);
+                        REQUIRE(dst.size() == want.size());
+                        for (std::size_t i = 0; i < want.size(); ++i) {
+                            REQUIRE(dst[i] == want[i]);
+                        }
+                        // Bits past the end stay clear, so later pushes land.
+                        if (const std::size_t rem = want.size() % 64; rem != 0) {
+                            const auto last = dst.words_data()[dst.word_count() - 1];
+                            REQUIRE((last >> rem) == 0U);
+                        }
+                        dst.push_back(true);
+                        dst.push_back(false);
+                        REQUIRE(dst[want.size()]);
+                        REQUIRE_FALSE(dst[want.size() + 1]);
+                    }
+                }
+            }
+        }
+    }
+    ibex::Column<bool> self{true, false, true};
+    self.append(self);
+    REQUIRE(self.size() == 6);
+    REQUIRE(self[3]);
+    REQUIRE_FALSE(self[4]);
+    REQUIRE(self[5]);
 }
 
 // --- Column<std::string> flat-buffer specialization -------------------------

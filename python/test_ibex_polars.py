@@ -1129,6 +1129,48 @@ class EngineTests(unittest.TestCase):
         string_schema = pl.Schema({"g": pl.String, "x": pl.Float64})
         self.assertEqual(_to_polars(table, string_schema, output).schema, string_schema)
 
+    def test_string_output_gathers_from_the_arrow_dictionary(self):
+        # Ibex exports a repetitive String column dictionary-encoded. The
+        # boundary gathers the labels by code instead of decoding every row:
+        # sliced chunks, nulls, a dictionary per chunk, narrow codes and
+        # large_string labels must all come back as the plain strings.
+        output = {"g": pa.large_string(), "x": pa.float64()}
+        expected = pl.Schema({"g": pl.String, "x": pl.Float64})
+        for codes, labels in ((pa.int32(), pa.string()), (pa.int8(), pa.large_string())):
+            chunks = [pa.DictionaryArray.from_arrays(pa.array([0, 2, None, 1], type=codes),
+                                                    pa.array(["z", "a", "b"], type=labels)).slice(1),
+                      pa.DictionaryArray.from_arrays(pa.array([1, None, 0], type=codes),
+                                                    pa.array(["b", "z", "a"], type=labels))]
+            table = pa.table({"g": pa.chunked_array(chunks), "x": [1., 2., 3., 4., 5., 6.]})
+            with patch.object(pl, "from_arrow", wraps=pl.from_arrow) as convert:
+                result = _to_polars(table, expected, output)
+                # Only labels and codes cross into Polars, never a decoded column.
+                self.assertFalse(any((pa.types.is_string(call.args[0].type)
+                                      or pa.types.is_large_string(call.args[0].type))
+                                     and len(call.args[0]) > 3
+                                     for call in convert.call_args_list if hasattr(call.args[0], "type")))
+            self.assertEqual(result.schema, expected)
+            self.assertEqual(result["g"].to_list(), ["b", None, "a", "z", None, "b"])
+            self.assertEqual(result["x"].to_list(), table["x"].to_pylist())
+        empty = _to_polars(table.slice(0, 0), expected, output)
+        self.assertEqual(empty.schema, expected)
+        self.assertEqual(empty.height, 0)
+        no_chunks = pa.table({"g": pa.chunked_array([], type=pa.dictionary(pa.int32(), pa.string())),
+                              "x": pa.chunked_array([], type=pa.float64())})
+        self.assertEqual(_to_polars(no_chunks, expected, output).schema, expected)
+
+    def test_wide_string_result_through_the_engine(self):
+        # The demo's boundary-heavy shape: a filter keeping most rows of a
+        # repetitive, nullable String column next to computed columns.
+        rows = 200_000
+        frame = pl.DataFrame({
+            "s": pl.Series([None if i % 97 == 0 else f"SYM{i % 500:04d}" for i in range(rows)]),
+            "q": pl.Series([i % 1000 for i in range(rows)], dtype=pl.Int64),
+            "p": pl.Series([float(i % 77) for i in range(rows)]),
+        }).lazy()
+        self.equal(frame.with_columns(n=pl.col("p") * pl.col("q"), cheap=pl.col("p") < 30)
+                   .filter(pl.col("q") > 10))
+
     def test_categorical_output_empty_chunks_and_null_dictionary(self):
         dtype = pl.Categorical(pl.Categories("ibex_null_dictionary"))
         expected = pl.Schema({"g": dtype})

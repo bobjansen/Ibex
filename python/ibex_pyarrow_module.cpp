@@ -8,6 +8,7 @@
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/repl/plugin_loader.hpp>
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -22,7 +23,6 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
-#include <dlfcn.h>
 #include <exception>
 #include <expected>
 #include <filesystem>
@@ -299,58 +299,10 @@ void session_capsule_destructor(PyObject* capsule) {
     delete session;
 }
 
-enum class PluginLoadStatus : std::uint8_t { Loaded, NotFound, LoadError };
-
-struct PluginLoadResult {
-    PluginLoadStatus status;
-    std::string message;
-};
-
-auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
-                     robin_hood::unordered_set<std::string>& loaded_plugins,
-                     ibex::runtime::ExternRegistry& externs) -> PluginLoadResult {
-    if (loaded_plugins.contains(stem) || externs.contains_library(stem)) {
-        loaded_plugins.insert(stem);
-        return {PluginLoadStatus::Loaded, ""};
-    }
-
-    const std::string filename = stem + ".so";
-    std::string last_error;
-    std::string last_candidate;
-    for (const auto& dir : search_paths) {
-        auto full_path = std::filesystem::path(dir) / filename;
-        void* handle = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (handle == nullptr) {
-            if (std::filesystem::exists(full_path)) {
-                if (const char* err = dlerror()) {
-                    last_error = err;
-                }
-                last_candidate = full_path.string();
-            }
-            continue;
-        }
-
-        using RegisterFn = void (*)(ibex::runtime::ExternRegistry*);
-        auto* fn = reinterpret_cast<RegisterFn>(dlsym(handle, "ibex_register"));
-        if (fn == nullptr) {
-            dlclose(handle);
-            last_candidate = full_path.string();
-            last_error = "missing ibex_register symbol";
-            continue;
-        }
-
-        fn(&externs);
-        loaded_plugins.insert(stem);
-        return {PluginLoadStatus::Loaded, ""};
-    }
-
-    if (!last_candidate.empty()) {
-        return {PluginLoadStatus::LoadError,
-                "failed to load '" + last_candidate +
-                    "': " + (last_error.empty() ? "unknown error" : last_error)};
-    }
-    return {PluginLoadStatus::NotFound, ""};
-}
+// One loader for the REPL and the bridge: it knows each platform's plugin
+// suffix and loader (dlopen, LoadLibrary).
+using ibex::repl::PluginLoadStatus;
+using ibex::repl::try_load_plugin;
 
 auto load_source_plugins(const ibex::parser::Program& program,
                          const std::vector<std::string>& plugin_search_paths,

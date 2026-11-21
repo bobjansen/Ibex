@@ -33,6 +33,7 @@
 #include <ibex/parser/parser.hpp>
 #include <ibex/parser/resource_functions.hpp>
 #include <ibex/parser/scalar_bindings.hpp>
+#include <ibex/repl/plugin_loader.hpp>
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -4131,15 +4132,10 @@ auto plugin_stem(const std::string& source_path) -> std::string {
     return p.stem().string();
 }
 
-/// Try to load a plugin shared library for the given stem from the search paths.
-/// Returns true if the plugin was loaded (or was already loaded), false on failure.
-enum class PluginLoadStatus : std::uint8_t { Loaded, NotFound, LoadError };
+}  // namespace
 
-struct PluginLoadResult {
-    PluginLoadStatus status;
-    std::string message;
-};
-
+// Declared in <ibex/repl/plugin_loader.hpp>: the Python bridge loads plugins
+// through it too.
 auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
                      robin_hood::unordered_set<std::string>& loaded_plugins,
                      runtime::ExternRegistry& externs) -> PluginLoadResult {
@@ -4221,6 +4217,8 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
     }
     return {.status = PluginLoadStatus::NotFound, .message = ""};
 }
+
+namespace {
 
 /// Locate <name>.ibex in the plugin search paths and return its contents.
 /// Returns std::nullopt when the file is not found in any search path.

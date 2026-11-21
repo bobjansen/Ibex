@@ -167,6 +167,13 @@ result = query.<span class="fn-name">collect</span>(engine=engine)   <span class
 <pre><code>pl.Config.<span class="fn-name">set_engine_affinity</span>(engine)
 result = query.<span class="fn-name">collect</span>()          <span class="cm"># runs on Ibex</span>
 pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"auto"</span>)  <span class="cm"># back to Polars</span></code></pre>
+    <p>
+      To write the result to a file instead, sink it through the engine. The
+      query runs in Ibex and Polars' own Parquet writer writes the result, so
+      the file is the one Polars would write and every
+      <code>sink_parquet</code> option works unchanged:
+    </p>
+<pre><code>query.<span class="fn-name">sink_parquet</span>(<span class="str">"out.parquet"</span>, engine=engine)</code></pre>
   </section>
 
   <section class="section" id="prepare">
@@ -245,7 +252,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
           <li>Window expressions (<code>over</code>), computed group or sort keys, Python UDFs.</li>
           <li>As-of and general non-equi joins, nondefault join validation.</li>
           <li>General regular expressions; multiple or remote files; struct and list columns.</li>
-          <li>Background, async and sink execution.</li>
+          <li>Background and async execution, lazy sinks (<code>lazy=True</code>), and sinks other than <code>sink_parquet</code>.</li>
         </ul>
       </article>
     </div>

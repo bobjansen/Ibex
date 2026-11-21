@@ -12,6 +12,19 @@ query = trades.lazy().group_by("symbol", "day").agg(avg_price=pl.mean("price"))
 result = query.collect(engine=engine)
 ```
 
+To write the result straight to a file, sink it through the engine:
+
+```python
+pl.scan_parquet("trades.parquet").filter(pl.col("qty") > 10).sink_parquet(
+    "out.parquet", engine=engine)
+```
+
+The query runs in Ibex and Polars' own Parquet writer writes the result, so the
+file is the one Polars would write and every `sink_parquet` option (compression,
+statistics, row groups, `PartitionBy`, cloud storage, file objects) works
+unchanged. A lazy sink (`sink_parquet(..., lazy=True)`, collected later) is not
+supported.
+
 ## Install
 
 Prebuilt wheels cover Python 3.11–3.14 on Linux x86_64 (glibc 2.28+) and
@@ -167,7 +180,7 @@ coercion to Float64 and null predicates are supported. Windows, UDFs,
 computed grouping/sort keys, aggregate broadcasting in projections/updates other than row counts, expression top-k
 operations, general inequality joins, other filtered aggregates, remote/multiple files, Enum, other numeric widths and nondefault scan
 policies are outside this slice. An already-sliced resident source is valid.
-Background, batch, async and sink execution are not implemented.
+Background, batch and async execution, lazy sinks, and sinks other than `sink_parquet` are not implemented.
 Struct and list columns are intentionally outside the project scope.
 
 As a temporary PDS compatibility rule, regex-mode `str.contains` accepts literal

@@ -4,6 +4,7 @@
 
 from datetime import date, datetime, timedelta
 import gc
+import io
 import math
 import os
 from pathlib import Path
@@ -1170,6 +1171,77 @@ class EngineTests(unittest.TestCase):
         }).lazy()
         self.equal(frame.with_columns(n=pl.col("p") * pl.col("q"), cheap=pl.col("p") < 30)
                    .filter(pl.col("q") > 10))
+
+    @staticmethod
+    def _sink_frame(rows=50_000):
+        # The types the result boundary converts: narrow ints, Categorical and
+        # a repetitive nullable String.
+        return pl.DataFrame({
+            "id": pl.Series(range(rows), dtype=pl.Int64),
+            "day": pl.Series([i % 250 for i in range(rows)], dtype=pl.Int32),
+            "venue": pl.Series([("XNAS", "XNYS", "BATS")[i % 3] for i in range(rows)], dtype=pl.Categorical),
+            "symbol": pl.Series([None if i % 89 == 0 else f"SYM{i % 300:03d}" for i in range(rows)]),
+            "price": pl.Series([float(i % 977) / 7 for i in range(rows)]),
+        })
+
+    def _sink_source(self, directory):
+        # Read -> transform -> write: a Parquet scan, a filter and computed columns.
+        path = Path(directory) / "input.parquet"
+        self._sink_frame().write_parquet(path)
+        return (pl.scan_parquet(path).filter(pl.col("day") > 20)
+                .with_columns(value=pl.col("price") * pl.col("day"), cheap=pl.col("price") < 30))
+
+    def test_sink_parquet_writes_what_polars_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            query = self._sink_source(directory)
+            ibex_path = Path(directory) / "ibex.parquet"
+            polars_path = Path(directory) / "polars.parquet"
+            with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as run:
+                self.assertIsNone(query.sink_parquet(ibex_path, engine=self.engine))
+            # The query ran in Ibex; Polars only wrote its result.
+            self.assertEqual(run.call_count, 1)
+            query.sink_parquet(polars_path, engine="streaming")
+            assert_frame_equal(pl.read_parquet(ibex_path), pl.read_parquet(polars_path))
+            # The same file schema, Polars' own metadata included.
+            self.assertTrue(pq.read_schema(ibex_path).equals(pq.read_schema(polars_path),
+                                                             check_metadata=True))
+            # An in-memory source with a Datetime column (temporal Parquet
+            # scans are not supported yet).
+            frame = self._sink_frame().with_columns(
+                at=pl.datetime(2026, 1, 1) + pl.duration(seconds=pl.col("id")))
+            timed = frame.lazy().filter(pl.col("day") > 20).with_columns(value=pl.col("price") * pl.col("day"))
+            timed.sink_parquet(ibex_path, engine=self.engine)
+            timed.sink_parquet(polars_path, engine="streaming")
+            assert_frame_equal(pl.read_parquet(ibex_path), pl.read_parquet(polars_path))
+            self.assertTrue(pq.read_schema(ibex_path).equals(pq.read_schema(polars_path),
+                                                             check_metadata=True))
+            # A group by written the same way.
+            grouped = query.group_by("venue", "symbol").agg(pl.sum("value"), pl.len()).sort("venue", "symbol")
+            grouped.sink_parquet(ibex_path, engine=self.engine)
+            assert_frame_equal(pl.read_parquet(ibex_path), grouped.collect(engine="streaming"))
+
+    def test_sink_parquet_passes_writer_options_and_targets_through(self):
+        with tempfile.TemporaryDirectory() as directory:
+            query = self._sink_source(directory)
+            path = Path(directory) / "nested" / "out.parquet"
+            query.sink_parquet(path, engine=self.engine, compression="snappy", row_group_size=5_000,
+                               statistics=False, mkdir=True)
+            metadata = pq.ParquetFile(path).metadata
+            self.assertGreater(metadata.num_row_groups, 1)
+            self.assertTrue(all(metadata.row_group(g).num_rows <= 5_000 for g in range(metadata.num_row_groups)))
+            self.assertEqual(metadata.row_group(0).column(0).compression, "SNAPPY")
+            self.assertFalse(metadata.row_group(0).column(0).is_stats_set)
+            buffer = io.BytesIO()
+            query.sink_parquet(buffer, engine=self.engine)
+            buffer.seek(0)
+            assert_frame_equal(pl.read_parquet(buffer), query.collect(engine="streaming"))
+
+    def test_lazy_sink_reports_the_eager_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            query = self._sink_source(directory)
+            sink = query.sink_parquet(Path(directory) / "lazy.parquet", lazy=True)
+            with self.assertRaisesRegex(NotImplementedError, "without lazy=True"):
+                sink.collect(engine=self.engine)
 
     def test_categorical_output_empty_chunks_and_null_dictionary(self):
         dtype = pl.Categorical(pl.Categories("ibex_null_dictionary"))

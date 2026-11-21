@@ -310,3 +310,16 @@ class IbexEngine(pl.Engine):
 
     def execute(self, lf, *, optimizations):
         return SingleNodeQueryResult(self.collect(lf, optimizations=optimizations))
+
+    def sink_parquet(self, lf, path, *, optimizations, **options):
+        """`lf.sink_parquet(path, engine=IbexEngine())`: run `lf` in Ibex, write with Polars.
+
+        The query runs in Ibex. Its result reaches Polars as it would for
+        `collect`, mostly sharing Arrow buffers, and Polars' own Parquet writer
+        writes it. The file therefore has exactly the schema and metadata
+        Polars would write, and every `sink_parquet` option and target
+        (compression, statistics, row groups, `PartitionBy`, cloud storage,
+        file objects) behaves as it does in Polars.
+        """
+        frame = self.collect(lf, optimizations=optimizations)
+        frame.lazy().sink_parquet(path, engine="streaming", **options)

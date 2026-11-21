@@ -1106,6 +1106,11 @@ class Adapter:
                 frame = frame.sort(keys, descending=descending, nulls_last=nulls_last, maintain_order=stable)
                 if node.slice is not None:
                     frame = frame.slice(*node.slice[:2])
+        elif kind == "Sink":
+            # The sink's file options are not exposed to Python by the plan
+            # visitor; IbexEngine.sink_parquet receives them as arguments.
+            raise NotImplementedError("lazy sinks are not supported: call "
+                                      "lf.sink_parquet(path, engine=IbexEngine()) without lazy=True")
         else:
             raise NotImplementedError(f"unsupported Polars plan node {kind} (node {node_id})")
         self.nodes[node_id] = frame

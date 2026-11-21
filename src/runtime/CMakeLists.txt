@@ -91,6 +91,27 @@ if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
     if(IBEX_LIBMVEC)
         target_link_libraries(ibex_runtime PRIVATE "${IBEX_LIBMVEC}")
         target_compile_definitions(ibex_runtime PRIVATE ZORRO_USE_LIBMVEC=1)
+        # glibc 2.22 shipped only sin/cos/log/exp/pow; tan, the inverse and
+        # hyperbolic functions and log2/log10 arrived in 2.35. A shared module
+        # links with undefined symbols, so on an older glibc (the manylinux_2_28
+        # wheel image) a missing kernel would only fail when Python loads the
+        # extension. Probe one 2.35 kernel and use the extended set only when
+        # it links; numeric_math.cpp falls back to scalar libm otherwise.
+        include(CheckCXXSourceCompiles)
+        set(CMAKE_REQUIRED_FLAGS "-mavx2")
+        set(CMAKE_REQUIRED_LIBRARIES "${IBEX_LIBMVEC}")
+        check_cxx_source_compiles("
+            #include <immintrin.h>
+            extern \"C\" __m256d _ZGVdN4v_acos(__m256d) noexcept;
+            int main() {
+                volatile auto kernel = &_ZGVdN4v_acos;
+                return kernel(_mm256_set1_pd(0.5))[0] > 0.0 ? 0 : 1;
+            }" IBEX_LIBMVEC_HAS_GLIBC_2_35_KERNELS)
+        unset(CMAKE_REQUIRED_FLAGS)
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if(IBEX_LIBMVEC_HAS_GLIBC_2_35_KERNELS)
+            target_compile_definitions(ibex_runtime PRIVATE IBEX_LIBMVEC_GLIBC_2_35=1)
+        endif()
     endif()
 endif()
 

@@ -103,11 +103,13 @@ void map_rows(const double* src, double* dst, std::size_t n, Kernel kernel) {
 // are glibc's fixed vector-ABI symbol names; the spelling is not ours to choose.
 extern "C" {
 __m256d _ZGVdN4v_log(__m256d) noexcept;
-__m256d _ZGVdN4v_log2(__m256d) noexcept;
-__m256d _ZGVdN4v_log10(__m256d) noexcept;
 __m256d _ZGVdN4v_exp(__m256d) noexcept;
 __m256d _ZGVdN4v_sin(__m256d) noexcept;
 __m256d _ZGVdN4v_cos(__m256d) noexcept;
+// Added in glibc 2.35 (src/runtime/CMakeLists.txt probes for them).
+#ifdef IBEX_LIBMVEC_GLIBC_2_35
+__m256d _ZGVdN4v_log2(__m256d) noexcept;
+__m256d _ZGVdN4v_log10(__m256d) noexcept;
 __m256d _ZGVdN4v_tan(__m256d) noexcept;
 __m256d _ZGVdN4v_asin(__m256d) noexcept;
 __m256d _ZGVdN4v_acos(__m256d) noexcept;
@@ -115,6 +117,7 @@ __m256d _ZGVdN4v_atan(__m256d) noexcept;
 __m256d _ZGVdN4v_sinh(__m256d) noexcept;
 __m256d _ZGVdN4v_cosh(__m256d) noexcept;
 __m256d _ZGVdN4v_tanh(__m256d) noexcept;
+#endif
 }
 // NOLINTEND(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)
 
@@ -128,14 +131,15 @@ auto vector_kernel(UnaryMath fn) -> VectorKernel {
             return _ZGVdN4v_log;
         case UnaryMath::Exp:
             return _ZGVdN4v_exp;
-        case UnaryMath::Log2:
-            return _ZGVdN4v_log2;
-        case UnaryMath::Log10:
-            return _ZGVdN4v_log10;
         case UnaryMath::Sin:
             return _ZGVdN4v_sin;
         case UnaryMath::Cos:
             return _ZGVdN4v_cos;
+#ifdef IBEX_LIBMVEC_GLIBC_2_35
+        case UnaryMath::Log2:
+            return _ZGVdN4v_log2;
+        case UnaryMath::Log10:
+            return _ZGVdN4v_log10;
         case UnaryMath::Tan:
             return _ZGVdN4v_tan;
         case UnaryMath::Asin:
@@ -150,6 +154,7 @@ auto vector_kernel(UnaryMath fn) -> VectorKernel {
             return _ZGVdN4v_cosh;
         case UnaryMath::Tanh:
             return _ZGVdN4v_tanh;
+#endif
         default:
             return nullptr;
     }

@@ -1580,7 +1580,12 @@ class HashAggregateState final {
     /// an integer for the same reason `process_rows_cat` may index an array
     /// with it: within one operator a dictionary only ever grows and never
     /// reorders, so a code identifies the same value in every chunk.
-    enum class IntKeyKind : std::uint8_t { Int64, Date, Ts, Cat };
+    /// `Bool` is read as 0/1: a Boolean key has at most three cells (false,
+    /// true, null), which the dense paths index directly. Before it joined,
+    /// `by is_buy` went to the generic hash path and hashed a KeyCol tuple
+    /// per row into two groups -- 10M rows, 24 threads: 77 ms against 5 ms
+    /// for a Categorical key.
+    enum class IntKeyKind : std::uint8_t { Int64, Date, Ts, Cat, Bool };
 
     /// Streaming `count_distinct` state for one aggregation.
     ///
@@ -2148,6 +2153,9 @@ class HashAggregateState final {
                 if (std::holds_alternative<Column<Timestamp>>(col)) {
                     return IntKeyKind::Ts;
                 }
+                if (std::holds_alternative<Column<bool>>(col)) {
+                    return IntKeyKind::Bool;
+                }
                 return std::nullopt;
             };
             // A nullable key keeps the path too: its dense array has a null
@@ -2178,7 +2186,8 @@ class HashAggregateState final {
                     int_key_kind_ = *ka;
                     int_key_kind_b_ = *kb;
                     const auto is_32_bit = [](IntKeyKind k) {
-                        return k == IntKeyKind::Cat || k == IntKeyKind::Date;
+                        return k == IntKeyKind::Cat || k == IntKeyKind::Date ||
+                               k == IntKeyKind::Bool;
                     };
                     pair_packs_u64_ = is_32_bit(*ka) && is_32_bit(*kb);
                 }
@@ -2690,6 +2699,11 @@ class HashAggregateState final {
             case IntKeyKind::Ts: {
                 const Timestamp* stamps = std::get<Column<Timestamp>>(key_col).data();
                 return run([stamps](std::size_t row) -> std::int64_t { return stamps[row].nanos; });
+            }
+            case IntKeyKind::Bool: {
+                const auto* bools = &std::get<Column<bool>>(key_col);
+                return run(
+                    [bools](std::size_t row) -> std::int64_t { return (*bools)[row] ? 1 : 0; });
             }
             case IntKeyKind::Cat:
                 break;
@@ -3993,6 +4007,7 @@ class HashAggregateState final {
             const Date* dates = nullptr;
             const Timestamp* stamps = nullptr;
             const Column<Categorical>::code_type* codes = nullptr;
+            const Column<bool>* bools = nullptr;
             IntKeyKind kind = IntKeyKind::Int64;
 
             [[nodiscard]] auto operator()(std::size_t row) const -> std::int64_t {
@@ -4005,6 +4020,8 @@ class HashAggregateState final {
                         return stamps[row].nanos;
                     case IntKeyKind::Cat:
                         return codes[row];
+                    case IntKeyKind::Bool:
+                        return (*bools)[row] ? 1 : 0;
                 }
                 return 0;
             }
@@ -4024,6 +4041,9 @@ class HashAggregateState final {
                     break;
                 case IntKeyKind::Cat:
                     reader.codes = std::get<Column<Categorical>>(col).codes_data();
+                    break;
+                case IntKeyKind::Bool:
+                    reader.bools = &std::get<Column<bool>>(col);
                     break;
             }
             return reader;
@@ -4292,6 +4312,9 @@ class HashAggregateState final {
         if (kind == IntKeyKind::Cat) {
             const auto size = std::get<Column<Categorical>>(col).dictionary_size();
             return {0, size == 0 ? 0 : static_cast<std::int64_t>(size) - 1};
+        }
+        if (kind == IntKeyKind::Bool) {
+            return {0, 1};
         }
         // Pair keys are never null here. In pieces on the pool when it may
         // fan out: serially, two keys over h2o's 10M rows were most of what
@@ -5717,6 +5740,8 @@ class HashAggregateState final {
                 return Date{.days = static_cast<std::int32_t>(raw)};
             case IntKeyKind::Ts:
                 return Timestamp{.nanos = raw};
+            case IntKeyKind::Bool:
+                return raw != 0;
             case IntKeyKind::Int64:
             case IntKeyKind::Cat:
                 break;
@@ -9008,6 +9033,10 @@ class HashAggregateState final {
                 return EmitSlot::TsKey;
             case IntKeyKind::Cat:
                 return EmitSlot::Cat;
+            case IntKeyKind::Bool:
+                // Bit-packed: no buffer to index, so appended in group order
+                // by one task (`put_int_key`).
+                return EmitSlot::Whole;
         }
         return EmitSlot::Whole;
     }
@@ -9364,6 +9393,13 @@ class HashAggregateState final {
         // Cat case stores a code, which resolves against the shared dictionary
         // the output column inherited from `make_empty_like`.
         const auto put_int_key = [&](std::size_t ci, std::size_t g, std::int64_t raw) {
+            if (slot_kind[ci] == EmitSlot::Whole) {
+                // A Bool key, the one int key kind with no indexable buffer. A
+                // Whole column is one task over every group, so appending
+                // keeps group order.
+                std::get<Column<bool>>(out.mutable_column(ci)).push_back(raw != 0);
+                return;
+            }
             store_int_key(slot_kind[ci], slot_data[ci], g, raw);
         };
 

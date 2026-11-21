@@ -2040,6 +2040,149 @@ TEST_CASE("one-core aggregate: partitions discovery only for a mostly distinct k
     }
 }
 
+TEST_CASE("Bool group-by keys take the integer key paths", "[runtime][chunked][aggregate][nulls]") {
+    // A Bool key is read as 0/1 by the single-int and int-pair paths and
+    // emitted back as Bool. `b` gains nulls only past row 150k, so in chunks a
+    // pair starts on the pair path and moves to the generic one mid-stream;
+    // `bn` never has nulls. Checked against a grouping computed here, in
+    // first-occurrence order, serially and fanned out, whole and in chunks.
+    constexpr std::size_t kRows = 300'000;
+    const std::vector<std::string> labels{"p", "q", "r", "s", "t"};
+    Column<Categorical>::codes_storage codes;
+    Column<std::int64_t> g;
+    Column<bool> b;
+    Column<bool> bn;
+    Column<std::int64_t> q;
+    runtime::ValidityBitmap b_valid;
+    const auto b_null = [](std::size_t i) { return i >= 150'000 && i % 17 == 0; };
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const std::size_t k = (i * 7919) % 60'001;
+        codes.push_back(static_cast<Column<Categorical>::code_type>(k % 5));
+        g.push_back(static_cast<std::int64_t>(k % 7) - 3);
+        b.push_back(b_null(i) ? false : (k / 3) % 2 == 1);
+        b_valid.push_back(!b_null(i));
+        bn.push_back(k % 3 == 0);
+        q.push_back(static_cast<std::int64_t>(i % 101));
+    }
+    runtime::Table t;
+    t.add_column("c", Column<Categorical>(labels, std::move(codes)));
+    t.add_column("g", std::move(g));
+    t.add_column("b", std::move(b));
+    t.columns.back().validity = std::move(b_valid);
+    t.add_column("bn", std::move(bn));
+    t.add_column("q", std::move(q));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    // A key cell as an optional integer: a Categorical's code, a Bool's 0/1.
+    using Cell = std::optional<std::int64_t>;
+    const auto cell_at = [&](const std::string& name, std::size_t row) -> Cell {
+        const auto* entry = t.find_entry(name);
+        if (runtime::is_null(*entry, row)) {
+            return std::nullopt;
+        }
+        if (const auto* cat = std::get_if<Column<Categorical>>(entry->column.get())) {
+            return cat->code_at(row);
+        }
+        if (const auto* bools = std::get_if<Column<bool>>(entry->column.get())) {
+            return (*bools)[row] ? 1 : 0;
+        }
+        return std::get<Column<std::int64_t>>(*entry->column)[row];
+    };
+    const auto out_cell = [&](const runtime::Table& out, const std::string& name,
+                              std::size_t row) -> Cell {
+        const auto* entry = out.find_entry(name);
+        REQUIRE(entry != nullptr);
+        if (runtime::is_null(*entry, row)) {
+            return std::nullopt;
+        }
+        if (const auto* cat = std::get_if<Column<Categorical>>(entry->column.get())) {
+            const auto it = std::ranges::find(labels, std::string((*cat)[row]));
+            return static_cast<std::int64_t>(it - labels.begin());
+        }
+        if (const auto* bools = std::get_if<Column<bool>>(entry->column.get())) {
+            return (*bools)[row] ? 1 : 0;
+        }
+        return std::get<Column<std::int64_t>>(*entry->column)[row];
+    };
+
+    for (const auto& keys :
+         {std::vector<std::string>{"b"}, std::vector<std::string>{"bn"},
+          std::vector<std::string>{"c", "bn"}, std::vector<std::string>{"bn", "c"},
+          std::vector<std::string>{"g", "b"}, std::vector<std::string>{"b", "g"}}) {
+        std::string by;
+        for (const auto& key : keys) {
+            by += (by.empty() ? "" : ", ") + key;
+        }
+        const std::string source = "t[select { total = sum(q), n = count() }, by { " + by + " }];";
+        INFO(source);
+        std::vector<std::vector<Cell>> order;
+        std::map<std::vector<Cell>, std::pair<std::int64_t, std::int64_t>> sums;
+        const auto& qs = std::get<Column<std::int64_t>>(*t.find("q"));
+        for (std::size_t i = 0; i < kRows; ++i) {
+            std::vector<Cell> key;
+            key.reserve(keys.size());
+            for (const auto& name : keys) {
+                key.push_back(cell_at(name, i));
+            }
+            auto [it, inserted] = sums.emplace(key, std::pair<std::int64_t, std::int64_t>{0, 0});
+            if (inserted) {
+                order.push_back(key);
+            }
+            ++it->second.first;
+            it->second.second += qs[i];
+        }
+        auto program = parser::parse(source);
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        const auto check = [&](const runtime::Table& out) {
+            REQUIRE(out.rows() == order.size());
+            for (const auto& name : keys) {
+                if (name != "c") {
+                    REQUIRE(std::holds_alternative<Column<bool>>(*out.find_entry(name)->column) ==
+                            (name != "g"));
+                }
+            }
+            const auto& totals = std::get<Column<std::int64_t>>(*out.find("total"));
+            const auto& counts = std::get<Column<std::int64_t>>(*out.find("n"));
+            for (std::size_t row = 0; row < order.size(); ++row) {
+                INFO("group " << row);
+                std::vector<Cell> key;
+                key.reserve(keys.size());
+                for (const auto& name : keys) {
+                    key.push_back(out_cell(out, name, row));
+                }
+                REQUIRE(key == order[row]);
+                REQUIRE(counts[row] == sums.at(key).first);
+                REQUIRE(totals[row] == sums.at(key).second);
+            }
+        };
+        for (const bool chunked : {false, true}) {
+            INFO("chunked: " << chunked);
+            std::optional<ChunkGrainGuard> guard;
+            if (chunked) {
+                guard.emplace("20000");
+            }
+            runtime::ExecutionContext serial;
+            serial.parallel_threads = 1;
+            runtime::ExecutionContext parallel;
+            parallel.parallel_threads = 8;
+            parallel.parallel_min_rows = 0;
+            const auto sr =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
+            const auto pr =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, parallel);
+            INFO((sr.has_value() ? std::string{} : sr.error()));
+            REQUIRE(sr.has_value());
+            INFO((pr.has_value() ? std::string{} : pr.error()));
+            REQUIRE(pr.has_value());
+            check(*sr);
+            check(*pr);
+        }
+    }
+}
+
 TEST_CASE("packed group-by keys: nullable key columns keep the packed path",
           "[runtime][chunked][aggregate][parallel]") {
     // h2o q10 on its 5%-NA data: every key column has a validity bitmap, which

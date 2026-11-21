@@ -2277,6 +2277,52 @@ inline void sharded_dictionary(ShardedColumn& planned, int leaf_index,
     };
 }
 
+/// `rows` bytes, each 0 or 1, as a `Column<bool>`: 64 rows to a word.
+inline auto pack_bool_bytes(const std::uint8_t* values, std::size_t rows) -> ibex::Column<bool> {
+    using Word = ibex::Column<bool>::word_type;
+    constexpr std::size_t kBits = sizeof(Word) * 8;
+    ibex::Column<bool> out(rows, false);
+    Word* const words = out.words_data();
+    for (std::size_t word = 0; word * kBits < rows; ++word) {
+        const std::size_t first = word * kBits;
+        const std::size_t count = std::min(kBits, rows - first);
+        Word packed = 0;
+        for (std::size_t bit = 0; bit < count; ++bit) {
+            packed |= static_cast<Word>(values[first + bit]) << bit;
+        }
+        words[word] = packed;
+    }
+    return out;
+}
+
+/// A Bool column split by row group. `Column<bool>` packs 64 rows into a word,
+/// and shard boundaries fall mid-word (row groups need not be multiples of 64),
+/// so shards cannot write the column itself. Each decodes into its own disjoint
+/// slice of a byte-per-row buffer instead, and `finalize` packs the bytes into
+/// words. Decoded serially, the one Bool column of a 10M-row trades file took
+/// 81 ms, four times any other column of it.
+inline void sharded_bool(ShardedColumn& planned, int leaf_index,
+                         const ibex::runtime::Selection* selection, std::size_t output_rows) {
+    auto bytes = std::make_shared<ibex::detail::NoInitVector<std::uint8_t>>(output_rows);
+    std::uint8_t* const base = bytes->data();
+    planned.decode_range = [base, leaf_index, selection](
+                               parquet::arrow::FileReader& reader, const DirectDecodeGroups& range,
+                               std::size_t output_start, std::size_t rows) -> std::size_t {
+        DirectValidity validity(rows);
+        const auto emitted = decode_numeric_into<parquet::BooleanType, std::uint8_t, false>(
+            reader, leaf_index, selection, range, base + output_start, rows, validity,
+            [](bool value) { return static_cast<std::uint8_t>(value ? 1U : 0U); });
+        if (emitted != rows || validity.position != rows || validity.has_null) {
+            throw std::runtime_error("parquet::read: sharded decode produced the wrong row count");
+        }
+        return emitted;
+    };
+    planned.finalize = [bytes, output_rows](ibex::runtime::ColumnEntry& entry) {
+        entry.column = std::make_shared<ibex::runtime::ColumnValue>(
+            pack_bool_bytes(bytes->data(), output_rows));
+    };
+}
+
 /// nullopt when this column cannot be split by row group — see `ShardedColumn`
 /// for which columns those are and why.
 /// Selected decodes with at most this many output rows split a string column
@@ -2484,6 +2530,9 @@ inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow:
         case arrow::Type::DICTIONARY:
             sharded_dictionary(planned, leaf_index, selection, groups, output_rows);
             break;
+        case arrow::Type::BOOL:
+            sharded_bool(planned, leaf_index, selection, output_rows);
+            break;
         case arrow::Type::STRING:
         case arrow::Type::LARGE_STRING:
             if (selection != nullptr && output_rows > kShardedStringMaxRows) {
@@ -2576,15 +2625,15 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
             break;
         }
         case arrow::Type::BOOL: {
-            ibex::Column<bool> out;
-            out.reserve(output_rows);
-            auto emitted = decode_physical_column<parquet::BooleanType>(
-                reader, leaf_index, selection, groups, [&](const bool* value) {
-                    validity.append(value != nullptr);
-                    out.push_back(value != nullptr && *value);
-                });
-            verify(emitted);
-            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            // Bulk-decoded into bytes, then packed: appending each value to
+            // the bit-packed column through the per-value emitter cost ~14 ns
+            // a row, the slowest column of a 10M-row trades file by 3x.
+            ibex::detail::NoInitVector<std::uint8_t> bytes(output_rows);
+            verify(decode_numeric_into<parquet::BooleanType, std::uint8_t, false>(
+                reader, leaf_index, selection, groups, bytes.data(), output_rows, validity,
+                [](bool value) { return static_cast<std::uint8_t>(value ? 1U : 0U); }));
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(
+                pack_bool_bytes(bytes.data(), output_rows));
             break;
         }
         case arrow::Type::STRING:

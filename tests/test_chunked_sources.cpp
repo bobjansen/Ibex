@@ -4225,6 +4225,164 @@ auto run_extern_serial(const std::string& source, const runtime::ExternRegistry&
 
 }  // namespace
 
+TEST_CASE("multi-key top-k takes the stable sort's head and tail rows",
+          "[runtime][chunked][topk][nulls][nan]") {
+    // Two or more order keys: rows are ranked in place against the heap's
+    // worst entry, across workers when a chunk is large enough. Few distinct
+    // values, so ties and the row sequence decide most winners, and nulls and
+    // NaNs sit in every key that can hold them.
+    constexpr std::size_t kChunkRows = 100'000;  // past parallel_min_rows
+    constexpr std::size_t kChunks = 3;
+    constexpr std::size_t kRows = kChunkRows * kChunks;
+    const auto flag_null = [](std::size_t row) { return row % 3 == 0; };
+    const auto flag_at = [](std::size_t row) { return (row * 7 / 2) % 2 == 1; };
+    const auto x_null = [](std::size_t row) { return row % 13 == 0; };
+    const auto x_at = [](std::size_t row) {
+        return row % 11 == 0 ? std::numeric_limits<double>::quiet_NaN()
+                             : static_cast<double>((row * 104'729) % 7) - 3.0;
+    };
+    const auto s_at = [](std::size_t row) { return "s" + std::to_string((row * 31) % 5); };
+
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("mixed_keys", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        for (std::size_t part = 0; part < kChunks; ++part) {
+            Column<bool> flag;
+            Column<double> x;
+            Column<std::string> s;
+            Column<std::int64_t> id;
+            runtime::ValidityBitmap flag_valid;
+            runtime::ValidityBitmap x_valid;
+            flag_valid.assign(kChunkRows, true);
+            x_valid.assign(kChunkRows, true);
+            for (std::size_t r = 0; r < kChunkRows; ++r) {
+                const std::size_t row = (part * kChunkRows) + r;
+                flag.push_back(flag_null(row) ? false : flag_at(row));
+                flag_valid.set(r, !flag_null(row));
+                x.push_back(x_null(row) ? 0.0 : x_at(row));
+                x_valid.set(r, !x_null(row));
+                s.push_back(s_at(row));
+                id.push_back(static_cast<std::int64_t>(row));
+            }
+            runtime::Chunk chunk;
+            const auto add = [&](std::string name, runtime::ColumnValue value,
+                                 std::optional<runtime::ValidityBitmap> validity) {
+                runtime::ColumnEntry entry;
+                entry.name = std::move(name);
+                entry.column = std::make_shared<runtime::ColumnValue>(std::move(value));
+                entry.validity = std::move(validity);
+                chunk.columns.push_back(std::move(entry));
+            };
+            add("flag", std::move(flag), std::move(flag_valid));
+            add("x", std::move(x), std::move(x_valid));
+            add("s", std::move(s), std::nullopt);
+            add("id", std::move(id), std::nullopt);
+            chunks.push_back(std::move(chunk));
+        }
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    enum class Key : std::uint8_t { Flag, X, S };
+    struct OrderKey {
+        Key key;
+        bool desc;
+    };
+    struct Case {
+        std::string clause;
+        std::vector<OrderKey> keys;
+        std::size_t k;
+        bool tail;
+    };
+    // Three-way compare of one key, nulls last under asc and desc alike, NaN
+    // above every number (SPEC 3.5, Null Keys).
+    const auto compare = [&](const OrderKey& key, std::size_t a, std::size_t b) -> int {
+        const auto nulls = [&](bool a_null, bool b_null) -> std::optional<int> {
+            if (a_null != b_null) {
+                return a_null ? 1 : -1;
+            }
+            if (a_null) {
+                return 0;
+            }
+            return std::nullopt;
+        };
+        int cmp = 0;
+        switch (key.key) {
+            case Key::Flag:
+                if (auto n = nulls(flag_null(a), flag_null(b))) {
+                    return *n;
+                }
+                cmp = static_cast<int>(flag_at(a)) - static_cast<int>(flag_at(b));
+                break;
+            case Key::X: {
+                if (auto n = nulls(x_null(a), x_null(b))) {
+                    return *n;
+                }
+                const double xa = x_at(a);
+                const double xb = x_at(b);
+                cmp = std::isnan(xa) || std::isnan(xb)
+                          ? static_cast<int>(std::isnan(xa)) - static_cast<int>(std::isnan(xb))
+                          : (xa < xb ? -1 : (xb < xa ? 1 : 0));
+                break;
+            }
+            case Key::S:
+                cmp = s_at(a).compare(s_at(b));
+                cmp = cmp < 0 ? -1 : (cmp > 0 ? 1 : 0);
+                break;
+        }
+        return key.desc ? -cmp : cmp;
+    };
+
+    const auto by_flag = [](bool desc) { return OrderKey{.key = Key::Flag, .desc = desc}; };
+    const auto by_x = [](bool desc) { return OrderKey{.key = Key::X, .desc = desc}; };
+    const auto by_s = [](bool desc) { return OrderKey{.key = Key::S, .desc = desc}; };
+    for (const Case& test : {
+             // The Polars adapter's null-first key ahead of the real one.
+             Case{.clause = "order { flag desc, x desc }, head 50",
+                  .keys = {by_flag(true), by_x(true)},
+                  .k = 50,
+                  .tail = false},
+             Case{.clause = "order { flag, x, s desc }, head 50",
+                  .keys = {by_flag(false), by_x(false), by_s(true)},
+                  .k = 50,
+                  .tail = false},
+             Case{.clause = "order { s desc, x }, tail 40",
+                  .keys = {by_s(true), by_x(false)},
+                  .k = 40,
+                  .tail = true},
+             Case{.clause = "order { x desc, flag }, head 1000",
+                  .keys = {by_x(true), by_flag(false)},
+                  .k = 1000,
+                  .tail = false},
+         }) {
+        std::vector<std::size_t> order(kRows);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            order[row] = row;
+        }
+        std::ranges::stable_sort(order, [&](std::size_t a, std::size_t b) {
+            for (const auto& key : test.keys) {
+                if (const int cmp = compare(key, a, b); cmp != 0) {
+                    return cmp < 0;
+                }
+            }
+            return false;
+        });
+        const auto take = static_cast<std::ptrdiff_t>(test.k);
+        std::vector<std::int64_t> want;
+        want.reserve(test.k);
+        for (auto it = test.tail ? order.end() - take : order.begin(),
+                  end = test.tail ? order.end() : order.begin() + take;
+             it != end; ++it) {
+            want.push_back(static_cast<std::int64_t>(*it));
+        }
+        const std::string query = "mixed_keys()[" + test.clause + "];";
+        const auto decl = std::string{"extern fn mixed_keys() -> DataFrame from \"x.hpp\"; "};
+        INFO(query);
+        CHECK(int_column(run_extern(decl + query, externs), "id") == want);
+        CHECK(int_column(run_extern_serial(decl + query, externs), "id") == want);
+    }
+}
+
 TEST_CASE("chunked int aggregate keeps sorted keys unindexed across chunk boundaries",
           "[runtime][chunked][aggregate]") {
     // A sorted key (TPC-H l_orderkey) whose groups straddle chunk boundaries:

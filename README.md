@@ -597,9 +597,10 @@ result = query.collect(engine=engine)
 
 Reuse the Engine and query to retain prepared resident inputs; every collection
 executes again. Unsupported plans fail explicitly. The experiment pins
-Polars 2.0.0 and its private plan visitor. Each release attaches
-`ibex-polars` wheels (Linux x86_64, Windows x86_64); `main`'s are in the
-`wheels-latest` prerelease. See
+Polars 2.0.0 and its private plan visitor. Prebuilt `ibex-polars` wheels
+(Linux x86_64, Windows x86_64) install without a compiler:
+`pip install --pre ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/wheels-latest`.
+See
 [scope and setup](python/ibex_polars/README.md) and
 [resident-table measurements](python/performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl).
 The [PDS-H comparison](python/performance.md#pds-h-through-ibexengine-scale-10) runs all 22 unchanged

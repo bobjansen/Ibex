@@ -14,15 +14,20 @@ result = query.collect(engine=engine)
 
 ## Install
 
-Wheels for Python 3.11–3.14 on Linux x86_64 (glibc 2.28+) and Windows
-x86_64 are attached to each [GitHub release](https://github.com/bobjansen/Ibex/releases),
-and CI republishes the current `main` as the rolling `wheels-latest`
-prerelease. No compiler is needed:
+Prebuilt wheels cover Python 3.11–3.14 on Linux x86_64 (glibc 2.28+) and
+Windows x86_64; no compiler is needed. Install the current `main`:
 
 ```bash
-pip install ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/<tag>
 pip install --pre ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/wheels-latest
 ```
+
+CI rebuilds the `wheels-latest` prerelease on every push to `main`. Its
+wheels carry development versions (such as `0.4.1.dev539`), and pip skips
+those unless given `--pre`.
+
+Tagged [releases](https://github.com/bobjansen/Ibex/releases) after v0.4.0
+attach wheels too. To pin one, replace `wheels-latest` with the release tag
+and drop `--pre`.
 
 macOS (Apple silicon) wheels are built only on request, by running the
 "Python wheels" workflow by hand with the macOS option.

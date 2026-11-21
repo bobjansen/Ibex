@@ -496,8 +496,6 @@ class ChunkedRenameOperator final : public Operator {
     const std::vector<ir::RenameSpec>* renames_;
 };
 
-using ir::collect_expr_column_refs;
-
 /// Per-chunk update for row-local field expressions. `build_operator()` only
 /// routes here when all of the UpdateNode's field expressions are row-local
 /// (per `is_row_local_update_expr`) and there are no tuple_fields or
@@ -804,26 +802,11 @@ auto build_filter_update_project_gather_map(
         step.project_columns == nullptr) {
         return std::unexpected("filter-update-project map step missing normalized operands");
     }
-    robin_hood::unordered_set<std::string> update_outputs;
-    robin_hood::unordered_set<std::string> needed;
-    for (const auto& field : *step.update_fields) {
-        update_outputs.insert(field.alias);
-        collect_expr_column_refs(field.expr, needed);
-    }
-    for (const auto& column : *step.project_columns) {
-        if (!update_outputs.contains(column.name)) {
-            needed.insert(column.name);
-        }
-    }
-    std::vector<ir::ColumnRef> gather_columns;
-    gather_columns.reserve(needed.size());
-    for (const auto& name : needed) {
-        gather_columns.push_back(ir::ColumnRef{.name = name});
-    }
     return std::make_unique<ChunkedFilterUpdateProjectOperator>(
         std::move(child), step.filter_predicate, step.update_fields, step.project_columns,
-        std::move(gather_columns), scalars, externs, exec,
-        physical_filter_route(*step.filter_predicate, source_signature), preserve_empty_morsels);
+        kernel::update_project_input_columns(*step.update_fields, *step.project_columns), scalars,
+        externs, exec, physical_filter_route(*step.filter_predicate, source_signature),
+        preserve_empty_morsels);
 }
 
 }  // namespace

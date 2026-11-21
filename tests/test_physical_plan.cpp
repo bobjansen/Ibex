@@ -542,6 +542,68 @@ TEST_CASE("A fused step runs over morsels", "[physical][execute][fusion][paralle
     CHECK(stats.parallel_pipelines.load() == 1);
 }
 
+// The fused filter→update→project through real morsels. The morsel source
+// evaluates the range-native filter in place and gathers only what the update
+// and the projection read; the update and projection then run per morsel.
+// Every column must come out as the serial run's: a gathered passthrough, a
+// nullable Bool, the update's column, and one the update reads but the
+// projection drops.
+TEST_CASE("A fused filter, update and project step runs over morsels",
+          "[physical][execute][fusion][parallel]") {
+    constexpr std::size_t kRows = 40'000;
+    Column<std::int64_t> price;
+    Column<double> qty;
+    Column<std::string> symbol;
+    Column<bool> flag;
+    runtime::ValidityBitmap flag_valid;
+    flag_valid.assign(kRows, true);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        price.push_back(static_cast<std::int64_t>((r * 7919) % kRows));
+        qty.push_back(static_cast<double>(r % 13) + 0.5);
+        symbol.push_back(r % 3 == 0 ? "A" : "B");
+        flag.push_back(r % 2 == 0);
+        flag_valid.set(r, r % 5 != 0);
+    }
+    runtime::Table table;
+    table.add_column("price", std::move(price));
+    table.add_column("qty", std::move(qty));
+    table.add_column("symbol", std::move(symbol));
+    table.add_column("flag", std::move(flag));
+    table.columns.back().validity = std::move(flag_valid);
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    const auto ir = require_ir(
+        "trades[filter price > 19999][update { notional = Float64(price) * qty }]"
+        "[select { symbol, notional, flag, price }];");
+    const auto plan = runtime::physical::plan_physical(*ir, registry, nullptr);
+    REQUIRE(plan.migrated);
+    REQUIRE(plan.steps.size() == 1);
+    REQUIRE(plan.steps.front().capability ==
+            runtime::MapKernelCapability::FilterUpdateProjectGather);
+    REQUIRE(plan.mode == runtime::physical::PipelineMode::MorselParallel);
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_grain = 4'096;
+    parallel.parallel_stats = &stats;
+
+    const auto a = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    const auto b = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    REQUIRE(a->rows() == kRows - 20'000);
+    REQUIRE(b->columns.size() == 4);
+    const auto mismatch = runtime::compare_tables(*a, *b);
+    INFO((mismatch.has_value() ? mismatch->message() : std::string{}));
+    CHECK_FALSE(mismatch.has_value());
+    CHECK(stats.parallel_pipelines.load() == 1);
+}
+
 TEST_CASE("Pipeline mode applies the parallel-map rules", "[physical][plan][parallel]") {
     using runtime::physical::PipelineMode;
     using runtime::physical::SerialOnlyReason;

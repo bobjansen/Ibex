@@ -39,6 +39,19 @@ enum class FilterChunkRoute : std::uint8_t { Auto, NativePredicate };
     -> std::expected<Chunk, std::string>;
 [[nodiscard]] auto project_chunk(const Chunk& input, const std::vector<ir::ColumnRef>& columns)
     -> std::expected<Chunk, std::string>;
+/// The input columns a fused filter→update→project reads: every column an
+/// update field references, and every projected column the update does not
+/// produce. A filter gathers only these.
+[[nodiscard]] auto update_project_input_columns(const std::vector<ir::FieldSpec>& fields,
+                                                const std::vector<ir::ColumnRef>& project_columns)
+    -> std::vector<ir::ColumnRef>;
+/// The update and projection of a fused filter→update→project, over rows
+/// that already passed its filter.
+[[nodiscard]] auto update_project_chunk(Chunk input, const std::vector<ir::FieldSpec>& fields,
+                                        const std::vector<ir::ColumnRef>& project_columns,
+                                        const ScalarRegistry* scalars,
+                                        const ExternRegistry* externs, const ExecutionContext& exec)
+    -> std::expected<Chunk, std::string>;
 [[nodiscard]] auto filter_update_project_chunk(
     Chunk input, const ir::Expr& predicate, const std::vector<ir::FieldSpec>& fields,
     const std::vector<ir::ColumnRef>& project_columns,

@@ -94,6 +94,7 @@
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
+#include "kernel_filter.hpp"
 #include "pipeline_executor_internal.hpp"
 #include "runtime_internal.hpp"
 #include "scan_worker_sink_internal.hpp"
@@ -260,6 +261,21 @@ class RangeFilterMorselSource final : public MorselSource {
                             const ScalarRegistry* scalars)
         : input_(&input), predicate_(predicate), project_(project), scalars_(scalars) {}
 
+    /// Gathers `owned_project`, a column list the source keeps itself.
+    RangeFilterMorselSource(const Table& input, const ir::Expr* predicate,
+                            std::vector<ir::ColumnRef> owned_project, const ScalarRegistry* scalars)
+        : input_(&input),
+          predicate_(predicate),
+          owned_project_(std::move(owned_project)),
+          project_(&owned_project_),
+          scalars_(scalars) {}
+
+    RangeFilterMorselSource(const RangeFilterMorselSource&) = delete;
+    RangeFilterMorselSource(RangeFilterMorselSource&&) = delete;
+    auto operator=(const RangeFilterMorselSource&) -> RangeFilterMorselSource& = delete;
+    auto operator=(RangeFilterMorselSource&&) -> RangeFilterMorselSource& = delete;
+    ~RangeFilterMorselSource() override = default;
+
     void set_morsel(std::size_t begin, std::size_t end, std::uint64_t sequence) override {
         pending_ = ChunkIdentity{.sequence = sequence, .row_offset = begin};
         begin_ = begin;
@@ -286,11 +302,49 @@ class RangeFilterMorselSource final : public MorselSource {
    private:
     const Table* input_;
     const ir::Expr* predicate_;
-    const std::vector<ir::ColumnRef>* project_;
+    std::vector<ir::ColumnRef> owned_project_;
+    const std::vector<ir::ColumnRef>* project_ = nullptr;
     const ScalarRegistry* scalars_;
     std::optional<ChunkIdentity> pending_;
     std::size_t begin_ = 0;
     std::size_t end_ = 0;
+};
+
+/// The update and projection of a fused filter→update→project step whose
+/// filter a `RangeFilterMorselSource` absorbed. One morsel in, one out, an
+/// empty one included: the merger indexes by sequence.
+class UpdateProjectMorselOperator final : public Operator {
+   public:
+    UpdateProjectMorselOperator(OperatorPtr child, const MapStep& step,
+                                const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                const ExecutionContext& exec)
+        : child_(std::move(child)),
+          fields_(step.update_fields),
+          project_columns_(step.project_columns),
+          scalars_(scalars),
+          externs_(externs),
+          exec_(&exec) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        auto chunk = child_->next();
+        if (!chunk.has_value() || !chunk->has_value()) {
+            return chunk;
+        }
+        auto projected = kernel::update_project_chunk(
+            std::move(**chunk), *fields_, *project_columns_, scalars_, externs_, *exec_);
+        if (!projected.has_value()) {
+            return std::unexpected(std::move(projected.error()));
+        }
+        return std::optional<Chunk>{std::move(projected.value())};
+    }
+
+   private:
+    OperatorPtr child_;
+    const std::vector<ir::FieldSpec>* fields_;
+    const std::vector<ir::ColumnRef>* project_columns_;
+    const ScalarRegistry* scalars_;
+    const ExternRegistry* externs_;
+    const ExecutionContext* exec_;
 };
 
 /// How a head operator is evaluated by range, when it can be. A filter head is
@@ -351,6 +405,27 @@ struct RangeHead {
     return std::nullopt;
 }
 
+/// For a fused filter→update→project head with a range-native filter, the
+/// input columns its update and projection read, which the range source then
+/// gathers; nullopt for any other head. The same disqualifiers as
+/// `range_filter_head` apply, and a column-less (time index) projection entry
+/// keeps the gathering source, whose chunks carry the time index.
+[[nodiscard]] auto range_update_filter_columns(const MapStep& step, const Table& input)
+    -> std::optional<std::vector<ir::ColumnRef>> {
+    if (input.columns.empty() ||
+        step.capability != MapKernelCapability::FilterUpdateProjectGather ||
+        step.filter_predicate == nullptr || step.update_fields == nullptr ||
+        step.project_columns == nullptr || !is_range_native_expr(*step.filter_predicate)) {
+        return std::nullopt;
+    }
+    auto columns = kernel::update_project_input_columns(*step.update_fields, *step.project_columns);
+    if (std::ranges::any_of(columns,
+                            [](const ir::ColumnRef& column) { return column.name.empty(); })) {
+        return std::nullopt;
+    }
+    return columns;
+}
+
 // One worker's private copy of the pipeline's map chain. The operators are
 // per-worker (they carry mutable per-chunk state); the IR nodes, registries,
 // and the input table they read are shared and immutable for the pipeline's
@@ -369,11 +444,24 @@ struct MorselWorkerChain {
     // operator above it — same output, without materializing the morsel first.
     std::size_t first_op = 0;
     std::unique_ptr<MorselSource> source;
+    bool absorbed_update_filter = false;
     if (!operators.empty()) {
         if (auto head = range_filter_head(operators.front(), input); head.has_value()) {
             source = std::make_unique<RangeFilterMorselSource>(input, head->predicate,
                                                                head->project, scalars);
             first_op = 1;
+        } else if (auto columns = range_update_filter_columns(operators.front(), input);
+                   columns.has_value()) {
+            // A fused filter→update→project head: the source filters in place
+            // and gathers only what the update and projection read, which run
+            // above it. Gathering the morsel first copied every input column
+            // of every row, survivors or not. 10M rows, 24 threads, 20% kept:
+            // `filter, update, select { symbol, notional }` 15 -> 9.5 ms, and
+            // the same with all 8 columns under a top-k, 29 -> 12 ms.
+            source = std::make_unique<RangeFilterMorselSource>(
+                input, operators.front().filter_predicate, std::move(*columns), scalars);
+            first_op = 1;
+            absorbed_update_filter = true;
         }
     }
     if (source == nullptr) {
@@ -381,6 +469,10 @@ struct MorselWorkerChain {
     }
 
     MorselWorkerChain worker{.source = source.get(), .chain = std::move(source)};
+    if (absorbed_update_filter) {
+        worker.chain = std::make_unique<UpdateProjectMorselOperator>(
+            std::move(worker.chain), operators.front(), scalars, externs, exec);
+    }
     for (std::size_t i = first_op; i < operators.size(); ++i) {
         const MapStep& op_node = operators[i];
         // `preserve_empty_morsels` is what makes one input morsel yield exactly

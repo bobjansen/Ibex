@@ -4,6 +4,7 @@
 #include "kernel_filter.hpp"
 
 #include <ibex/core/column.hpp>
+#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -15,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <robin_hood.h>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -364,11 +366,40 @@ auto filter_update_project_chunk(Chunk input, const ir::Expr& predicate,
         filter_project_chunk(std::move(input), predicate, gather_columns, scalars, route);
     if (!filtered.has_value())
         return std::unexpected(std::move(filtered.error()));
-    auto updated =
-        update_row_local_chunk(std::move(filtered.value()), fields, scalars, externs, exec);
+    return update_project_chunk(std::move(filtered.value()), fields, project_columns, scalars,
+                                externs, exec);
+}
+
+auto update_project_chunk(Chunk input, const std::vector<ir::FieldSpec>& fields,
+                          const std::vector<ir::ColumnRef>& project_columns,
+                          const ScalarRegistry* scalars, const ExternRegistry* externs,
+                          const ExecutionContext& exec) -> std::expected<Chunk, std::string> {
+    auto updated = update_row_local_chunk(std::move(input), fields, scalars, externs, exec);
     if (!updated.has_value())
         return std::unexpected(std::move(updated.error()));
     return project_chunk(updated.value(), project_columns);
+}
+
+auto update_project_input_columns(const std::vector<ir::FieldSpec>& fields,
+                                  const std::vector<ir::ColumnRef>& project_columns)
+    -> std::vector<ir::ColumnRef> {
+    robin_hood::unordered_set<std::string> update_outputs;
+    robin_hood::unordered_set<std::string> needed;
+    for (const auto& field : fields) {
+        update_outputs.insert(field.alias);
+        ir::collect_expr_column_refs(field.expr, needed);
+    }
+    for (const auto& column : project_columns) {
+        if (!update_outputs.contains(column.name)) {
+            needed.insert(column.name);
+        }
+    }
+    std::vector<ir::ColumnRef> columns;
+    columns.reserve(needed.size());
+    for (const auto& name : needed) {
+        columns.push_back(ir::ColumnRef{.name = name});
+    }
+    return columns;
 }
 
 }  // namespace ibex::runtime::kernel

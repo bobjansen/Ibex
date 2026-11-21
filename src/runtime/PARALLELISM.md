@@ -399,11 +399,16 @@ chunk's row count, and the derived partition count remain runtime decisions.
 `gather_rows_parallel` in `sort.cpp`) reads the shared `parallel_min_rows`
 knob. `ChunkedOrderOperator` just buffers and calls `order_table`.
 
-**TopK / Head / Tail / FilterHead / FilterTail** — _serial by design; `explain`
-prints the reason._ Plan-built breaker operators with no fan-out point. TopK
+**TopK / Head / Tail / FilterHead / FilterTail** — plan-built breaker
+operators with no plan-level fan-out point; `explain` shows them serial. TopK
 (`ChunkedOrderedLimitOperator`) is a one-pass bounded heap, O(n·log k), not a
-sort; per-range heaps plus a merge would barely pay for small k, and Ibex
-already wins top-k ~12×. Do not fold it into Order.
+sort. Inside it, an ungrouped top-k still fans out behind
+`group_barrier_worker_count`: a chunk of at least `parallel_min_rows` rows is
+split into per-worker row ranges, and smaller chunks (a morsel pipeline's) are
+held up to `workers × parallel_min_rows` rows and ranked as one batch, a whole
+chunk per task. Each worker keeps its own heap; the heaps merge by (key,
+sequence), a strict order, so the result does not depend on the schedule. Do
+not fold it into Order.
 
 **Everything else** — sort, decode, semi/anti build and predicate, the
 materialized fallbacks, and data-dependent aggregate specialization gates. The

@@ -467,15 +467,18 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 break;
             }
 
-            const Table t = chunk_to_table(std::move(*chunk_res.value()));
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
             if (!empty_template_.has_value()) {
                 const std::vector<std::size_t> idx;
                 empty_template_ = gather_rows(t, idx);
             }
-            auto err = process_chunk(t);
+            auto err = accept_chunk(std::move(t));
             if (err.has_value()) {
                 return std::unexpected(std::move(*err));
             }
+        }
+        if (auto err = flush_pending(); err.has_value()) {
+            return std::unexpected(std::move(*err));
         }
 
         emitted_ = true;
@@ -486,6 +489,114 @@ class ChunkedOrderedLimitOperator final : public Operator {
     }
 
    private:
+    /// An ungrouped top-k fed many small chunks (a morsel pipeline emits
+    /// ~13k-row chunks) would rank every row serially: each chunk is below
+    /// the per-chunk fan-out floor. Such chunks are held, up to one row range
+    /// per worker, and ranked as one batch across workers. A chunk that is
+    /// large by itself goes straight to `process_chunk`, which splits it.
+    auto accept_chunk(Table chunk) -> std::optional<std::string> {
+        if (!batch_rows_.has_value()) {
+            const std::size_t workers =
+                group_by_->empty() && count_ > 0
+                    ? group_barrier_worker_count(exec_, std::numeric_limits<std::size_t>::max())
+                    : 0;
+            batch_rows_ = workers >= 2 ? workers * exec_.parallel_min_rows : 0;
+        }
+        if (*batch_rows_ == 0 || (pending_.empty() && chunk.rows() >= *batch_rows_)) {
+            return process_chunk(chunk);
+        }
+        pending_rows_ += chunk.rows();
+        pending_.push_back(std::move(chunk));
+        return pending_rows_ >= *batch_rows_ ? flush_pending() : std::nullopt;
+    }
+
+    /// Rank the held chunks: one heap per worker, which takes whole chunks
+    /// in turn, merged into this one. Sequences are the serial ones, so as
+    /// in the per-chunk split the winners do not depend on the schedule.
+    auto flush_pending() -> std::optional<std::string> {
+        std::vector<Table> pending = std::move(pending_);
+        pending_.clear();
+        pending_rows_ = 0;
+        if (pending.size() <= 1) {
+            return pending.empty() ? std::nullopt : process_chunk(pending.front());
+        }
+        struct Part {
+            const Table* chunk = nullptr;
+            std::vector<const ColumnEntry*> key_columns;
+            std::vector<KeyCol> cols;
+            std::size_t base = 0;
+        };
+        std::vector<Part> parts;
+        parts.reserve(pending.size());
+        std::size_t base = next_sequence_;
+        bool in_place = true;
+        for (const Table& chunk : pending) {
+            Part part{.chunk = &chunk, .key_columns = {}, .cols = {}, .base = base};
+            base += chunk.rows();
+            part.key_columns.reserve(keys_->size());
+            for (const auto& key : *keys_) {
+                const auto* column = chunk.find_entry(key.name);
+                if (column == nullptr) {
+                    return "order column not found: " + key.name +
+                           " (available: " + format_columns(chunk) + ")";
+                }
+                part.key_columns.push_back(column);
+            }
+            auto cols = order_key_cols(part.key_columns);
+            if (!cols.has_value()) {
+                in_place = false;
+                break;
+            }
+            part.cols = std::move(*cols);
+            parts.push_back(std::move(part));
+        }
+        if (!in_place) {
+            for (const Table& chunk : pending) {
+                if (auto err = process_chunk(chunk); err.has_value()) {
+                    return err;
+                }
+            }
+            return std::nullopt;
+        }
+        const std::size_t workers = std::min(parts.size(), process_worker_pool().size());
+        std::vector<std::vector<Entry>> local(workers);
+        std::atomic<std::size_t> next_part{0};
+        auto batch = process_worker_pool().submit(workers, [&](std::size_t r) {
+            std::vector<Entry>& heap = local[r];
+            for (std::size_t p = next_part.fetch_add(1); p < parts.size();
+                 p = next_part.fetch_add(1)) {
+                const Part& part = parts[p];
+                const std::size_t rows = part.chunk->rows();
+                for (std::size_t row = 0; row < rows; ++row) {
+                    const std::size_t sequence = part.base + row;
+                    if (heap.size() == count_ &&
+                        !row_preferred(part.cols, row, sequence, heap.front())) {
+                        continue;
+                    }
+                    Entry entry;
+                    entry.key.values.reserve(keys_->size());
+                    for (const auto* column : part.key_columns) {
+                        push_key_value(entry.key, *column, row);
+                    }
+                    entry.sequence = sequence;
+                    entry.row = snapshot_row(*part.chunk, row);
+                    push_entry(heap, std::move(entry));
+                }
+            }
+        });
+        batch.wait();
+        next_sequence_ = base;
+        for (auto& heap : local) {
+            for (auto& entry : heap) {
+                if (heap_.size() == count_ && !entry_preferred(entry, heap_.front())) {
+                    continue;
+                }
+                push_entry(heap_, std::move(entry));
+            }
+        }
+        return std::nullopt;
+    }
+
     struct RowSnapshot {
         std::vector<ScalarValue> values;
         std::vector<uint8_t> valid;
@@ -2037,6 +2148,11 @@ class ChunkedOrderedLimitOperator final : public Operator {
     std::size_t next_sequence_ = 0;
     std::vector<Entry> heap_;
     ExecutionContext exec_;
+    /// `accept_chunk`'s held small chunks and the row count that flushes
+    /// them; zero when batches are off (grouped, or no workers to fan to).
+    std::optional<std::size_t> batch_rows_;
+    std::vector<Table> pending_;
+    std::size_t pending_rows_ = 0;
     std::vector<Key> group_keys_;
     std::vector<GroupState> group_states_;
     KeyRowIndex group_index_;

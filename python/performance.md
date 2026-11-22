@@ -1,47 +1,49 @@
 # Python frontends: performance summary
 
 Where `IbexEngine` (Polars queries run on Ibex) and the independent `ibex`
-package stand against Polars 2.0.0. This replaces the per-change measurement
+package stand against Polars. The PDS-H section is measured against Polars
+2.1.0, which `IbexEngine` pins; the other sections were measured against
+Polars 2.0.0 and have not been re-run. This replaces the per-change measurement
 diaries (`pdsh-performance.md`, `join-performance.md`,
 `polars-engine-performance.md`, `q01-performance.md`,
 `grouped-mean-performance.md`); the investigations behind each number live in
 git history and the plans.
 
 **Method.** Local i7-13700, Linux, Release build, CPU frequency locked at
-3.2 GHz unless noted. The reference is Polars 2.0.0's streaming engine with
+3.2 GHz unless noted. The reference is Polars' streaming engine with
 Categorical keys, re-run in the same sitting. Eight threads are pinned with
-`taskset -c 0,2,4,6,8,10,12,14` (eight physical cores), one thread with
-`taskset -c 2`, and both engines get the same budget (`IBEX_CORES` and
+`taskset -c 0,2,4,6,8,10,12,14` (eight physical cores), one thread to one of
+those cores, and both engines get the same budget (`IBEX_CORES` and
 `POLARS_MAX_THREADS`). Every result is checked against Polars before timing.
 Raw samples stay on the measuring machine; they are not versioned.
 
 ## PDS-H through `IbexEngine` (scale 10)
 
 Upstream `polars-benchmark` query functions, unchanged, on upstream-generated
-Parquet. Ibex/Polars-streaming medians, 2026-11-07 afternoon (`075948ae`);
-all 22 answers match at both budgets.
+Parquet. Ibex/Polars-streaming medians against Polars 2.1.0, 2026-11-22
+(`b0070d41`), six interleaved rounds; all 22 answers match at both budgets.
 
 | Query | 8 threads | 1 thread | Query | 8 threads | 1 thread |
 |---|---:|---:|---|---:|---:|
-| Q01 | 1.09 | 0.96 | Q12 | 0.93 | 0.92 |
-| Q02 | 0.91 | 0.97 | Q13 | 0.70 | 0.66 |
-| Q03 | 0.99 | 0.92 | Q14 | 1.03 | 0.94 |
-| Q04 | 1.06 | 1.05 | Q15 | 0.96 | 0.93 |
-| Q05 | 1.04 | 0.97 | Q16 | 0.85 | 0.78 |
-| Q06 | 0.87 | 0.88 | Q17 | 0.89 | 1.00 |
-| Q07 | 1.03 | 0.91 | Q18 | 0.65 | 0.61 |
-| Q08 | 1.01 | 0.94 | Q19 | 1.05 | 1.09 |
-| Q09 | 1.08 | 0.91 | Q20 | 0.77 | 0.71 |
-| Q10 | 0.80 | 0.72 | Q21 | 1.04 | 0.79 |
-| Q11 | 0.92 | 0.88 | Q22 | 0.90 | 1.05 |
+| Q01 | 0.91 | 0.82 | Q12 | 0.87 | 0.86 |
+| Q02 | 0.95 | 0.97 | Q13 | 0.69 | 0.67 |
+| Q03 | 0.98 | 0.92 | Q14 | 1.07 | 0.95 |
+| Q04 | 0.99 | 1.17 | Q15 | 0.92 | 0.96 |
+| Q05 | 1.07 | 0.96 | Q16 | 1.11 | 0.97 |
+| Q06 | 0.87 | 0.88 | Q17 | 0.95 | 0.97 |
+| Q07 | 1.04 | 0.92 | Q18 | 0.63 | 0.55 |
+| Q08 | 1.00 | 0.95 | Q19 | 0.92 | 0.97 |
+| Q09 | 1.05 | 0.92 | Q20 | 0.78 | 0.75 |
+| Q10 | 0.80 | 0.71 | Q21 | 1.06 | 0.88 |
+| Q11 | 0.69 | 0.67 | Q22 | 0.96 | 1.05 |
 
-Geometric mean **0.93× at 8 threads** (faster on 13/22; summed medians 6.75 s
-against 7.16 s) and **0.88× at 1 thread** (19/22; 42.4 s against 49.0 s).
-A 2026-11-10 resweep reproduced both means (0.933 / 0.880) with one change:
-Q22 at one thread rose from 455 to 527 ms, in the adapter path only (native
-Q22 did not move), between `075948ae` and the 11-10 head; not yet bisected.
-The largest remaining gaps are Q01 and Q09 at 8 threads (memory-bound
-aggregation at eight workers) and Q19/Q04 at one.
+Geometric mean **0.91× at 8 threads** (faster on 15/22; summed medians 6.47 s
+against 7.02 s) and **0.87× at 1 thread** (20/22; 42.0 s against 49.0 s).
+Polars 2.1.0 is within about 3% of 2.0.0 on most queries; Q16 got 17–23%
+faster (now Ibex's largest 8-thread gap) and Q18 14% slower at 8 threads.
+The other gaps at 8 threads are Q05, Q14, Q21 and Q09 (1.05–1.07×), and Q04
+(1.17×) at one. Against Polars 2.0.0 on 2026-11-07 (`075948ae`) the means
+were 0.93× and 0.88×.
 
 For the native hand-written Ibex queries against Polars and DuckDB on AWS,
 see the [published benchmark snapshot](../benchmarking/aws/README.md#published-benchmark-snapshot).

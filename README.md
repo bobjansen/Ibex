@@ -605,12 +605,12 @@ See
 [resident-table measurements](python/performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl).
 The [PDS-H comparison](python/performance.md#pds-h-through-ibexengine-scale-10) runs all 22 unchanged
 upstream queries on SF10 through the engine; every result matches Polars,
-including row order and dtypes. Against Polars 2.0 streaming, re-run in the
-same sitting (2026-11-07, `075948ae`, i7-13700 at a fixed 3.2 GHz), the
-geometric mean of per-query time ratios is **0.93× at eight threads** and
-**0.88× at one thread** (below 1 means Ibex is faster). Ibex is faster on
-13/22 queries at eight threads and 19/22 at one; the largest remaining
-eight-thread gaps are Q01 (1.09×), Q09 (1.08×) and Q04 (1.06×).
+including row order and dtypes. Against Polars 2.1 streaming, re-run in the
+same sitting (2026-11-22, `b0070d41`, i7-13700 at a fixed 3.2 GHz), the
+geometric mean of per-query time ratios is **0.91× at eight threads** and
+**0.87× at one thread** (below 1 means Ibex is faster). Ibex is faster on
+15/22 queries at eight threads and 20/22 at one; the largest remaining
+eight-thread gaps are Q16 (1.11×), Q05 (1.07×) and Q14 (1.07×).
 
 ## Independent lazy Python API (experimental)
 

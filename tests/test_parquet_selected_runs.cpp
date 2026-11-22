@@ -56,8 +56,7 @@ auto runs_reader() -> std::unique_ptr<parquet::arrow::FileReader> {
     const auto table = arrow::Table::Make(
         arrow::schema({arrow::field("i", arrow::int64()), arrow::field("d", arrow::float64()),
                        arrow::field("s", arrow::utf8())}),
-        {ints.Finish().ValueOrDie(), doubles.Finish().ValueOrDie(),
-         labels.Finish().ValueOrDie()});
+        {ints.Finish().ValueOrDie(), doubles.Finish().ValueOrDie(), labels.Finish().ValueOrDie()});
     const auto output = arrow::io::BufferOutputStream::Create().ValueOrDie();
     REQUIRE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), output, kRowGroupRows,
                                        parquet::WriterProperties::Builder().build())
@@ -89,25 +88,23 @@ TEST_CASE("for_each_selected_run splits strictly increasing rows into consecutiv
     for (std::size_t row = 10; row < 210; ++row) {  // one run of 200: blocks, then a tail
         rows.push_back(row);
     }
-    rows.push_back(212);  // a run of 1
+    rows.push_back(212);                             // a run of 1
     for (std::size_t row = 300; row < 364; ++row) {  // exactly one block
         rows.push_back(row);
     }
     rows.push_back(365);
     rows.push_back(366);
     std::vector<std::pair<std::size_t, std::size_t>> runs;
-    for_each_selected_run(rows.data(), rows.data() + rows.size(), 10,
-                          [&](std::size_t offset, std::size_t count) {
-                              runs.emplace_back(offset, count);
-                          });
+    for_each_selected_run(
+        rows.data(), rows.data() + rows.size(), 10,
+        [&](std::size_t offset, std::size_t count) { runs.emplace_back(offset, count); });
     const std::vector<std::pair<std::size_t, std::size_t>> expected = {
         {0, 200}, {202, 1}, {290, 64}, {355, 2}};
     CHECK(runs == expected);
     runs.clear();
-    for_each_selected_run(rows.data(), rows.data(), 0,
-                          [&](std::size_t offset, std::size_t count) {
-                              runs.emplace_back(offset, count);
-                          });
+    for_each_selected_run(rows.data(), rows.data(), 0, [&](std::size_t offset, std::size_t count) {
+        runs.emplace_back(offset, count);
+    });
     CHECK(runs.empty());
 }
 
@@ -123,8 +120,8 @@ TEST_CASE("Parquet selected decode copies runs of rows across row groups",
 
     const auto ints = direct_column(*reader, *arrow::field("i", arrow::int64()), 0, &selection,
                                     groups, selection.size());
-    const auto doubles = direct_column(*reader, *arrow::field("d", arrow::float64()), 1,
-                                       &selection, groups, selection.size());
+    const auto doubles = direct_column(*reader, *arrow::field("d", arrow::float64()), 1, &selection,
+                                       groups, selection.size());
     const auto labels =
         direct_column(*reader, *arrow::field("s", arrow::dictionary(arrow::int32(), arrow::utf8())),
                       2, &selection, groups, selection.size());

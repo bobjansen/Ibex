@@ -3915,10 +3915,10 @@ TEST_CASE("ReplSession: a chunk sink receives the last statement's result as it 
     }
     SECTION("earlier statements run as usual") {
         Received received;
-        const auto result = run(
-            "let a = units()[filter v <= 2]; let b = units()[filter v > 6];"
-            " a[update { w = v + 100 }];",
-            received);
+        const auto result =
+            run("let a = units()[filter v <= 2]; let b = units()[filter v > 6];"
+                " a[update { w = v + 100 }];",
+                received);
         CAPTURE(result.error);
         REQUIRE(result.ok);
         CHECK(received.rows() == std::vector<std::int64_t>{101, 102});
@@ -3943,10 +3943,10 @@ TEST_CASE("ReplSession: a chunk sink receives the last statement's result as it 
         // `head` of a function's table argument: the argument is planned on
         // its own, deeper than the statement, and must not reach the sink.
         Received received;
-        const auto result = run(
-            "fn top(t: DataFrame) -> DataFrame { t[head 2]; }"
-            " top(units()[update { w = v * 2 }]);",
-            received);
+        const auto result =
+            run("fn top(t: DataFrame) -> DataFrame { t[head 2]; }"
+                " top(units()[update { w = v * 2 }]);",
+                received);
         CAPTURE(result.error);
         REQUIRE(result.ok);
         CHECK(received.rows() == std::vector<std::int64_t>{2, 4});
@@ -3959,8 +3959,7 @@ TEST_CASE("ReplSession: a chunk sink receives the last statement's result as it 
             ++calls;
             return std::unexpected("disk full");
         };
-        const auto result =
-            session.execute("units()[update { w = v }];", std::move(options));
+        const auto result = session.execute("units()[update { w = v }];", std::move(options));
         CHECK_FALSE(result.ok);
         CHECK(result.error.find("disk full") != std::string::npos);
         CHECK(calls == 1);

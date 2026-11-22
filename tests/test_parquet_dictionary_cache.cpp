@@ -35,11 +35,11 @@ constexpr std::int64_t kRowGroupRows = 6;
 // Row groups of 6: the same three labels in three orders, then one with a new
 // label "d" and a null, then the first labels again.
 auto labels() -> std::vector<std::optional<std::string>> {
-    return {"a", "b", "c", "a", "b", "c",          //
-            "c", "a", "b", "b", "c", "a",          //
-            "b", "c", "a", "c", "a", "b",          //
+    return {"a", "b", "c",          "a", "b", "c",  //
+            "c", "a", "b",          "b", "c", "a",  //
+            "b", "c", "a",          "c", "a", "b",  //
             "d", "a", std::nullopt, "d", "c", "b",  //
-            "a", "a", "b", "c", "c", "b"};
+            "a", "a", "b",          "c", "c", "b"};
 }
 
 auto dictionary_reader() -> std::unique_ptr<parquet::arrow::FileReader> {

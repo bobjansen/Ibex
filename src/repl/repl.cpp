@@ -475,12 +475,14 @@ auto result_chunk_sink() -> ResultChunkSink& {
     return state;
 }
 
-[[nodiscard]] auto optimize_and_execute_plan(
-    ir::NodePtr plan, const runtime::TableRegistry& base_tables,
-    const std::set<std::string>& lazy_callees, const runtime::ExternRegistry& externs,
-    const runtime::ScalarRegistry& scalars, bool root_order_insensitive = false,
-    const LazyTableRegistry& bound_lazy_sources = {},
-    const runtime::TableChunkSink* chunk_sink = nullptr)
+[[nodiscard]] auto optimize_and_execute_plan(ir::NodePtr plan,
+                                             const runtime::TableRegistry& base_tables,
+                                             const std::set<std::string>& lazy_callees,
+                                             const runtime::ExternRegistry& externs,
+                                             const runtime::ScalarRegistry& scalars,
+                                             bool root_order_insensitive = false,
+                                             const LazyTableRegistry& bound_lazy_sources = {},
+                                             const runtime::TableChunkSink* chunk_sink = nullptr)
     -> std::expected<runtime::Table, std::string>;
 
 struct BoundCallArg {
@@ -5776,13 +5778,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     continue;
                 }
                 // A table expression binds its plan; it runs where it is read.
-                if (auto planned =
-                        try_bind_plan_let(
-                            let_stmt, tables, lazy_tables, scalars, columns, models, functions,
-                            compile_time_lists, extern_decls, externs,
-                            parser::table_reference_count(
-                                std::span<const parser::Stmt>(statements).subspan(stmt_index + 1),
-                                let_stmt.name))) {
+                if (auto planned = try_bind_plan_let(
+                        let_stmt, tables, lazy_tables, scalars, columns, models, functions,
+                        compile_time_lists, extern_decls, externs,
+                        parser::table_reference_count(
+                            std::span<const parser::Stmt>(statements).subspan(stmt_index + 1),
+                            let_stmt.name))) {
                     if (!*planned) {
                         ibex::formatting::print("error: {}\n", planned->error());
                         return false;
@@ -6469,8 +6470,8 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
         tables.insert_or_assign(name, std::move(table));
     }
     if (chunk_sink != nullptr) {
-        if (auto streamed =
-                runtime::interpret_chunks(*rewritten, tables, &scalars, &externs, exec, *chunk_sink);
+        if (auto streamed = runtime::interpret_chunks(*rewritten, tables, &scalars, &externs, exec,
+                                                      *chunk_sink);
             !streamed.has_value()) {
             return std::unexpected(std::move(streamed.error()));
         }

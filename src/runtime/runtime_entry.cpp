@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "aggregate_prefilter.hpp"
+#include "ibex/runtime/interrupt.hpp"
 #include "physical_plan.hpp"
 #include "scan_worker_sink_internal.hpp"
 

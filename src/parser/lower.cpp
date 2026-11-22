@@ -7420,8 +7420,7 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
     return lowered;
 }
 
-auto table_reference_count(std::span<const Stmt> statements, std::string_view name)
-    -> std::size_t {
+auto table_reference_count(std::span<const Stmt> statements, std::string_view name) -> std::size_t {
     TableRefCounts counts;
     for (const auto& stmt : statements) {
         if (const auto* let_stmt = std::get_if<LetStmt>(&stmt)) {

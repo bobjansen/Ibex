@@ -1680,6 +1680,10 @@ inline auto decode_string_column(parquet::arrow::FileReader& reader, int leaf_in
     return emitted;
 }
 
+}  // namespace
+
+// Outside the anonymous namespace: ParquetLazyReaderFactoryState, which has
+// external linkage, holds one (GCC's -Wsubobject-linkage).
 /// One scan's dictionary columns, each as the first unit to decode it found
 /// its labels, for the scan's later units to share.
 ///
@@ -1716,7 +1720,8 @@ class ParquetDictionaryCache {
         const std::lock_guard lock(mutex_);
         auto& entry = entries_[leaf_index];
         if (entry == nullptr) {
-            Entry built{.labels = labels, .index = {}, .shared = ibex::Column<ibex::Categorical>{labels}};
+            Entry built{
+                .labels = labels, .index = {}, .shared = ibex::Column<ibex::Categorical>{labels}};
             built.index.reserve(labels.size());
             for (std::size_t i = 0; i < labels.size(); ++i) {
                 built.index.emplace(labels[i], static_cast<std::int32_t>(i));
@@ -1730,6 +1735,8 @@ class ParquetDictionaryCache {
     mutable std::mutex mutex_;
     std::map<int, std::shared_ptr<const ParquetDictionaryCache::Entry>> entries_;
 };
+
+namespace {
 
 /// Decode a dictionary column's selected rows as codes over `dictionary`.
 ///

@@ -10,7 +10,6 @@
 // classes are fully private to this translation unit.
 
 #include <ibex/ir/column_name_map.hpp>
-#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>

@@ -37,6 +37,9 @@ namespace ibex::runtime {
 /// key with a validity bitmap through the dense code array (its nulls one
 /// extra cell). For tests: the generic path gives the same answer.
 [[nodiscard]] auto nullable_cat_key_chunks() -> std::atomic<std::uint64_t>&;
+/// Streamed batches a hash aggregate joined from two or more input chunks
+/// (`stream_batch_rows`). Test instrumentation, like the counter above.
+[[nodiscard]] auto aggregate_stream_batches() -> std::atomic<std::uint64_t>&;
 
 /// How many times, process-wide, the single-int serial loop gave up its
 /// deferred index (`int_index_deferred_`) and built the hash map. For tests:

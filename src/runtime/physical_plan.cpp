@@ -15,6 +15,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/join_threshold_policy.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
@@ -79,11 +80,12 @@ constexpr std::size_t kJoinMaxWorkers = 64;
 /// Groups never exceed input rows, so an input-estimate decline is safe there.
 constexpr std::size_t kAggMaxWorkers = 64;
 
-/// The exact cardinality of a registered table scan, or `None` when its input
-/// cardinality is altered or otherwise unavailable. Project, Rename, and a
-/// row-local Update preserve row count; a Filter or Join deliberately makes it
-/// unknowable at plan time.
-auto table_input_row_estimate(const ir::Node& root, const TableRegistry& registry) -> RowEstimate {
+/// The exact cardinality of a registered table scan, or of a lazy scan from its
+/// file's footer, or `None` when its input cardinality is altered or otherwise
+/// unavailable. Project, Rename, and a row-local Update preserve row count; a
+/// Filter or Join deliberately makes it unknowable at plan time.
+auto table_input_row_estimate(const ir::Node& root, const TableRegistry& registry,
+                              const DeferredScanRegistry* deferred = nullptr) -> RowEstimate {
     const ir::Node* cur = root.children().empty() ? nullptr : root.children().front().get();
     while (cur != nullptr &&
            (cur->kind() == ir::NodeKind::Project || cur->kind() == ir::NodeKind::Rename ||
@@ -94,11 +96,16 @@ auto table_input_row_estimate(const ir::Node& root, const TableRegistry& registr
         return {};
     }
     const auto& scan = ir::node_cast<ir::ScanNode>(*cur);
-    const auto it = registry.find(scan.source_name());
-    if (it == registry.end()) {
-        return {};
+    if (const auto it = registry.find(scan.source_name()); it != registry.end()) {
+        return {.rows = it->second.rows(), .source = RowEstimate::Source::TableExact};
     }
-    return {.rows = it->second.rows(), .source = RowEstimate::Source::TableExact};
+    if (deferred != nullptr) {
+        if (const auto it = deferred->find(scan.source_name());
+            it != deferred->end() && it->second.lazy != nullptr) {
+            return {.rows = it->second.lazy->rows(), .source = RowEstimate::Source::Footer};
+        }
+    }
+    return {};
 }
 
 auto runtime_column_type(const ColumnValue& column) -> ir::ColumnType {
@@ -596,7 +603,8 @@ auto deferred_source_schemas(const DeferredScanRegistry* deferred) -> ir::Source
 }
 
 auto plan_physical(const ir::Node& root, const TableRegistry& registry,
-                   const ExternRegistry* externs, const ir::SourceSchemas& source_schemas) -> Plan {
+                   const ExternRegistry* externs, const ir::SourceSchemas& source_schemas,
+                   const DeferredScanRegistry* deferred_scans) -> Plan {
     Plan plan;
     plan.root = &root;
     const ir::SourceSchemas schemas = planning_source_schemas(registry, source_schemas);
@@ -618,7 +626,8 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         plan.source_node = &root;
         plan.breaker_phases.push_back(
             {.name = "dedup",
-             .parallelism = distinct_dedup_parallelism(table_input_row_estimate(root, registry))});
+             .parallelism = distinct_dedup_parallelism(
+                 table_input_row_estimate(root, registry, deferred_scans))});
         return plan;
     }
     if (root.kind() == ir::NodeKind::Order) {
@@ -645,7 +654,8 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             // count is whole-table and has no hash fallback to describe.
             if (plan.aggregate.strategy == AggregateStrategy::StreamingSorted) {
                 plan.aggregate.columns = known_aggregate_column_mapping(aggregate, schemas);
-                const RowEstimate input_estimate = table_input_row_estimate(root, registry);
+                const RowEstimate input_estimate =
+                    table_input_row_estimate(root, registry, deferred_scans);
                 plan.hash_aggregate = HashAggregateNodes{
                     .discovery = {.source = aggregate.children().front().get(),
                                   .input = AggregateDataKind::InputChunks,

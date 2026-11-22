@@ -608,9 +608,12 @@ struct Plan {
 /// gates in its own words drifts: one did within the hour (two-key Int64 joins,
 /// `6de3956d`), and an equivalence probe written from the same reading agreed
 /// with the mistake.
+/// `deferred_scans`, when given, lets a lazy scan's footer row count stand in
+/// for a registered table's exact one in the breakers' input estimates.
 [[nodiscard]] auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                                  const ExternRegistry* externs,
-                                 const ir::SourceSchemas& source_schemas = {}) -> Plan;
+                                 const ir::SourceSchemas& source_schemas = {},
+                                 const DeferredScanRegistry* deferred_scans = nullptr) -> Plan;
 
 /// The schemas of an execution's deferred lazy sources, for `plan_physical`.
 /// Without them a lazy scan is an unknown schema to the planner, and any

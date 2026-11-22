@@ -26,6 +26,10 @@ struct AggregatePhasePolicy {
     std::size_t merge_groups_per_worker = 4096;
     std::size_t ordered_min_runs = 1U << 16U;
     std::size_t ordered_runs_per_worker = 8192;
+    /// A streamed input's chunks smaller than this are joined, up to it,
+    /// before Discovery; 0 keeps every chunk on its own. The same floor as
+    /// `owned_range_min_rows`: the many-group strategies start there.
+    std::size_t stream_batch_rows = 1U << 20U;
 
     [[nodiscard]] constexpr auto accumulation_floor() const noexcept -> std::size_t {
         const auto two_morsels =

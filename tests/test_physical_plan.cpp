@@ -41,6 +41,15 @@ namespace {
 
 using namespace ibex;
 
+/// Aggregates that see every input chunk on its own: no streamed batch joins
+/// them (`stream_batch_rows`), so a test's chunk transitions reach the
+/// aggregate as written.
+auto unbatched_aggregates() -> runtime::AggregatePhasePolicy {
+    runtime::AggregatePhasePolicy policy;
+    policy.stream_batch_rows = 0;
+    return policy;
+}
+
 auto require_ir(const char* source) -> ir::NodePtr {
     auto parsed = parser::parse(source);
     if (!parsed.has_value()) {
@@ -1567,6 +1576,54 @@ TEST_CASE("The plan describes a hash aggregate's structural fan-out policies",
         REQUIRE(text.find("input estimate 3 rows (table)") != std::string::npos);
     }
 
+    SECTION("a lazy scan gives the aggregate its footer row count") {
+        // A streamed Parquet scan is a deferred lazy source, not a registered
+        // table. Its footer's row count is the aggregate's input estimate,
+        // through row-preserving steps only, and only when the planner is
+        // handed the deferred sources.
+        runtime::Table schema;
+        schema.add_column("k", Column<std::int64_t>{});
+        schema.add_column("v", Column<double>{});
+        auto lazy = std::make_shared<runtime::LazyTable>(
+            std::move(schema), 4'000,
+            [](const std::vector<std::string>&,
+               const runtime::Selection*) -> std::expected<runtime::Table, std::string> {
+                return std::unexpected("planning only: nothing decodes");
+            });
+        runtime::DeferredScanRegistry deferred;
+        deferred.emplace("lazy", runtime::DeferredScan{.lazy = std::move(lazy),
+                                                       .conjuncts = {},
+                                                       .demand = {"k", "v"},
+                                                       .demand_all = false,
+                                                       .key_column = {},
+                                                       .filter = nullptr});
+        const runtime::TableRegistry registry;
+        const auto schemas = runtime::physical::deferred_source_schemas(&deferred);
+        const auto plan_of = [&](const char* source, const runtime::DeferredScanRegistry* scans) {
+            auto tree = require_ir(source);
+            auto plan = runtime::physical::plan_physical(*tree, registry, nullptr, schemas, scans);
+            return std::pair{std::move(tree), std::move(plan)};
+        };
+        const auto [tree, plan] = plan_of(
+            "lazy[update { w = v * 2.0 }][select { total = sum(w) }, by { k }];", &deferred);
+        REQUIRE(plan.hash_aggregate.has_value());
+        const auto& estimate = plan.hash_aggregate->discovery.parallelism.estimate;
+        REQUIRE(estimate.source == runtime::physical::RowEstimate::Source::Footer);
+        REQUIRE(estimate.rows == 4'000);
+        REQUIRE(runtime::physical::explain_physical(plan).find(
+                    "input estimate 4000 rows (footer)") != std::string::npos);
+        const auto [unknown_tree, without_scans] =
+            plan_of("lazy[select { total = sum(v) }, by { k }];", nullptr);
+        REQUIRE(without_scans.hash_aggregate.has_value());
+        REQUIRE(without_scans.hash_aggregate->discovery.parallelism.estimate.source ==
+                runtime::physical::RowEstimate::Source::None);
+        const auto [filtered_tree, filtered] =
+            plan_of("lazy[filter v > 1.0][select { total = sum(v) }, by { k }];", &deferred);
+        REQUIRE(filtered.hash_aggregate.has_value());
+        REQUIRE(filtered.hash_aggregate->discovery.parallelism.estimate.source ==
+                runtime::physical::RowEstimate::Source::None);
+    }
+
     SECTION("declared source schemas bind aggregate columns without executing the source") {
         auto tree = require_ir("ticks[select { total = sum(volume) }, by { symbol }];");
         const ir::SourceSchemas schemas{{
@@ -2159,6 +2216,7 @@ TEST_CASE("Streamed sorted keys accumulate across workers, bit-identical to one 
     runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext parallel;
     parallel.parallel_threads = 8;
+    parallel.aggregate_phase_policy = unbatched_aggregates();
     parallel.parallel_stats = &stats;
     const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
     const auto before = runtime::ascending_gid_accumulations().load();

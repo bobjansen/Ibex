@@ -1574,6 +1574,24 @@ class GroupKeyStore {
     std::vector<std::uint64_t> null_masks_;
 };
 
+/// Replays chunks already pulled from a stream, in order, for
+/// `HashAggregateState::gather_batch` to join.
+class HeldChunksOperator final : public Operator {
+   public:
+    explicit HeldChunksOperator(std::vector<Chunk> chunks) : chunks_(std::move(chunks)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (next_ == chunks_.size()) {
+            return std::optional<Chunk>{};
+        }
+        return std::optional<Chunk>{std::move(chunks_[next_++])};
+    }
+
+   private:
+    std::vector<Chunk> chunks_;
+    std::size_t next_ = 0;
+};
+
 class HashAggregateState final {
    public:
     /// `Cat` carries a Categorical's *code*, which the pair path may treat as
@@ -1660,7 +1678,8 @@ class HashAggregateState final {
     /// retained until `accumulate_discovery` consumes its transfer, so the
     /// ColumnEntry pointers in that value remain valid without copying data.
     auto next_discovery() -> std::expected<bool, std::string> {
-        if (input_consumed_) {
+        if (input_consumed_ || input_ends_after_batch_) {
+            input_consumed_ = true;
             return false;
         }
         if (active_chunk_.has_value()) {
@@ -1675,7 +1694,15 @@ class HashAggregateState final {
             input_consumed_ = true;
             return false;
         }
-        const Chunk& chunk = active_chunk_.emplace(std::move(*chunk_res.value()));
+        Chunk input = std::move(*chunk_res.value());
+        if (batches_small_chunks(input)) {
+            auto batch = gather_batch(std::move(input));
+            if (!batch.has_value()) {
+                return std::unexpected(std::move(batch.error()));
+            }
+            input = std::move(*batch);
+        }
+        const Chunk& chunk = active_chunk_.emplace(std::move(input));
         const ExecutionProfileScope scope(discovery_profile_, ProfilePhase::Next);
         if (scan_sink_ != nullptr) {
             worker_emission_ = scan_sink_->take_current();
@@ -1694,8 +1721,99 @@ class HashAggregateState final {
         return true;
     }
 
+    /// The rows the dense pair array's density is judged against: the chunk's,
+    /// or the whole input's when the plan knows it ahead (a registered table,
+    /// or a lazy scan's footer). The pair dense path starts on the first chunk
+    /// only, and a streamed scan's first chunk is a few row groups: a 245k-row
+    /// unit declined the 1.25M cells of `by { symbol, day }` over a 10M-row
+    /// file, for good, where the same rows in memory take them (Discovery 145
+    /// -> 72 ms on 8 cores). The single-int dense rule keeps the chunk's rows:
+    /// judged on the whole input it pre-empts the async hot path q18's shape
+    /// is built around, and that trade is unmeasured.
+    [[nodiscard]] auto density_rows(std::size_t rows) const -> std::size_t {
+        const auto& estimate = par_.discovery.estimate;
+        return estimate.confident() ? std::max(rows, estimate.rows) : rows;
+    }
+
+    /// Whether `chunk`, the next streamed input, is joined with the chunks
+    /// after it before Discovery sees it.
+    ///
+    /// Discovery and Accumulation decide their fan-out per chunk, and the
+    /// strategies for many groups only start at `owned_range_min_rows`: below
+    /// it, every per-worker partial would be larger than the chunk it covers.
+    /// A streamed scan hands over units far smaller than that (a Parquet unit
+    /// is a few row groups), so each chunk ran alone, Accumulation serially:
+    /// `by { symbol, day }` over a 10M-row file in 41 chunks took 395 ms on 8
+    /// cores against 67 ms in memory, where the same rows arrive as one chunk.
+    /// Held to that floor (`stream_batch_rows`), the batch takes the strategies
+    /// the floor admits -- once the groups found so far reach
+    /// `owned_range_min_groups`, the other half of the owned-range gate, and
+    /// their slots fill an owned range per worker. With fewer, a chunk's
+    /// serial reduction is cache-resident and keeps up with the scan; a batch
+    /// then only adds its join and a tail after the scan ends (PDS-H q15:
+    /// 100k groups, 1.6 MB of slots over a filtered lineitem, +6%). A batch holds its chunks until
+    /// it is reduced, so the input in memory is bounded by the batch rather than by one chunk.
+    ///
+    /// Not the first chunk: it settles whether scan workers build partials
+    /// for this operator, and while they do every chunk must arrive with its
+    /// own (`scan_sink_active_`). Nor once the first chunk committed to a
+    /// partition-owned mode (`owned_mode_`, `owned_async_pair_mode_`): those
+    /// reduce a stream chunk by chunk, overlapping each with the next, and
+    /// batching them cost PDS-H q18 12% and q15 6% at SF-10 on 8 cores. Nor a
+    /// serial run, which a join only copies.
+    [[nodiscard]] auto batches_small_chunks(const Chunk& chunk) const -> bool {
+        const std::size_t slot_bytes =
+            n_groups_ * ((n_aggs_ * sizeof(AggSlotCore)) + (scratch_stride_ * sizeof(double)));
+        return initialized_ && !chunk.columns.empty() && !owned_mode_ && !owned_async_pair_mode_ &&
+               n_groups_ >= phase_policy().owned_range_min_groups &&
+               slot_bytes >= par_.accumulation.worker_cap * kOwnedRangeBytes &&
+               chunk.rows() < phase_policy().stream_batch_rows &&
+               (scan_sink_ == nullptr || (scan_sink_decided_ && !scan_sink_active_)) &&
+               exec_ != nullptr && !on_worker_pool_thread() &&
+               par_.accumulation.decline == physical::FanOutDecline::None &&
+               par_.accumulation.worker_cap >= 2;
+    }
+
+    /// `first` and the chunks after it, joined until the batch reaches
+    /// `stream_batch_rows` or the input ends (which the next Discovery then
+    /// reports). Joined as `MaterializeOperator` joins a stream: one schema,
+    /// dictionaries unified, validity widened where a chunk carries nulls.
+    auto gather_batch(Chunk first) -> std::expected<Chunk, std::string> {
+        if (scan_sink_ != nullptr) {
+            // Decided inactive: no worker builds a partial for this operator,
+            // so none is owed per chunk.
+            scan_sink_->deactivate();
+        }
+        std::vector<Chunk> parts;
+        std::size_t rows = first.rows();
+        parts.push_back(std::move(first));
+        while (rows < phase_policy().stream_batch_rows) {
+            auto next = child_->next();
+            if (!next.has_value()) {
+                return std::unexpected(std::move(next.error()));
+            }
+            if (!next->has_value()) {
+                input_ends_after_batch_ = true;
+                break;
+            }
+            rows += (*next)->rows();
+            parts.push_back(std::move(**next));
+        }
+        if (parts.size() == 1) {
+            return std::move(parts.front());
+        }
+        aggregate_stream_batches().fetch_add(1, std::memory_order_relaxed);
+        auto joined =
+            MaterializeOperator(std::make_unique<HeldChunksOperator>(std::move(parts))).run();
+        if (!joined.has_value()) {
+            return std::unexpected(std::move(joined.error()));
+        }
+        return table_to_chunk(std::move(*joined));
+    }
+
     /// Consume the current Discovery output at the structural Accumulation
-    /// node, then release the input chunk before the source advances.
+    /// node, then release the input chunk (or batch, `gather_batch`) before
+    /// the source advances.
     auto accumulate_discovery() -> std::expected<void, std::string> {
         if (!active_chunk_.has_value()) {
             return std::unexpected("physical aggregate: Accumulation has no discovered chunk");
@@ -2715,6 +2833,9 @@ class HashAggregateState final {
     }
 
     static constexpr std::size_t kOwnedHotSlots = 4096;
+    /// Slots one owner holds in `try_accumulate_owned_ranges`, sized to sit in
+    /// a core's L2.
+    static constexpr std::size_t kOwnedRangeBytes = std::size_t{1} << 20;
     // Async hot-job grain and the pair first-chunk cutoff are supplied by
     // AggregateDiscoveryPolicy. The cutoff keeps large one-chunk pair inputs
     // on the radix strategy; streamed chunks can overlap owned work with input.
@@ -4374,7 +4495,7 @@ class HashAggregateState final {
         // than the data (the single-int path's rule).
         const std::uint64_t rows_per_cell =
             rows >= phase_policy().dense_gid_min_rows ? kIntDenseRowsPerCell : 4;
-        if (require_density && !pair_dense_active_ && cells * rows_per_cell > rows) {
+        if (require_density && !pair_dense_active_ && cells * rows_per_cell > density_rows(rows)) {
             return false;
         }
 
@@ -7485,8 +7606,6 @@ class HashAggregateState final {
                                      const std::vector<const ColumnEntry*>& agg_entries,
                                      std::size_t rows,
                                      const std::vector<std::uint8_t>* skip = nullptr) -> bool {
-        // Slots one owner holds, sized to sit in a core's L2.
-        constexpr std::size_t kRangeBytes = std::size_t{1} << 20;
         if (rows < phase_policy().owned_range_min_rows ||
             n_groups_ < phase_policy().owned_range_min_groups || exec_ == nullptr ||
             par_.accumulation.decline != physical::FanOutDecline::None ||
@@ -7505,8 +7624,8 @@ class HashAggregateState final {
         const std::size_t group_bytes =
             (n_aggs_ * sizeof(AggSlotCore)) + (scratch_stride_ * sizeof(double));
         // A power-of-two range, so a row's owner is a shift.
-        const unsigned shift = static_cast<unsigned>(
-            std::countr_zero(std::bit_floor(std::max<std::size_t>(1, kRangeBytes / group_bytes))));
+        const unsigned shift = static_cast<unsigned>(std::countr_zero(
+            std::bit_floor(std::max<std::size_t>(1, kOwnedRangeBytes / group_bytes))));
         const std::size_t n_ranges = ((n_groups_ - 1) >> shift) + 1;
         if (n_ranges < 2) {
             return false;
@@ -9841,6 +9960,8 @@ class HashAggregateState final {
     bool prefiltered_ = false;
     bool columns_bound_ = false;
     bool input_consumed_ = false;
+    /// `gather_batch` met the end of the input; the next Discovery reports it.
+    bool input_ends_after_batch_ = false;
     bool ordering_finalized_ = false;
     bool emitted_ = false;
     std::optional<Chunk> active_chunk_;
@@ -11077,6 +11198,11 @@ auto deferred_int_index_builds() -> std::atomic<std::uint64_t>& {
 auto nullable_cat_key_chunks() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};
     return count;
+}
+
+auto aggregate_stream_batches() -> std::atomic<std::uint64_t>& {
+    static std::atomic<std::uint64_t> batches{0};
+    return batches;
 }
 
 auto packed_nullable_key_chunks() -> std::atomic<std::uint64_t>& {

@@ -1051,7 +1051,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // executor below is also callable with an already-built plan, which makes
     // plan-edge mutation tests exercise the same consumer production uses.
     const physical::Plan plan = physical::plan_physical(
-        node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans));
+        node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans),
+        exec.deferred_scans);
     if (plan.migrated) {
         return build_operator_from_physical_plan(plan, node, registry, scalars, externs, exec,
                                                  model_out);
@@ -1226,7 +1227,8 @@ auto build_pipeline_source(const physical::Plan& pipeline, const TableRegistry& 
         return build_operator(input, registry, scalars, externs, exec, model_out);
     }
     const physical::Plan plan = physical::plan_physical(
-        node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans));
+        node, registry, externs, physical::deferred_source_schemas(exec.deferred_scans),
+        exec.deferred_scans);
     if (!plan.migrated || plan.root != &node || !plan.aggregate.describes) {
         return build_operator(input, registry, scalars, externs, exec, model_out);
     }

@@ -104,6 +104,29 @@ class VectorSource final : public runtime::Operator {
     std::size_t pos_ = 0;
 };
 
+/// Aggregates that see every input chunk on its own: no streamed batch joins
+/// them (`stream_batch_rows`), so a test's chunk transitions reach the
+/// aggregate as written.
+auto unbatched_aggregates() -> runtime::AggregatePhasePolicy {
+    runtime::AggregatePhasePolicy policy;
+    policy.stream_batch_rows = 0;
+    return policy;
+}
+
+auto run_extern_unbatched(const std::string& source, const runtime::ExternRegistry& externs)
+    -> runtime::Table {
+    auto program = parser::parse(source);
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+    const runtime::TableRegistry registry;
+    runtime::ExecutionContext exec;
+    exec.aggregate_phase_policy = unbatched_aggregates();
+    auto result = runtime::interpret(*ir.value(), registry, nullptr, &externs, nullptr, exec);
+    REQUIRE(result.has_value());
+    return std::move(*result);
+}
+
 auto run_extern(const std::string& source, const runtime::ExternRegistry& externs)
     -> runtime::Table {
     auto program = parser::parse(source);
@@ -1348,6 +1371,7 @@ TEST_CASE("chunked aggregate: a clustered sum's map-free merge equals serial, in
         runtime::ParallelPipelineStats stats;
         runtime::ExecutionContext parallel;
         parallel.parallel_threads = 8;
+        parallel.aggregate_phase_policy = unbatched_aggregates();
         parallel.parallel_min_rows = 0;
         parallel.parallel_stats = &stats;
         const auto s = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, serial);
@@ -1582,6 +1606,7 @@ TEST_CASE("chunked aggregate: an Int64 sum by two Int64 keys streams through the
     const ChunkGrainGuard guard{"70001"};
     runtime::ExecutionContext parallel;
     parallel.parallel_threads = 8;
+    parallel.aggregate_phase_policy = unbatched_aggregates();
     parallel.parallel_min_rows = 0;
     auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/8,
                                                                     /*report=*/false);
@@ -2037,6 +2062,139 @@ TEST_CASE("one-core aggregate: partitions discovery only for a mostly distinct k
                                   static_cast<std::int64_t>(i % 3)};
             },
             false);
+    }
+}
+
+TEST_CASE("a streamed aggregate joins small chunks into batches with the same answer",
+          "[runtime][chunked][aggregate][nulls]") {
+    // Small streamed chunks are joined into batches of `stream_batch_rows`
+    // before Discovery, once there are groups enough for the many-group
+    // strategies the batch admits. Every chunk here carries its own dictionary (labels in
+    // another order) and the value column gains nulls part way through, so
+    // the join unifies dictionaries and widens validity. Checked against a
+    // grouping computed here, in first-occurrence order, batched, unbatched
+    // and serially. Values are multiples of 0.5, so every sum is exact.
+    constexpr std::size_t kChunkRows = 5'000;
+    constexpr std::size_t kChunks = 41;
+    const std::vector<std::string> labels{"p", "q", "r", "s", "t", "u", "v"};
+    const auto label_at = [&](std::size_t row) { return labels[(row * 7919) % labels.size()]; };
+    // Nearly a group per row: batching starts only once the groups found
+    // fill an owned range per worker (8 MB of slots at 8 workers).
+    const auto day_at = [](std::size_t row) {
+        return static_cast<std::int64_t>((row * 104'729) % 200'003);
+    };
+    const auto v_null = [](std::size_t row) { return row >= 100'000 && row % 13 == 0; };
+    const auto v_at = [](std::size_t row) { return static_cast<double>(row % 41) * 0.5; };
+
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("trades", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        for (std::size_t part = 0; part < kChunks; ++part) {
+            // This chunk's dictionary: the labels rotated by its index.
+            std::vector<std::string> dictionary;
+            for (std::size_t i = 0; i < labels.size(); ++i) {
+                dictionary.push_back(labels[(i + part) % labels.size()]);
+            }
+            Column<Categorical>::codes_storage codes;
+            Column<std::int64_t> day;
+            Column<double> v;
+            runtime::ValidityBitmap v_valid;
+            v_valid.assign(kChunkRows, true);
+            bool any_null = false;
+            for (std::size_t r = 0; r < kChunkRows; ++r) {
+                const std::size_t row = (part * kChunkRows) + r;
+                const auto it = std::ranges::find(dictionary, label_at(row));
+                codes.push_back(
+                    static_cast<Column<Categorical>::code_type>(it - dictionary.begin()));
+                day.push_back(day_at(row));
+                v.push_back(v_null(row) ? 0.0 : v_at(row));
+                v_valid.set(r, !v_null(row));
+                any_null = any_null || v_null(row);
+            }
+            runtime::Chunk chunk;
+            const auto add = [&](std::string name, runtime::ColumnValue value,
+                                 std::optional<runtime::ValidityBitmap> validity) {
+                runtime::ColumnEntry entry;
+                entry.name = std::move(name);
+                entry.column = std::make_shared<runtime::ColumnValue>(std::move(value));
+                entry.validity = std::move(validity);
+                chunk.columns.push_back(std::move(entry));
+            };
+            add("c", Column<Categorical>(dictionary, std::move(codes)), std::nullopt);
+            add("day", std::move(day), std::nullopt);
+            add("v", std::move(v),
+                any_null ? std::optional<runtime::ValidityBitmap>{std::move(v_valid)}
+                         : std::nullopt);
+            chunks.push_back(std::move(chunk));
+        }
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    struct Sums {
+        double total = 0;
+        std::int64_t values = 0;
+        std::int64_t rows = 0;
+    };
+    using Key = std::pair<std::string, std::int64_t>;
+    std::vector<Key> order;
+    std::map<Key, Sums> sums;
+    for (std::size_t row = 0; row < kChunks * kChunkRows; ++row) {
+        const Key key{label_at(row), day_at(row)};
+        auto [it, inserted] = sums.try_emplace(key);
+        if (inserted) {
+            order.push_back(key);
+        }
+        ++it->second.rows;
+        if (!v_null(row)) {
+            it->second.total += v_at(row);
+            ++it->second.values;
+        }
+    }
+
+    auto program = parser::parse(
+        "extern fn trades() -> DataFrame from \"x.hpp\"; "
+        "trades()[select { total = sum(v), values = count(v), n = count() }, "
+        "by { c, day }];");
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+    for (const std::size_t batch_rows : {std::size_t{10'000}, std::size_t{0}}) {
+        for (const std::size_t threads : {std::size_t{8}, std::size_t{1}}) {
+            INFO("batch rows " << batch_rows << " threads " << threads);
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            runtime::AggregatePhasePolicy policy;
+            policy.stream_batch_rows = batch_rows;
+            exec.aggregate_phase_policy = policy;
+            const runtime::TableRegistry registry;
+            const auto batches_before = runtime::aggregate_stream_batches().load();
+            const auto out =
+                runtime::interpret(*ir.value(), registry, nullptr, &externs, nullptr, exec);
+            INFO((out.has_value() ? std::string{} : out.error()));
+            REQUIRE(out.has_value());
+            // Batches form only with workers to fan out to and a floor to fill.
+            const auto batches = runtime::aggregate_stream_batches().load() - batches_before;
+            CHECK((batches > 0) == (batch_rows != 0 && threads > 1));
+            REQUIRE(out->rows() == order.size());
+            const auto* c = out->find_entry("c");
+            REQUIRE(c != nullptr);
+            const auto& cats = std::get<Column<Categorical>>(*c->column);
+            const auto& days = std::get<Column<std::int64_t>>(*out->find("day"));
+            const auto& totals = std::get<Column<double>>(*out->find("total"));
+            const auto& values = std::get<Column<std::int64_t>>(*out->find("values"));
+            const auto& counts = std::get<Column<std::int64_t>>(*out->find("n"));
+            for (std::size_t g = 0; g < order.size(); ++g) {
+                INFO("group " << g);
+                REQUIRE(std::string(cats[g]) == order[g].first);
+                REQUIRE(days[g] == order[g].second);
+                const Sums& want = sums.at(order[g]);
+                REQUIRE(totals[g] == want.total);
+                REQUIRE(values[g] == want.values);
+                REQUIRE(counts[g] == want.rows);
+            }
+        }
     }
 }
 
@@ -2528,7 +2686,7 @@ TEST_CASE("chunked aggregate: a Categorical key's null group survives bitmap-fre
         return std::expected<runtime::OperatorPtr, std::string>{std::make_unique<GrowingSource>()};
     });
     const auto before = runtime::nullable_cat_key_chunks().load();
-    const auto result = run_extern(
+    const auto result = run_extern_unbatched(
         "extern fn cat_null_keys() -> DataFrame from \"x.hpp\"; "
         "cat_null_keys()[select { total = sum(q), n = count() }, by c];",
         externs);
@@ -2783,7 +2941,7 @@ TEST_CASE("chunked aggregate: multi-key Categorical null cells survive dictionar
         return std::expected<runtime::OperatorPtr, std::string>{std::make_unique<GrowingSource>()};
     });
     const auto before = runtime::nullable_cat_key_chunks().load();
-    const auto result = run_extern(
+    const auto result = run_extern_unbatched(
         "extern fn cat_pair_keys() -> DataFrame from \"x.hpp\"; "
         "cat_pair_keys()[select { total = sum(q), n = count() }, by { c, d }];",
         externs);
@@ -4873,6 +5031,7 @@ TEST_CASE("sparse nullable categorical pairs retain compact code keys across chu
         for (const std::size_t cores : {1U, 8U}) {
             runtime::ExecutionContext exec;
             exec.parallel_threads = cores;
+            exec.aggregate_phase_policy = unbatched_aggregates();
             const runtime::TableRegistry registry;
             const auto before = runtime::nullable_cat_key_chunks().load();
             const auto start = std::chrono::steady_clock::now();
@@ -5043,6 +5202,7 @@ TEST_CASE("wide and nullable categorical discovery keeps codes when its layout c
         for (const std::size_t cores : {1U, 8U}) {
             runtime::ExecutionContext exec;
             exec.parallel_threads = cores;
+            exec.aggregate_phase_policy = unbatched_aggregates();
             const runtime::TableRegistry registry;
             const auto seeds_before = runtime::late_partitioned_seeds().load();
             const auto nullable_before = runtime::nullable_cat_key_chunks().load();

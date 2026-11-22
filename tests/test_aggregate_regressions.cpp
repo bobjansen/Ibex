@@ -409,6 +409,9 @@ TEST_CASE("categorical first and last keep codes, and survive a dictionary chang
     runtime::physical::AggregateParallelism parallelism;
     parallelism.accumulation.worker_cap = workers;
     parallelism.phase_policy.accumulation_morsel_rows = 32;
+    // Each chunk alone, released before the next: the dictionary change
+    // happens inside the aggregate.
+    parallelism.phase_policy.stream_batch_rows = 0;
     auto out =
         runtime::MaterializeOperator(runtime::make_chunked_aggregate_operator(
                                          std::make_unique<AggregateChunks>(std::move(chunks), true),

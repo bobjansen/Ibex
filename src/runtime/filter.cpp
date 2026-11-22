@@ -456,6 +456,11 @@ auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, d
 
 // Frontend-selected NaN ordering. Dispatch the operator once, outside the
 // vector loop. Null propagation remains the same bitmap operation as IEEE.
+//
+// The terms combine with `|` and `&`, not `||` and `&&`: GCC kept the
+// short-circuit as a branch per row (a filter keeping half its rows
+// mispredicts every other one) and did not vectorize the loop. Clang made it
+// branch-free either way; the Linux wheels are built with GCC.
 template <ir::CompareOp Op, typename Left, typename Right>
 void nan_high_loop(const Left& left, const Right& right, uint8_t* out, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) {
@@ -463,18 +468,20 @@ void nan_high_loop(const Left& left, const Right& right, uint8_t* out, std::size
         const auto b = static_cast<double>(right(i));
         const bool an = std::isnan(a);
         const bool bn = std::isnan(b);
+        bool keep = false;
         if constexpr (Op == ir::CompareOp::Eq)
-            out[i] = (a == b) || (an && bn);
+            keep = (a == b) | (an & bn);
         if constexpr (Op == ir::CompareOp::Ne)
-            out[i] = (a != b) && (!an || !bn);
+            keep = (a != b) & !(an & bn);
         if constexpr (Op == ir::CompareOp::Lt)
-            out[i] = (a < b) || (!an && bn);
+            keep = (a < b) | (!an & bn);
         if constexpr (Op == ir::CompareOp::Le)
-            out[i] = (a <= b) || bn;
+            keep = (a <= b) | bn;
         if constexpr (Op == ir::CompareOp::Gt)
-            out[i] = (a > b) || (an && !bn);
+            keep = (a > b) | (an & !bn);
         if constexpr (Op == ir::CompareOp::Ge)
-            out[i] = (a >= b) || an;
+            keep = (a >= b) | an;
+        out[i] = static_cast<uint8_t>(keep);
     }
 }
 
@@ -560,9 +567,12 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t of
         const auto* integer = std::get_if<std::int64_t>(&lit);
         if (const auto* column = std::get_if<Column<double>>(&col); column && (d || integer)) {
             const double value = d ? *d : static_cast<double>(*integer);
+            // A pointer taken once: `operator[]` checks for adopted storage on
+            // every row, which GCC cannot hoist past the mask's byte stores.
+            const double* values = column->data() + off;
             nan_high_mask(
-                op, [&](std::size_t i) { return (*column)[off + i]; },
-                [&](std::size_t) { return value; }, mp, n);
+                op, [values](std::size_t i) { return values[i]; },
+                [value](std::size_t) { return value; }, mp, n);
             result.apply_validity(validity, off, n);
             return result;
         }
@@ -843,10 +853,17 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
         const auto* rd = std::get_if<Column<double>>(&rhs);
         const auto* li = std::get_if<Column<std::int64_t>>(&lhs);
         const auto* ri = std::get_if<Column<std::int64_t>>(&rhs);
+        // Double columns are read through a pointer taken once (see
+        // compare_col_scalar); an Int64 column may be compact Int32 storage.
+        const auto reader = [](const auto& column, std::size_t offset) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(column)>, Column<double>>) {
+                return [values = column.data() + offset](std::size_t i) { return values[i]; };
+            } else {
+                return [&column, offset](std::size_t i) { return column[offset + i]; };
+            }
+        };
         const auto fill = [&](const auto& left, const auto& right) {
-            nan_high_mask(
-                op, [&](std::size_t i) { return left[lhs_off + i]; },
-                [&](std::size_t i) { return right[rhs_off + i]; }, mp, n);
+            nan_high_mask(op, reader(left, lhs_off), reader(right, rhs_off), mp, n);
         };
         if (ld && rd)
             fill(*ld, *rd);

@@ -22086,6 +22086,73 @@ TEST_CASE("bound filters preserve NaN ordering and null validity", "[runtime][bo
     CHECK(result->rows() == 0);
 }
 
+TEST_CASE("NaN-ordered comparisons rank NaN highest and equal to itself, for every operator",
+          "[runtime][bound_filter]") {
+    // Every pair of {-1, 0, 1, NaN} against a scalar and against a second
+    // column, for each operator, compared with the order the policy defines.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<double> values = {-1.0, 0.0, 1.0, nan};
+    std::vector<double> left;
+    std::vector<double> right;
+    for (const double a : values) {
+        for (const double b : values) {
+            left.push_back(a);
+            right.push_back(b);
+        }
+    }
+    // NaN ranks above every number and equals NaN.
+    const auto rank = [](double x) { return std::isnan(x) ? 2.0 : (x < 0 ? -1.0 : x); };
+    const std::vector<std::pair<std::string, std::function<bool(double, double)>>> ops = {
+        {"eq", [&](double a, double b) { return rank(a) == rank(b); }},
+        {"ne", [&](double a, double b) { return rank(a) != rank(b); }},
+        {"lt", [&](double a, double b) { return rank(a) < rank(b); }},
+        {"le", [&](double a, double b) { return rank(a) <= rank(b); }},
+        {"gt", [&](double a, double b) { return rank(a) > rank(b); }},
+        {"ge", [&](double a, double b) { return rank(a) >= rank(b); }},
+    };
+    std::vector<std::int64_t> ids(left.size());
+    // NOLINTNEXTLINE(modernize-use-ranges): Apple libc++ does not provide ranges::iota.
+    std::iota(ids.begin(), ids.end(), 0);
+    runtime::Table table;
+    table.add_column("i", Column<std::int64_t>{ids});
+    table.add_column("a", Column<double>{left});
+    table.add_column("b", Column<double>{right});
+    runtime::TableRegistry tables;
+    tables.emplace("t", table);
+    for (const auto& [name, holds] : ops) {
+        for (const double scalar : {0.0, nan}) {
+            CAPTURE(name, scalar);
+            runtime::ScalarRegistry scalars;
+            scalars.emplace("s", scalar);
+            const std::string query = "t[filter __ibex_nan_high_" + name + "(a, ^s)];";
+            const auto plan = require_ir(query.c_str());
+            auto result = runtime::interpret(*plan, tables, &scalars);
+            REQUIRE(result);
+            std::vector<std::int64_t> expected;
+            for (std::size_t row = 0; row < left.size(); ++row) {
+                if (holds(left[row], scalar)) {
+                    expected.push_back(static_cast<std::int64_t>(row));
+                }
+            }
+            const auto& kept = std::get<Column<std::int64_t>>(*result->find("i"));
+            CHECK(std::vector<std::int64_t>(kept.begin(), kept.end()) == expected);
+        }
+        CAPTURE(name);
+        const std::string query = "t[filter __ibex_nan_high_" + name + "(a, b)];";
+        const auto plan = require_ir(query.c_str());
+        auto result = runtime::interpret(*plan, tables);
+        REQUIRE(result);
+        std::vector<std::int64_t> expected;
+        for (std::size_t row = 0; row < left.size(); ++row) {
+            if (holds(left[row], right[row])) {
+                expected.push_back(static_cast<std::int64_t>(row));
+            }
+        }
+        const auto& kept = std::get<Column<std::int64_t>>(*result->find("i"));
+        CHECK(std::vector<std::int64_t>(kept.begin(), kept.end()) == expected);
+    }
+}
+
 TEST_CASE("compact storage computes expressions and reductions in Int64",
           "[compact-int32][interpreter]") {
     runtime::Table input;

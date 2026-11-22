@@ -75,7 +75,7 @@ class FirstLastTests(unittest.TestCase):
         assert_frame_equal(computed.collect(engine=IbexEngine(), optimizations=flags),
                            computed.collect(optimizations=flags))
         query = frame.group_by("g", maintain_order=True).agg(selectors())
-        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
             query.collect(engine=IbexEngine())
             self.assertEqual(execute.call_count, 1)
 

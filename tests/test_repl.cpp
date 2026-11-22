@@ -3862,6 +3862,14 @@ TEST_CASE("ReplSession: a chunk sink receives the last statement's result as it 
         CHECK_FALSE(result.table.has_value());
         CHECK(result.tables.empty());
     }
+    SECTION("no rows: one empty chunk still carries the result's columns") {
+        Received received;
+        const auto result = run("units()[filter v > 99][update { w = v * 10 }];", received);
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        REQUIRE(received.chunks.size() == 1);
+        CHECK(received.chunks.front().empty());
+    }
     SECTION("earlier statements run as usual") {
         Received received;
         const auto result = run(

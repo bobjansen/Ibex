@@ -72,21 +72,7 @@ auto drain_operator_chunks(OperatorPtr op, const TableChunkSink& sink)
     // As for materialize_operator: a consumer takes every chunk, so batching
     // them for a breaker that is not there would only copy each row again.
     (void)pipeline_executor_detail::unbatch_pipeline_output(*op);
-    while (true) {
-        if (interrupt_requested()) {
-            return std::unexpected(interrupt_message());
-        }
-        auto next = op->next();
-        if (!next.has_value()) {
-            return std::unexpected(std::move(next.error()));
-        }
-        if (!next->has_value()) {
-            return {};
-        }
-        Chunk chunk = std::move(**next);
-        if (chunk.rows() == 0) {
-            continue;
-        }
+    const auto to_table = [](Chunk chunk) {
         Table table;
         table.columns = std::move(chunk.columns);
         for (std::size_t i = 0; i < table.columns.size(); ++i) {
@@ -96,7 +82,37 @@ auto drain_operator_chunks(OperatorPtr op, const TableChunkSink& sink)
         if (table.columns.empty()) {
             table.logical_rows = chunk.logical_rows;
         }
-        if (auto sent = sink(std::move(table)); !sent.has_value()) {
+        return table;
+    };
+    // Empty chunks are skipped, but the first is kept: if no rows come, it is
+    // sent at the end so the consumer still sees the result's columns, as
+    // materialize_operator's result keeps its first chunk's.
+    std::optional<Chunk> first_empty;
+    bool sent_any = false;
+    while (true) {
+        if (interrupt_requested()) {
+            return std::unexpected(interrupt_message());
+        }
+        auto next = op->next();
+        if (!next.has_value()) {
+            return std::unexpected(std::move(next.error()));
+        }
+        if (!next->has_value()) {
+            if (!sent_any && first_empty.has_value()) {
+                return sink(to_table(std::move(*first_empty)));
+            }
+            return {};
+        }
+        Chunk chunk = std::move(**next);
+        if (chunk.rows() == 0) {
+            if (!sent_any && !first_empty.has_value()) {
+                first_empty = std::move(chunk);
+            }
+            continue;
+        }
+        sent_any = true;
+        first_empty.reset();
+        if (auto sent = sink(to_table(std::move(chunk))); !sent.has_value()) {
             return sent;
         }
     }

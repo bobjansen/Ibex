@@ -111,13 +111,13 @@ class SliceTests(unittest.TestCase):
             self.equal(source[::-2])
             self.equal(source.slice(20, 1))
         query = pl.LazyFrame({"x": range(12)})[2::3]
-        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
             self.equal(query)
             self.assertEqual(execute.call_count, 2)  # one call for each optimization policy
         text = ibex.DataFrame({"x": [1, 2, 3]}).lazy()[2::3].explain()
         self.assertIn("seq()", text)
         self.assertIn("filter", text)
-        with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
             with self.assertRaises(NotImplementedError):
                 pl.LazyFrame({"x": range(5), "y": range(5)}).select(
                     pl.col("x").gather_every(2), pl.col("y")).collect(engine=IbexEngine())

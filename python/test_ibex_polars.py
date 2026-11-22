@@ -115,7 +115,7 @@ class EngineTests(unittest.TestCase):
         query = (supplier.join(revenue, on="key")
                  .filter(pl.col("total") == pl.col("total").max())
                  .with_columns(pl.col("total").round(2)).sort("key"))
-        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
             self.assertEqual(self.equal(query)["key"].to_list(), [1, 2])
             execute.assert_called_once()
 
@@ -899,7 +899,7 @@ class EngineTests(unittest.TestCase):
                 path = Path(directory) / f"{dtype}.parquet"
                 data.write_parquet(path)
                 for query in (data.lazy(), pl.scan_parquet(path)):
-                    with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+                    with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
                         with self.assertRaises(NotImplementedError):
                             query.collect(engine=self.engine)
                         execute.assert_not_called()
@@ -1254,6 +1254,44 @@ class EngineTests(unittest.TestCase):
             grouped.sink_parquet(ibex_path, engine=self.engine)
             assert_frame_equal(pl.read_parquet(ibex_path), grouped.collect(engine="streaming"))
 
+    def test_collect_keeps_the_streamed_chunks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            many = Path(directory) / "many.parquet"
+            self._sink_frame(200_000).write_parquet(many, row_group_size=25_000)
+            scan = pl.scan_parquet(many)
+            query = scan.filter(pl.col("day") > 20).with_columns(value=pl.col("price") * pl.col("day"))
+            label_counts = []
+            dictionary_codes = _engine._dictionary_codes
+
+            def counted(column, name):
+                labels, codes = dictionary_codes(column, name)
+                label_counts.append(labels.len())
+                return labels, codes
+
+            with patch.object(ibex_pyarrow, "execute_pipeline_stream",
+                              wraps=ibex_pyarrow.execute_pipeline_stream) as run, \
+                    patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as whole, \
+                    patch.object(_engine, "_dictionary_codes", side_effect=counted):
+                result = query.collect(engine=self.engine)
+                # The query ran once, and its chunks became the frame's
+                # chunks without being joined into one table first.
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(whole.call_count, 0)
+                self.assertGreater(result.n_chunks(), 1)
+                # Each row group's dictionary has the same labels: the codes
+                # are used as they are, over one copy of the labels.
+                self.assertTrue(label_counts)
+                self.assertTrue(all(count < 2 * 300 for count in label_counts), label_counts)
+                assert_frame_equal(result, query.collect(engine="streaming"))
+                # No rows: the first empty chunk carries the schema, so the
+                # query is not run again to find it.
+                empty = scan.filter(pl.col("day") > 1000).with_columns(value=pl.col("price") * pl.col("day"))
+                found = empty.collect(engine=self.engine)
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(whole.call_count, 0)
+                self.assertEqual(found.height, 0)
+                self.assertEqual(found.schema, empty.collect_schema())
+
     def test_dictionary_codes_shift_only_for_a_new_dictionary(self):
         same = pa.array(["a", "b", "c"])
         other = pa.array(["c", "a"])
@@ -1469,7 +1507,7 @@ class EngineTests(unittest.TestCase):
     def test_repeated_collection_reuses_input_but_executes_each_time(self):
         query = pl.DataFrame({"x": [1, 2]}).lazy().select(pl.sum("x"))
         with patch.object(ibex_pyarrow, "bind_table", wraps=ibex_pyarrow.bind_table) as bind:
-            with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+            with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
                 for _ in range(3):
                     self.assertEqual(query.collect(engine=self.engine).item(), 3)
                 self.assertEqual(bind.call_count, 1)
@@ -1576,7 +1614,7 @@ class EngineTests(unittest.TestCase):
             self.equal(frame.group_by("g", maintain_order=True).agg(expressions), options=flags)
             self.equal(frame.filter(pl.lit(False)).select(expressions), options=flags)
         query = frame.group_by("g", maintain_order=True).agg(expressions)
-        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
             query.collect(engine=self.engine)
             self.assertEqual(execute.call_count, 1)
         result = ibex.DataFrame({"x": [None, 2, 3]}).lazy().select(
@@ -1623,7 +1661,7 @@ class EngineTests(unittest.TestCase):
             query = frame.select(pl.col("x").eq_missing(2**32).alias("no"),
                                  pl.col("x").ne_missing(2**32).alias("yes"))
             self.assertIn("repeat", query.explain())
-            with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+            with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
                 result = self.equal(query)
                 self.assertEqual(execute.call_count, 1)
             self.assertEqual(result.to_dict(as_series=False),
@@ -1757,7 +1795,7 @@ class EngineTests(unittest.TestCase):
         import ibex
         data = {"g": [1, 1, 2], "v": [None, 3, 4]}
         query = pl.LazyFrame(data).unique(subset="g", keep="last", maintain_order=True)
-        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
             self.equal(query)
             self.assertEqual(execute.call_count, 1)
         result = ibex.DataFrame(data).lazy().unique(subset="g", keep="last", maintain_order=True).collect()

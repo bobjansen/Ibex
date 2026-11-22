@@ -134,7 +134,7 @@ class JoinTests(unittest.TestCase):
         right = pl.LazyFrame({"k": [1], "y": [4]})
         for query in (left.join(right, on="k", validate="1:1"),
                       left.join(right, left_on=pl.col("k") + 1, right_on="k")):
-            with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+            with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
                 with self.assertRaises(NotImplementedError):
                     query.collect(engine=IbexEngine(), optimizations=pl.QueryOptFlags.none())
                 execute.assert_not_called()
@@ -142,7 +142,7 @@ class JoinTests(unittest.TestCase):
     def test_shared_api_and_one_native_pipeline(self):
         data_left, data_right = {"k": [1, 2, 2], "x": [3, 4, 5]}, {"k": [2], "y": [6]}
         query = pl.LazyFrame(data_left).join(pl.LazyFrame(data_right), on="k", how="left", maintain_order="left_right")
-        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
             query.collect(engine=IbexEngine())
             self.assertEqual(execute.call_count, 1)
         actual = ibex.DataFrame(data_left).lazy().join(ibex.DataFrame(data_right).lazy(),

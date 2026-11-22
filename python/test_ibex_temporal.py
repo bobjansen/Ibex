@@ -84,7 +84,7 @@ class TemporalTests(unittest.TestCase):
     def test_nanosecond_timestamp_literal_bug_fails_explicitly(self):
         frame = pl.LazyFrame({"t": pl.Series([0, 1, 2], dtype=pl.Datetime("ns"))})
         query = frame.filter(pl.col("t") > pl.lit(1).cast(pl.Datetime("ns")))
-        with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
             with self.assertRaisesRegex(NotImplementedError, "exact Polars visitor"):
                 query.collect(engine=IbexEngine())
             execute.assert_not_called()
@@ -97,7 +97,7 @@ class TemporalTests(unittest.TestCase):
         for dtype in (pl.Datetime("us"), pl.Duration("ms")):
             for value in (-(2**63), 2**63 - 1):
                 frame = pl.LazyFrame({"x": pl.Series([value, None], dtype=dtype)})
-                with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+                with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
                     with self.assertRaisesRegex(NotImplementedError, "Int64 nanosecond range"):
                         frame.collect(engine=IbexEngine())
                     execute.assert_not_called()

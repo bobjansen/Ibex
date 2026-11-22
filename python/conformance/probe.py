@@ -47,12 +47,15 @@ class Probe:
             event.update(status="excluded", reason="collection mode outside harness scope")
         else:
             candidate_error = None
-            with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+            # A collect streams its result; either entry point is a native run.
+            with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute, \
+                    patch.object(ibex_pyarrow, "execute_pipeline_stream",
+                                 wraps=ibex_pyarrow.execute_pipeline_stream) as stream:
                 try:
                     candidate = self.original(frame, **(kwargs | {"engine": IbexEngine(cache_size=0)}))
                 except Exception as error:
                     candidate_error = error
-                event["native_calls"] = execute.call_count
+                event["native_calls"] = execute.call_count + stream.call_count
             if isinstance(candidate_error, NotImplementedError) and not event["native_calls"]:
                 event.update(status="unsupported", reason=str(candidate_error))
             elif reference_error is not None:

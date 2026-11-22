@@ -1414,10 +1414,39 @@ inline auto groups_have_no_nulls(const parquet::FileMetaData& metadata,
     return true;
 }
 
-template <typename DType, typename Emit>
+/// `emit_run(values, count)`, when given, takes runs of consecutive selected
+/// rows of a null-free group at once instead of one `emit` per row.
+template <typename DType, typename Emit, typename EmitRun = std::nullptr_t>
 inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_index,
                                    const ibex::runtime::Selection* selection,
-                                   const DirectDecodeGroups& groups, Emit&& emit) -> std::size_t;
+                                   const DirectDecodeGroups& groups, Emit&& emit,
+                                   EmitRun&& emit_run = nullptr) -> std::size_t;
+
+/// Calls `run(offset, count)` for each run of consecutive rows in the strictly
+/// increasing row indices [first, last), with offsets from `base`.
+///
+/// A filter that keeps most rows keeps them in long runs. Indices strictly
+/// increase, so 64 of them are consecutive exactly when the last is 63 past
+/// the first: one compare per 64 rows finds a run, which the caller then
+/// copies as a block instead of gathering it row by row.
+template <typename Run>
+inline void for_each_selected_run(const std::size_t* first, const std::size_t* last,
+                                  std::size_t base, Run&& run) {
+    constexpr std::ptrdiff_t kBlock = 64;
+    while (first != last) {
+        const std::size_t start = *first;
+        const std::size_t* end = first + 1;
+        while (last - end >= kBlock &&
+               end[kBlock - 1] == start + static_cast<std::size_t>(end - first + kBlock - 1)) {
+            end += kBlock;
+        }
+        while (end != last && *end == start + static_cast<std::size_t>(end - first)) {
+            ++end;
+        }
+        run(start - base, static_cast<std::size_t>(end - first));
+        first = end;
+    }
+}
 
 /// Rows a row-group range contributes: all of them, or the selected subset.
 inline auto decode_output_rows(const ibex::runtime::Selection* selection,
@@ -1452,9 +1481,21 @@ inline auto decode_numeric_into(parquet::arrow::FileReader& reader, int leaf_ind
     if (selection != nullptr || (optional && !groups_have_no_nulls(metadata, groups, leaf_index))) {
         std::size_t output_pos = 0;
         const auto emitted = decode_physical_column<DType>(
-            reader, leaf_index, selection, groups, [&](const Raw* value) {
+            reader, leaf_index, selection, groups,
+            [&](const Raw* value) {
                 validity.append(value != nullptr);
                 output_data[output_pos++] = value == nullptr ? Out{} : convert(*value);
+            },
+            [&](const Raw* run, std::size_t count) {
+                validity.append_valid(count);
+                if constexpr (SameLayout) {
+                    std::memcpy(output_data + output_pos, run, count * sizeof(Raw));
+                } else {
+                    for (std::size_t i = 0; i < count; ++i) {
+                        output_data[output_pos + i] = convert(run[i]);
+                    }
+                }
+                output_pos += count;
             });
         if (output_pos != output_rows || emitted != output_rows) {
             throw std::runtime_error("parquet::read: selected decoder emitted the wrong row count");
@@ -1678,10 +1719,12 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
         const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
         std::size_t selected_end = selected_pos;
         if (selection != nullptr) {
-            while (selected_end < selection->size() &&
-                   (*selection)[selected_end] < group_start + group_rows) {
-                ++selected_end;
-            }
+            // Binary search: walking the selection to the group's end read
+            // every selected row's index once more per decoded column.
+            selected_end = static_cast<std::size_t>(
+                std::lower_bound(selection->begin() + static_cast<std::ptrdiff_t>(selected_pos),
+                                 selection->end(), group_start + group_rows) -
+                selection->begin());
             if (selected_end == selected_pos) {
                 group_start += group_rows;
                 continue;
@@ -1795,15 +1838,22 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                 // filter does, instead of walking and testing every row.
                 const std::size_t batch_first = group_start + row;
                 const std::size_t batch_end = batch_first + static_cast<std::size_t>(levels_read);
-                std::size_t taken = 0;
-                for (; selected_pos < selected_end && (*selection)[selected_pos] < batch_end;
-                     ++selected_pos, ++taken) {
-                    const auto local = local_codes[(*selection)[selected_pos] - batch_first];
-                    if (local < 0 || static_cast<std::size_t>(local) >= local_to_global.size()) {
-                        throw std::runtime_error("parquet::read: invalid dictionary index");
-                    }
-                    codes.push_back(local_to_global[static_cast<std::size_t>(local)]);
-                }
+                const auto* first = selection->data() + selected_pos;
+                const auto* last =
+                    std::lower_bound(first, selection->data() + selected_end, batch_end);
+                const auto taken = static_cast<std::size_t>(last - first);
+                for_each_selected_run(
+                    first, last, batch_first, [&](std::size_t offset, std::size_t count) {
+                        for (std::size_t i = offset; i < offset + count; ++i) {
+                            const auto local = local_codes[i];
+                            if (local < 0 ||
+                                static_cast<std::size_t>(local) >= local_to_global.size()) {
+                                throw std::runtime_error("parquet::read: invalid dictionary index");
+                            }
+                            codes.push_back(local_to_global[static_cast<std::size_t>(local)]);
+                        }
+                    });
+                selected_pos += taken;
                 validity.append_valid(taken);
                 emitted += taken;
                 row += static_cast<std::size_t>(levels_read);
@@ -1922,10 +1972,11 @@ inline auto sparse_page_plan(parquet::ParquetFileReader& file, int group, int le
     return plan;
 }
 
-template <typename DType, typename Emit>
+template <typename DType, typename Emit, typename EmitRun>
 inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_index,
                                    const ibex::runtime::Selection* selection,
-                                   const DirectDecodeGroups& groups, Emit&& emit) -> std::size_t {
+                                   const DirectDecodeGroups& groups, Emit&& emit,
+                                   EmitRun&& emit_run) -> std::size_t {
     using Raw = typename DType::c_type;
 
     std::unique_ptr<Raw[]> values(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
@@ -1946,10 +1997,12 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
         const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
         std::size_t selected_end = selected_pos;
         if (selection != nullptr) {
-            while (selected_end < selection->size() &&
-                   (*selection)[selected_end] < group_start + group_rows) {
-                ++selected_end;
-            }
+            // Binary search: walking the selection to the group's end read
+            // every selected row's index once more per decoded column.
+            selected_end = static_cast<std::size_t>(
+                std::lower_bound(selection->begin() + static_cast<std::ptrdiff_t>(selected_pos),
+                                 selection->end(), group_start + group_rows) -
+                selection->begin());
             if (selected_end == selected_pos) {
                 group_start += group_rows;
                 continue;
@@ -2105,10 +2158,22 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                 }
                 const std::size_t batch_start = group_start + row;
                 const std::size_t batch_end = batch_start + static_cast<std::size_t>(levels_read);
-                while (selected_pos < selected_end && (*selection)[selected_pos] < batch_end) {
-                    emit(&values[(*selection)[selected_pos] - batch_start]);
-                    ++emitted;
-                    ++selected_pos;
+                if constexpr (!std::is_null_pointer_v<std::remove_cvref_t<EmitRun>>) {
+                    const auto* first = selection->data() + selected_pos;
+                    const auto* last =
+                        std::lower_bound(first, selection->data() + selected_end, batch_end);
+                    for_each_selected_run(first, last, batch_start,
+                                          [&](std::size_t offset, std::size_t count) {
+                                              emit_run(&values[offset], count);
+                                          });
+                    emitted += static_cast<std::size_t>(last - first);
+                    selected_pos += static_cast<std::size_t>(last - first);
+                } else {
+                    while (selected_pos < selected_end && (*selection)[selected_pos] < batch_end) {
+                        emit(&values[(*selection)[selected_pos] - batch_start]);
+                        ++emitted;
+                        ++selected_pos;
+                    }
                 }
                 row += static_cast<std::size_t>(levels_read);
             }

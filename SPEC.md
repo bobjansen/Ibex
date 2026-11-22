@@ -118,7 +118,10 @@ In interactive mode:
   `:schema` answers without running it), and inlined into every statement that
   reads the name, so `let t = h[filter ...]; t[select ...]` is planned and
   streamed as one query. Each read runs it again; nothing is kept between
-  statements. The plan reads what its names meant at the `let`: rebinding a
+  statements. One exception, as a script shares it: when the rest of the same
+  input (one `execute`, one pasted block) reads the name at least twice and
+  the plan joins, aggregates, sorts or otherwise does work that re-running
+  would repeat, it is evaluated once, at the `let`. The plan reads what its names meant at the `let`: rebinding a
   table it reads, or a scalar it reads as `^name`, later does not change it.
   Evaluated at the `let` instead, as a table: a value drawing on `rand_*` or
   calling an extern or a user `fn` in a table position (the effect may be the
@@ -4350,7 +4353,8 @@ Evaluates its argument and holds the result as a materialized table. As a value
 it is its argument unchanged; what it changes is a `let`. A plain `let` of a
 table expression is a plan: each reader of the name has it inlined (in a
 script it is shared when it is read more than once and costly to repeat; in
-the REPL, which cannot see later statements, every read runs it, Section 1.5),
+the REPL, which cannot see later statements, every read runs it, unless the
+same input reads it twice more, Section 1.5),
 and a `let` of a bare lazy source (`let h = parquet::read(p);`) reads nothing
 until a statement reads `h`, then re-reads what that statement needs. `let t =
 collect(e);` instead evaluates `e` once, where the `let` is, and every reader

@@ -216,6 +216,17 @@ using FunctionLookup = std::function<const FunctionDecl*(std::string_view)>;
 /// Lower a single expression with an external context.
 [[nodiscard]] auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult;
 
+/// How many times `statements` read `name` where a table goes (a block's base,
+/// a join side), counted as `lower_script` counts them to share a `let`.
+[[nodiscard]] auto table_reference_count(std::span<const Stmt> statements, std::string_view name)
+    -> std::size_t;
+
+/// Whether running `plan` once per reader repeats real work: a join,
+/// aggregation, sort, update or another breaker. `lower_script` shares a `let`
+/// read twice only then; a scan/filter/project chain is cheaper re-run, each
+/// reader keeping its own pushdown.
+[[nodiscard]] auto plan_is_expensive(const ir::Node& plan) -> bool;
+
 /// Lower a value (row or scalar) expression -- an operand of `filter` or a
 /// field of `select` -- to an `ir::Expr`. A bare name becomes a `ColumnRef`,
 /// which the runtime resolves against the input's columns and then its scalar

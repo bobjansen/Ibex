@@ -1226,6 +1226,49 @@ TEST_CASE("REPL let of a table expression binds a plan, run where it is read", "
     CHECK_FALSE(session.execute("t;").ok);
 }
 
+TEST_CASE("REPL batch runs an expensive let it reads twice once", "[repl][lazy]") {
+    ibex::runtime::ExternRegistry registry;
+    std::vector<std::vector<std::string>> decode_calls;
+    register_recording_lazy_source(registry, decode_calls);
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session
+                .execute("extern fn read_fake() -> DataFrame from \"fake.hpp\";\n"
+                         "let input = read_fake();")
+                .ok);
+
+    SECTION("an aggregate read twice runs once, as a script shares it") {
+        decode_calls.clear();
+        const auto result = session.execute(
+            "let g = input[select { s = sum(b) }, by { a }];\n"
+            "let k = g[select { key = a }];\n"
+            "(g join k on { a = key })[select { n = count() }];");
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        CHECK(session_int(result, "n") == 3);
+        CHECK(decode_calls.size() == 1);
+        CHECK_FALSE(environment_entry(session, "g").plan);
+    }
+    SECTION("a filter read twice stays a plan, each read keeping its pushdown") {
+        const auto result = session.execute(
+            "let f = input[filter a > 1];\n"
+            "let k = f[select { key = a }];\n"
+            "(f join k on { a = key })[select { n = count() }];");
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        CHECK(session_int(result, "n") == 2);
+        CHECK(environment_entry(session, "f").plan);
+    }
+    SECTION("an aggregate read once stays a plan") {
+        const auto result = session.execute(
+            "let g = input[select { s = sum(b) }, by { a }];\n"
+            "g[select { n = count() }];");
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        CHECK(session_int(result, "n") == 3);
+        CHECK(environment_entry(session, "g").plan);
+    }
+}
+
 TEST_CASE("REPL plan binding reads what its names meant at the let", "[repl][lazy]") {
     ibex::runtime::ExternRegistry registry;
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);

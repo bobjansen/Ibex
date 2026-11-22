@@ -86,6 +86,7 @@
 #include <optional>
 #include <robin_hood.h>
 #include <set>
+#include <span>
 #include <streambuf>
 #include <string>
 #include <system_error>
@@ -4035,6 +4036,12 @@ auto reads_bare_binding(const ir::Node& node, const ir::SourceSchemas& sources,
 /// one a source is asked for (`ir::required_columns`) but does not have.
 /// `^name` is bound now, as a literal.
 ///
+/// Also evaluated now: a plan its batch reads at least twice more
+/// (`later_reads`) that is expensive to re-run (`parser::plan_is_expensive`),
+/// as a script shares it. Each read of a plan binding runs it again, so a
+/// batch that joins a shared join back onto itself -- PDS-H q17's
+/// `_ibex_cache_0`, as IbexEngine emits it -- ran that join twice.
+///
 /// The tables and sources the plan scans are captured under `__let` aliases,
 /// so rebinding their names later leaves the plan reading what it read here.
 auto try_bind_plan_let(const parser::LetStmt& let, runtime::TableRegistry& tables,
@@ -4043,7 +4050,7 @@ auto try_bind_plan_let(const parser::LetStmt& let, runtime::TableRegistry& table
                        const FunctionRegistry& functions,
                        CompileTimeListRegistry& compile_time_lists,
                        const ExternDeclRegistry& extern_decls,
-                       const runtime::ExternRegistry& externs)
+                       const runtime::ExternRegistry& externs, std::size_t later_reads)
     -> std::optional<std::expected<void, std::string>> {
     parser::Expr& value = *let.value;
     if (!std::holds_alternative<parser::BlockExpr>(value.node) &&
@@ -4085,6 +4092,9 @@ auto try_bind_plan_let(const parser::LetStmt& let, runtime::TableRegistry& table
     }
     auto schema = ir::infer_schema(*plan, context.source_schemas);
     if (!schema.is_known()) {
+        return std::nullopt;
+    }
+    if (later_reads >= 2 && parser::plan_is_expensive(*plan)) {
         return std::nullopt;
     }
 
@@ -5767,8 +5777,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 }
                 // A table expression binds its plan; it runs where it is read.
                 if (auto planned =
-                        try_bind_plan_let(let_stmt, tables, lazy_tables, scalars, columns, models,
-                                          functions, compile_time_lists, extern_decls, externs)) {
+                        try_bind_plan_let(
+                            let_stmt, tables, lazy_tables, scalars, columns, models, functions,
+                            compile_time_lists, extern_decls, externs,
+                            parser::table_reference_count(
+                                std::span<const parser::Stmt>(statements).subspan(stmt_index + 1),
+                                let_stmt.name))) {
                     if (!*planned) {
                         ibex::formatting::print("error: {}\n", planned->error());
                         return false;

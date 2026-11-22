@@ -7420,4 +7420,24 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
     return lowered;
 }
 
+auto table_reference_count(std::span<const Stmt> statements, std::string_view name)
+    -> std::size_t {
+    TableRefCounts counts;
+    for (const auto& stmt : statements) {
+        if (const auto* let_stmt = std::get_if<LetStmt>(&stmt)) {
+            count_table_refs(*let_stmt->value, /*table_position=*/true, counts);
+        } else if (const auto* expr_stmt = std::get_if<ExprStmt>(&stmt)) {
+            count_table_refs(*expr_stmt->expr, /*table_position=*/true, counts);
+        } else if (const auto* tuple_let = std::get_if<TupleLetStmt>(&stmt)) {
+            count_table_refs(*tuple_let->value, /*table_position=*/true, counts);
+        }
+    }
+    const auto found = counts.find(std::string(name));
+    return found == counts.end() ? 0 : found->second;
+}
+
+auto plan_is_expensive(const ir::Node& plan) -> bool {
+    return contains_expensive_node(plan);
+}
+
 }  // namespace ibex::parser

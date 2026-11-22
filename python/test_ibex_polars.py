@@ -1206,10 +1206,33 @@ class EngineTests(unittest.TestCase):
             query = self._sink_source(directory)
             ibex_path = Path(directory) / "ibex.parquet"
             polars_path = Path(directory) / "polars.parquet"
-            with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as run:
-                self.assertIsNone(query.sink_parquet(ibex_path, engine=self.engine))
-            # The query ran in Ibex; Polars only wrote its result.
+            # Several row groups, so the scan streams in more than one unit.
+            many = Path(directory) / "many.parquet"
+            self._sink_frame(200_000).write_parquet(many, row_group_size=25_000)
+            streamed = (pl.scan_parquet(many).filter(pl.col("day") > 20)
+                        .with_columns(value=pl.col("price") * pl.col("day")))
+            batches = []
+
+            def stream(source, on_batch, **kwargs):
+                def counted(batch):
+                    batches.append(batch.num_rows)
+                    on_batch(batch)
+                return execute_stream(source, counted, **kwargs)
+
+            execute_stream = ibex_pyarrow.execute_pipeline_stream
+            with patch.object(ibex_pyarrow, "execute_pipeline_stream", side_effect=stream) as run, \
+                    patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as whole:
+                self.assertIsNone(streamed.sink_parquet(ibex_path, engine=self.engine))
+            # The query ran in Ibex, once, and its result reached Polars' writer
+            # in several batches as it ran; Polars only wrote it.
             self.assertEqual(run.call_count, 1)
+            self.assertEqual(whole.call_count, 0)
+            self.assertGreater(len(batches), 1)
+            streamed.sink_parquet(polars_path, engine="streaming")
+            assert_frame_equal(pl.read_parquet(ibex_path), pl.read_parquet(polars_path))
+            self.assertTrue(pq.read_schema(ibex_path).equals(pq.read_schema(polars_path),
+                                                             check_metadata=True))
+            self.assertIsNone(query.sink_parquet(ibex_path, engine=self.engine))
             query.sink_parquet(polars_path, engine="streaming")
             assert_frame_equal(pl.read_parquet(ibex_path), pl.read_parquet(polars_path))
             # The same file schema, Polars' own metadata included.
@@ -1245,6 +1268,25 @@ class EngineTests(unittest.TestCase):
             query.sink_parquet(buffer, engine=self.engine)
             buffer.seek(0)
             assert_frame_equal(pl.read_parquet(buffer), query.collect(engine="streaming"))
+
+    def test_sink_parquet_of_an_empty_result_and_after_a_failed_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            query = self._sink_source(directory)
+            ibex_path = Path(directory) / "ibex.parquet"
+            polars_path = Path(directory) / "polars.parquet"
+            empty = query.filter(pl.col("day") > 10_000)
+            empty.sink_parquet(ibex_path, engine=self.engine)
+            empty.sink_parquet(polars_path, engine="streaming")
+            assert_frame_equal(pl.read_parquet(ibex_path), pl.read_parquet(polars_path))
+            self.assertTrue(pq.read_schema(ibex_path).equals(pq.read_schema(polars_path),
+                                                             check_metadata=True))
+            # The writer fails while Ibex is still producing: the error is
+            # Polars', the query stops, and the engine runs the next one.
+            with self.assertRaises(Exception):
+                query.sink_parquet(Path(directory) / "missing" / "out.parquet", engine=self.engine,
+                                   mkdir=False)
+            query.sink_parquet(ibex_path, engine=self.engine)
+            assert_frame_equal(pl.read_parquet(ibex_path), query.collect(engine="streaming"))
 
     def test_lazy_sink_reports_the_eager_call(self):
         with tempfile.TemporaryDirectory() as directory:

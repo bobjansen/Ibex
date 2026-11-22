@@ -1440,6 +1440,103 @@ PyObject* py_execute_pipeline(PyObject* /*self*/, PyObject* args, PyObject* kwar
     }
 }
 
+/// `execute_pipeline` that hands its result to `on_batch` as it is produced,
+/// one pyarrow.Table per chunk, instead of returning it: a consumer such as a
+/// Parquet writer then works while the query still runs. The query runs with
+/// the GIL released; `on_batch` is called with it held, on the calling thread.
+/// An exception `on_batch` raises stops the query and propagates.
+PyObject* py_execute_pipeline_stream(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
+    static const char* kwlist[] = {"source", "on_batch", "tables", "scalars", nullptr};
+    const char* source = nullptr;
+    PyObject* on_batch = nullptr;
+    PyObject* tables_obj = Py_None;
+    PyObject* scalars_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "sO|OO", const_cast<char**>(kwlist), &source,
+                                     &on_batch, &tables_obj, &scalars_obj)) {
+        return nullptr;
+    }
+    if (PyCallable_Check(on_batch) == 0) {
+        return set_python_error_from_message(PyExc_TypeError, "on_batch must be callable");
+    }
+    auto tables = build_table_registry_from_python(tables_obj);
+    if (!tables.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, tables.error());
+    }
+    auto scalars = build_scalar_registry_from_python(scalars_obj);
+    if (!scalars.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, scalars.error());
+    }
+    // The exception `on_batch` raised, kept to re-raise once the query stops.
+    // PyErr_Fetch, not PyErr_GetRaisedException: the wheel supports 3.11.
+    struct Raised {
+        PyObject* type = nullptr;
+        PyObject* value = nullptr;
+        PyObject* traceback = nullptr;
+    } raised;
+    const auto drop_raised = [&raised] {
+        Py_XDECREF(raised.type);
+        Py_XDECREF(raised.value);
+        Py_XDECREF(raised.traceback);
+    };
+    ibex::repl::ExecutionResult result;
+    try {
+        ibex::runtime::ExternRegistry externs;
+        register_first_party_backends(externs);
+        ibex::repl::ReplConfig config;
+        config.persistent_history = false;
+        ibex::repl::ReplSession session(config, externs);
+        ibex::repl::ReplSession::ExecuteOptions options;
+        options.tables = std::move(*tables);
+        options.scalars = std::move(*scalars);
+        options.render = false;
+        options.plan_table_expressions = true;
+        options.chunk_sink =
+            [on_batch, &raised](ibex::runtime::Table chunk) -> std::expected<void, std::string> {
+            const PyGILState_STATE gil = PyGILState_Ensure();
+            PyObject* batch = export_result_table_or_none(
+                std::make_shared<const ibex::runtime::Table>(std::move(chunk)));
+            PyObject* returned = batch == nullptr ? nullptr : PyObject_CallOneArg(on_batch, batch);
+            Py_XDECREF(batch);
+            const bool ok = returned != nullptr;
+            Py_XDECREF(returned);
+            if (!ok && raised.type == nullptr) {
+                PyErr_Fetch(&raised.type, &raised.value, &raised.traceback);
+            }
+            PyErr_Clear();
+            PyGILState_Release(gil);
+            if (!ok) {
+                return std::unexpected("on_batch raised");
+            }
+            return {};
+        };
+        // The query must not throw past Py_END_ALLOW_THREADS: the handler
+        // below would then run without the GIL.
+        std::optional<std::string> thrown;
+        Py_BEGIN_ALLOW_THREADS;
+        try {
+            result = session.execute(source, std::move(options));
+        } catch (const std::exception& error) {
+            thrown = error.what();
+        }
+        Py_END_ALLOW_THREADS;
+        if (thrown.has_value()) {
+            drop_raised();
+            return set_python_error_from_message(PyExc_RuntimeError, *thrown);
+        }
+    } catch (const std::exception& error) {
+        drop_raised();
+        return set_python_error_from_message(PyExc_RuntimeError, error.what());
+    }
+    if (raised.type != nullptr) {
+        PyErr_Restore(raised.type, raised.value, raised.traceback);
+        return nullptr;
+    }
+    if (!result.ok) {
+        return set_python_error_from_message(PyExc_RuntimeError, result.error);
+    }
+    Py_RETURN_NONE;
+}
+
 /// Sets one bit per row number in a zeroed bitmap of `height` rows. Returns
 /// false when the numbers are not strictly increasing within [0, height).
 /// Workers own disjoint index ranges; the numbers they name may share a
@@ -1546,6 +1643,10 @@ PyMethodDef kModuleMethods[] = {
      PyDoc_STR("Prepare and retain an immutable native input once for repeated pipelines.")},
     {"execute_pipeline", _PyCFunction_CAST(py_execute_pipeline), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Execute a complete pipeline through the shared Ibex planner, returning Arrow.")},
+    {"execute_pipeline_stream", _PyCFunction_CAST(py_execute_pipeline_stream),
+     METH_VARARGS | METH_KEYWORDS,
+     PyDoc_STR("Execute a complete pipeline, passing each result chunk to on_batch as a "
+               "pyarrow.Table while it runs.")},
     {"create_session", _PyCFunction_CAST(py_create_session), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Create a persistent Ibex session for repeated evaluation.")},
     {"reset_session", _PyCFunction_CAST(py_reset_session), METH_VARARGS | METH_KEYWORDS,

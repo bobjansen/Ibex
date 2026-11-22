@@ -4,6 +4,7 @@
 
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+import queue
 import threading
 import weakref
 
@@ -18,7 +19,24 @@ from ._temporal import is_temporal, storage_type
 
 check_version()
 
+from polars.io.plugins import register_io_source
 from polars.lazyframe.query_result import SingleNodeQueryResult
+
+
+def _one_dictionary(column):
+    """A dictionary column as one chunk over one dictionary.
+
+    A streamed result's chunks each carry the dictionary of the scan unit they
+    came from, and converting a chunk costs a few Polars calls of fixed cost:
+    41 chunks of two such columns took 25 ms against 2 ms for one. Unifying
+    the dictionaries remaps the codes once; the labels are few.
+    """
+    if column.num_chunks <= 1:
+        return column
+    unified = column.unify_dictionaries()
+    dictionary = unified.chunk(0).dictionary
+    indices = pa.concat_arrays([chunk.indices for chunk in unified.chunks])
+    return pa.chunked_array([pa.DictionaryArray.from_arrays(indices, dictionary)])
 
 
 def _categorical_from_arrow(column, dtype, name):
@@ -29,7 +47,7 @@ def _categorical_from_arrow(column, dtype, name):
     until the physical codes have acquired their categorical dtype.
     """
     parts = []
-    for chunk in column.chunks:
+    for chunk in _one_dictionary(column).chunks:
         labels = pl.from_arrow(chunk.dictionary).cast(dtype, strict=True)
         codes = pc.take(labels.to_physical().to_arrow(), chunk.indices)
         parts.append(pl.from_arrow(codes).cat.to(dtype).alias(name))
@@ -45,7 +63,7 @@ def _strings_from_dictionary(column, name):
     gathers from the small label column by code, in parallel: 6 ms.
     """
     parts = []
-    for chunk in column.chunks:
+    for chunk in _one_dictionary(column).chunks:
         indices = chunk.indices
         # Codes are non-negative: an int32 view as UInt32 is exact and free.
         indices = indices.view(pa.uint32()) if indices.type == pa.int32() else indices.cast(pa.uint32())
@@ -235,6 +253,79 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
     return frame if frame.schema == expected else frame.lazy().cast(expected, strict=True).collect(engine="streaming")
 
 
+class _Stopped(Exception):
+    """The consumer of a streamed result went away; the query stops."""
+
+
+class _StreamedResult:
+    """An Ibex query run on a helper thread whose chunks arrive as batches.
+
+    The helper thread runs the query (without the GIL) and queues each chunk
+    as Arrow; `batches()` converts and yields them on the consumer's thread.
+    The queue is bounded, so a slow consumer pauses the query rather than
+    buffering the whole result. Closing `batches()` early stops the query.
+    """
+
+    _DEPTH = 4
+
+    def __init__(self, source, bindings, scalars):
+        self._queue = queue.Queue(maxsize=self._DEPTH)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(source, bindings, scalars),
+                                        name="ibex-polars-stream", daemon=True)
+
+    def _put(self, item):
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.05)
+                return
+            except queue.Full:
+                pass
+        raise _Stopped
+
+    def _run(self, source, bindings, scalars):
+        import ibex_pyarrow
+        try:
+            ibex_pyarrow.execute_pipeline_stream(source, lambda batch: self._put((True, batch)),
+                                                 tables=bindings, scalars=scalars)
+            self._put((False, None))
+        except _Stopped:
+            pass
+        except BaseException as error:  # handed to the consumer, which raises it
+            try:
+                self._put((False, error))
+            except _Stopped:
+                pass
+
+    def batches(self, min_rows=1 << 20):
+        """The result as Arrow tables of at least `min_rows` rows (but the last).
+
+        Ibex's chunks are a scan unit each, often a few thousand rows after a
+        filter, and converting one to Polars has a fixed cost of about a
+        millisecond; joined (without copying) up to `min_rows`, they convert
+        at the whole result's per-row cost.
+        """
+        self._thread.start()
+        pending, rows = [], 0
+        try:
+            while True:
+                more, item = self._queue.get()
+                if not more:
+                    if item is not None:
+                        raise item
+                    if pending:
+                        yield pa.concat_tables(pending)
+                    return
+                pending.append(item)
+                rows += item.num_rows
+                if rows >= min_rows:
+                    yield pa.concat_tables(pending)
+                    pending, rows = [], 0
+        finally:
+            self._stop.set()
+            self._thread.join()
+
+
 class IbexEngine(pl.Engine):
     def __init__(self, *, cache_size=32):
         check_version()
@@ -314,12 +405,40 @@ class IbexEngine(pl.Engine):
     def sink_parquet(self, lf, path, *, optimizations, **options):
         """`lf.sink_parquet(path, engine=IbexEngine())`: run `lf` in Ibex, write with Polars.
 
-        The query runs in Ibex. Its result reaches Polars as it would for
-        `collect`, mostly sharing Arrow buffers, and Polars' own Parquet writer
-        writes it. The file therefore has exactly the schema and metadata
+        The query runs in Ibex, and Polars' own Parquet writer writes its
+        result batch by batch as Ibex produces it, so the encoding overlaps the
+        query. Each batch reaches Polars as `collect`'s result would, mostly
+        sharing Arrow buffers. The file therefore has exactly the schema and metadata
         Polars would write, and every `sink_parquet` option and target
         (compression, statistics, row groups, `PartitionBy`, cloud storage,
         file objects) behaves as it does in Polars.
         """
-        frame = self.collect(lf, optimizations=optimizations)
-        frame.lazy().sink_parquet(path, engine="streaming", **options)
+        with self._lock:
+            source, bindings, scalars, expected, output, categories, left_rows = self._prepare(lf, optimizations)
+            if left_rows is not None or not expected:
+                # A join rebuilt from the original frame's rows, or a result
+                # without columns, converts whole.
+                frame = self.collect(lf, optimizations=optimizations)
+                frame.lazy().sink_parquet(path, engine="streaming", **options)
+                return
+            # Polars' streaming sink writes each batch as Ibex produces it, so
+            # encoding overlaps the query instead of following it.
+            stream = _StreamedResult(source, bindings, scalars)
+            schema = pl.Schema(expected)
+
+            def batches(with_columns, predicate, n_rows, batch_size):
+                remaining = n_rows
+                for batch in stream.batches():
+                    frame = _to_polars(batch, expected, output, categories)
+                    if with_columns is not None:
+                        frame = frame.select(with_columns)
+                    if predicate is not None:
+                        frame = frame.filter(predicate)
+                    if remaining is not None:
+                        frame = frame.head(remaining)
+                        remaining -= frame.height
+                    yield frame
+                    if remaining == 0:
+                        return
+
+            register_io_source(batches, schema=schema).sink_parquet(path, engine="streaming", **options)

@@ -19,8 +19,9 @@ pl.scan_parquet("trades.parquet").filter(pl.col("qty") > 10).sink_parquet(
     "out.parquet", engine=engine)
 ```
 
-The query runs in Ibex and Polars' own Parquet writer writes the result, so the
-file is the one Polars would write and every `sink_parquet` option (compression,
+The query runs in Ibex and Polars' own Parquet writer writes the result batch
+by batch as Ibex produces it, so writing overlaps the query. The file is the one
+Polars would write and every `sink_parquet` option (compression,
 statistics, row groups, `PartitionBy`, cloud storage, file objects) works
 unchanged. A lazy sink (`sink_parquet(..., lazy=True)`, collected later) is not
 supported.

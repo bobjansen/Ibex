@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
-"""Pinned adapter for Polars 2.0.0's private logical-plan visitor.
+"""Pinned adapter for Polars 2.1.0's private logical-plan visitor.
 
 Visitor node/expression IDs drive translation. Original plan metadata supplies
 join validation flags omitted by the visitor. Unknown nodes/options fail before
@@ -25,8 +25,8 @@ from . import _categories
 from ._temporal import NANOS_PER_UNIT, TEMPORAL_TYPES, is_temporal, literal_ticks, prepare_column
 
 
-VISITOR_VERSION = (15, 2)
-POLARS_VERSION = "2.0.0"
+VISITOR_VERSION = (16, 0)
+POLARS_VERSION = "2.1.0"
 
 # These logical integer types all fit native Int64 storage. UInt32/UInt64
 # intentionally remain outside this subset.
@@ -963,7 +963,10 @@ class Adapter:
             if policy != default_policy:
                 raise NotImplementedError("unsupported Parquet cast policy")
             scan_options = json.loads(node.scan_type[1])
-            if scan_options != {"schema": None, "parallel": "Auto", "low_memory": False, "use_statistics": True}:
+            # Polars 2.1 adds `decryption_properties`; Ibex reads no encrypted
+            # files, so only its unset value is accepted.
+            if scan_options != {"schema": None, "parallel": "Auto", "low_memory": False, "use_statistics": True,
+                                "decryption_properties": None}:
                 raise NotImplementedError("unsupported Parquet scan configuration")
             cloud = json.loads(node.scan_type[2])
             if cloud.get("config") is not None or cloud.get("credential_provider") is not None:
@@ -978,6 +981,11 @@ class Adapter:
             if node.predicate is not None:
                 frame = frame.filter(self.expression(node.predicate.node))
             frame = frame.select(list(schema))
+        elif kind == "Join" and getattr(node, "predicate", None) is not None:
+            # Polars 2.1 exposes a join's fused filter (a cross join with a
+            # filter, or an extra predicate on an inequality join); none of
+            # the paths below would apply it.
+            raise NotImplementedError("join with a fused predicate")
         elif kind == "Join" and isinstance(node.options[0], tuple) and node.options[0][0] == "IEJoin":
             how, nulls_equal, slice_, suffix, coalesce, maintain_order = node.options
             operators = {"Lt": "<", "LtEq": "<=", "Gt": ">", "GtEq": ">="}

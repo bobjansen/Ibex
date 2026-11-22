@@ -597,7 +597,7 @@ result = query.collect(engine=engine)
 
 Reuse the Engine and query to retain prepared resident inputs; every collection
 executes again. Unsupported plans fail explicitly. The experiment pins
-Polars 2.0.0 and its private plan visitor. Prebuilt `ibex-polars` wheels
+Polars 2.1.0 and its private plan visitor. Prebuilt `ibex-polars` wheels
 (Linux x86_64, Windows x86_64) install without a compiler:
 `pip install --pre ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/wheels-latest`.
 See

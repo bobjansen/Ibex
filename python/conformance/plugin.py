@@ -31,12 +31,16 @@ class Plugin:
             yield
         else:
             selection = self.selection_tests.get(item.nodeid)
-            probe = Probe(pl.LazyFrame.collect, check_row_order=item.nodeid not in self.unordered_tests,
+            # An entry names one node, or a test function and so every one of
+            # its parametrizations.
+            unordered = self.unordered_tests.get(item.nodeid,
+                                                 self.unordered_tests.get(item.nodeid.split("[")[0]))
+            probe = Probe(pl.LazyFrame.collect, check_row_order=unordered is None,
                           allowed_rows=selection["allowed_rows"] if selection else None)
             if selection:
                 row["comparison_policy"] = {"unordered_selection": selection}
-            if item.nodeid in self.unordered_tests:
-                row["comparison_policy"] = {"check_row_order": False, "reason": self.unordered_tests[item.nodeid]}
+            if unordered is not None:
+                row["comparison_policy"] = {"check_row_order": False, "reason": unordered}
             def collect(frame, *args, **kwargs):
                 return probe.collect(frame, *args, **kwargs)
             with patch.object(pl.LazyFrame, "collect", collect):

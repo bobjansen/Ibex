@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
-"""Polars 2.0.0 reproducer: query is correct, visitor loses nanoseconds.
+"""Polars reproducer: query is correct, visitor loses nanoseconds.
 
-Requires only polars==2.0.0. The final assertion intentionally fails.
+Found on Polars 2.0.0 and still present in 2.1.0. Requires only polars. The
+final assertion intentionally fails.
 """
 
 import polars as pl

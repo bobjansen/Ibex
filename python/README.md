@@ -223,7 +223,7 @@ planning. A paired eight-thread run improves Q19 from 2,126 to 398 ms versus
 All 16 supported queries still match Polars at one and eight threads; the
 linked report records the measurements and regression coverage.
 
-The optional conformance runner needs Polars 2.0 and the upstream benchmark's
+The optional conformance runner needs Polars 2.1 and the upstream benchmark's
 Python dependencies, checkout and generated data. It invokes the original
 `queries.polars.q6.q` function twice, using real Polars and Ibex. Only the
 query module's `pl` binding and explicit lazy input change; upstream files

@@ -8,7 +8,7 @@
 set(IBEX_PYTHON_EXECUTABLE "" CACHE FILEPATH
     "Python interpreter used to build and test the Ibex pyarrow bridge")
 set(IBEX_POLARS_UPSTREAM_DIR "" CACHE PATH
-    "Optional unmodified Polars 2.0.0 source tree for upstream conformance tests")
+    "Optional unmodified Polars 2.1.0 source tree for upstream conformance tests")
 
 if(IBEX_PYTHON_EXECUTABLE)
     set(Python3_EXECUTABLE "${IBEX_PYTHON_EXECUTABLE}")
@@ -172,7 +172,7 @@ execute_process(
 
 if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
     execute_process(
-        COMMAND "${Python3_EXECUTABLE}" -c "import polars; assert polars.__version__ == '2.0.0'"
+        COMMAND "${Python3_EXECUTABLE}" -c "import polars; assert polars.__version__ == '2.1.0'"
         RESULT_VARIABLE IBEX_POLARS_IMPORT_RESULT
         OUTPUT_QUIET ERROR_QUIET
     )
@@ -241,7 +241,7 @@ if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
             set_tests_properties(ibex_polars_upstream PROPERTIES LABELS "python;conformance" TIMEOUT 300)
         endif()
     elseif(IBEX_POLARS_UPSTREAM_DIR)
-        message(FATAL_ERROR "Upstream conformance requires Polars 2.0.0")
+        message(FATAL_ERROR "Upstream conformance requires Polars 2.1.0")
     endif()
     add_test(
         NAME ibex_python_lazy

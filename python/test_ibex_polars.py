@@ -912,7 +912,14 @@ class EngineTests(unittest.TestCase):
                                      "y": [10, 20, 30]}), path)
             frame = pl.scan_parquet(path)
             self.equal(frame.select("x"))
-            self.equal(frame.filter((pl.col("x") + 1) < 0).select("y"))
+            # x + 1 wraps to negative for 2^31 - 1, as Polars computes it in
+            # memory and without statistics. Polars 2.1.0's row-group pruning
+            # evaluates the predicate on the statistics without wrapping and
+            # drops the group, so the reference reads without statistics.
+            query = frame.filter((pl.col("x") + 1) < 0).select("y")
+            reference = pl.scan_parquet(path, use_statistics=False).filter((pl.col("x") + 1) < 0).select("y")
+            assert_frame_equal(query.collect(engine=self.engine), reference.collect())
+            self.assertEqual(reference.collect()["y"].to_list(), [10])
             self.equal(frame.select(total=pl.col("x").sum()))
 
     def test_float32_uses_float64_storage_and_preserves_output_types(self):

@@ -89,7 +89,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: pola-rs/polars
-          ref: 22a147de3d2bb2e44b97338a2510816c7105c9f2
+          ref: 7f902bd3ffd27ff82d14278a09a295ff2f7aed92
           path: .polars-upstream
           persist-credentials: false
 

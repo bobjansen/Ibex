@@ -280,6 +280,29 @@ def _join_chunks(tables):
                              else pa.Table.from_arrays(table.columns, schema=schema) for table in tables])
 
 
+# Plans a Polars optimization produces that Ibex cannot take, but whose query
+# it can: revisit with that optimization off (Ibex optimizes the result itself).
+_RETRY_WITHOUT = {
+    # The visitor shows the optimized node only as a fused join; without
+    # pushdown it is an ordinary join plus filter, which Ibex pushes down.
+    "join with a fused predicate": "predicate_pushdown",
+    # Polars 2.1 hoists a shared reduction into a with_columns, which would
+    # need the reduction broadcast to every row.
+    "reduction broadcasting in HStack is not supported yet": "comm_subexpr_elim",
+}
+
+
+def _compile(lf, optimizations):
+    """The adapter's plan for `lf`; NotImplementedError for any plan it cannot take."""
+    try:
+        return Adapter(lf, optimizations).compile()
+    except pl.exceptions.PanicException as panic:
+        # Polars' visitor panics on nodes it cannot convert to Python (2.1.0:
+        # the row-encoded key of a multi-column min_by). A panic is a
+        # BaseException, so it would escape every caller's fallback.
+        raise NotImplementedError(f"the Polars plan visitor cannot convert this plan: {panic}") from None
+
+
 class _Stopped(Exception):
     """The consumer of a streamed result went away; the query stops."""
 
@@ -379,17 +402,17 @@ class IbexEngine(pl.Engine):
         if entry is not None and entry[0]() is lf:
             self._cache.move_to_end(key)
             return entry[1]
-        try:
-            plan = Adapter(lf, optimizations).compile()
-        except NotImplementedError as error:
-            if str(error) != "join with a fused predicate" or not optimizations.predicate_pushdown:
-                raise
-            # Visitor 15.2 cannot expose this optimized node. Revisit the same
-            # query as an ordinary join plus filter; Ibex can push it down.
-            # Copy the Rust flags so caller settings and cache keys stay intact.
-            flags = pl.QueryOptFlags._from_pyoptflags(optimizations._pyoptflags.copy())
-            flags.update(predicate_pushdown=False)
-            plan = Adapter(lf, flags).compile()
+        # Copied Rust flags, so caller settings and cache keys stay intact.
+        flags = pl.QueryOptFlags._from_pyoptflags(optimizations._pyoptflags.copy())
+        while True:
+            try:
+                plan = _compile(lf, flags)
+                break
+            except NotImplementedError as error:
+                retry = _RETRY_WITHOUT.get(str(error))
+                if retry is None or not getattr(flags, retry):
+                    raise
+                flags.update(**{retry: False})
         if self._cache_size:
             owner = weakref.ref(self)
             def discard(reference):

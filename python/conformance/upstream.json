@@ -1,9 +1,9 @@
 {
-  "polars_version": "2.0.0",
-  "tag": "py-2.0.0",
-  "commit": "22a147de3d2bb2e44b97338a2510816c7105c9f2",
+  "polars_version": "2.1.0",
+  "tag": "py-2.1.0",
+  "commit": "7f902bd3ffd27ff82d14278a09a295ff2f7aed92",
   "repository": "https://github.com/pola-rs/polars",
-  "test_tree_sha256": "42dad0c3d2d56c28fa40279b9f48691b461c48749aa38c1ed7aa26ebc7e4f3e0",
+  "test_tree_sha256": "68c6eb96ef6bd0a42d82ed3c5d0077be09afe1c95e13dd5f0d4f4b35fd4295cc",
   "targets": [
     "tests/unit/operations/test_select.py",
     "tests/unit/operations/test_with_columns.py",
@@ -1011,6 +1011,7 @@
     ]
   },
   "unordered_tests": {
+    "tests/unit/operations/test_sort.py::test_sort_head_uses_limit": "Upstream asserts its unordered group_by queries with check_row_order=False; its select queries are ordered, and stay checked by upstream's own assertion.",
     "tests/unit/operations/test_group_by.py::test_group_by_cse_alias_26423": "Upstream explicitly asserts check_row_order=False after unordered group_by.",
     "tests/unit/operations/test_group_by.py::test_group_by_first_nondet_24278": "Upstream compares only the sum of collected first-row indices across eleven unordered group_by collections; row order is not part of its contract. Compare the full row multiset here."
   },

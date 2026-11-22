@@ -1,7 +1,7 @@
 # Upstream Polars compatibility target
 
 This optional harness runs **unmodified upstream tests and assertions** from
-[Polars 2.0.0](https://github.com/pola-rs/polars/tree/22a147de3d2bb2e44b97338a2510816c7105c9f2/py-polars/tests).
+[Polars 2.1.0](https://github.com/pola-rs/polars/tree/7f902bd3ffd27ff82d14278a09a295ff2f7aed92/py-polars/tests).
 `upstream.json` pins the release commit, the content digest of the complete
 Python test tree and its pytest configuration, eight initial test modules,
 and query comparisons that must keep passing. Nothing is vendored or rewritten.
@@ -16,9 +16,9 @@ Use the Python environment selected for the bridge build:
 
 ```bash
 .venv/bin/python -m pip install -r python/conformance/requirements.txt
-git clone --depth 1 --branch py-2.0.0 https://github.com/pola-rs/polars.git .polars-upstream
+git clone --depth 1 --branch py-2.1.0 https://github.com/pola-rs/polars.git .polars-upstream
 git -C .polars-upstream rev-parse HEAD
-# Must be 22a147de3d2bb2e44b97338a2510816c7105c9f2.
+# Must be 7f902bd3ffd27ff82d14278a09a295ff2f7aed92.
 
 # Build ibex_pyarrow as described in python/README.md first.
 PYTHONPATH=build-release/python:python .venv/bin/python -m conformance.run \

@@ -26,7 +26,7 @@ requires-python = ">=3.11"
 # The adapter translates Polars' internal plan visitor, which is
 # version-specific: IbexEngine refuses any other Polars release.
 dependencies = [
-    "polars==2.0.0",
+    "polars==2.1.0",
     "pyarrow>=14",
     "numpy>=1.26",
 ]

@@ -47,7 +47,7 @@ macOS (Apple silicon) wheels are built only on request, by running the
 "Python wheels" workflow by hand with the macOS option.
 
 The wheel bundles the native bridge and its Arrow/Parquet libraries and pulls
-in `polars==2.0.0`, `pyarrow` and `numpy`. To build one from a checkout
+in `polars==2.1.0`, `pyarrow` and `numpy`. To build one from a checkout
 (compiles Arrow, so the first build takes a while):
 
 ```bash
@@ -275,7 +275,7 @@ Native evaluation currently holds the GIL; concurrent use is serialized during
 preparation/execution.
 
 The implementation depends on private plan visitor APIs and requires exactly
-Polars 2.0.0 and visitor version `(15, 2)`. Other versions fail explicitly. This
+Polars 2.1.0 and visitor version `(16, 0)`. Other versions fail explicitly. This
 pin is an integration risk to resolve before distributing a general backend;
 it is not a claim of full Polars compatibility.
 

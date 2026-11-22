@@ -23,35 +23,52 @@ from polars.io.plugins import register_io_source
 from polars.lazyframe.query_result import SingleNodeQueryResult
 
 
-def _one_dictionary(column):
-    """A dictionary column as one chunk over one dictionary.
+def _dictionary_codes(column, name):
+    """(labels, codes): a dictionary column as one label array and its codes.
 
     A streamed result's chunks each carry the dictionary of the scan unit they
-    came from, and converting a chunk costs a few Polars calls of fixed cost:
-    41 chunks of two such columns took 25 ms against 2 ms for one. Unifying
-    the dictionaries remaps the codes once; the labels are few.
+    came from, usually with the same labels. A chunk whose dictionary equals
+    the one before it keeps its codes; another dictionary is appended to the
+    labels and its chunk's codes shift by where it starts. `labels.gather(codes)`
+    is then the column: one parallel Polars gather, where one call per chunk
+    or Arrow's serial unification of 41 chunks of 9.9M rows cost 25 ms more.
     """
-    if column.num_chunks <= 1:
-        return column
-    unified = column.unify_dictionaries()
-    dictionary = unified.chunk(0).dictionary
-    indices = pa.concat_arrays([chunk.indices for chunk in unified.chunks])
-    return pa.chunked_array([pa.DictionaryArray.from_arrays(indices, dictionary)])
+    dictionaries, shifted, size, start = [], [], 0, 0
+    for chunk in column.chunks:
+        dictionary = chunk.dictionary
+        if not dictionaries or not dictionary.equals(dictionaries[-1]):
+            start = size
+            dictionaries.append(dictionary)
+            size += len(dictionary)
+        indices = chunk.indices
+        # Codes are non-negative: an int32 view as UInt32 is exact and free.
+        indices = indices.view(pa.uint32()) if indices.type == pa.int32() else indices.cast(pa.uint32())
+        shifted.append(pc.add(indices, pa.scalar(start, pa.uint32())) if start else indices)
+    if size >= 1 << 32:
+        raise RuntimeError(f"the dictionaries of {name} have more than 2^32 labels")
+    # One chunk: a gather from chunked labels costs five times as much.
+    labels = pl.from_arrow(pa.chunked_array(dictionaries, type=column.type.value_type)).rechunk() \
+        if dictionaries else pl.Series(name, [], dtype=pl.String)
+    codes = pl.from_arrow(pa.chunked_array(shifted, type=pa.uint32())).alias(name)
+    return labels, codes
 
 
 def _categorical_from_arrow(column, dtype, name):
-    """Translate dictionary entries once, then gather Polars category codes.
+    """Translate the dictionary labels once, then gather Polars category ids.
 
     Arrow dictionaries are local to each chunk; their ordinals need not match
-    the requested Polars category mapping. Keep the mapping alive in `labels`
-    until the physical codes have acquired their categorical dtype.
+    the requested Polars category mapping, so the labels are cast to `dtype`
+    and their ids gathered by code. One streaming query does the gather and
+    `cat.to`, whose check of every id then runs on every thread.
     """
-    parts = []
-    for chunk in _one_dictionary(column).chunks:
-        labels = pl.from_arrow(chunk.dictionary).cast(dtype, strict=True)
-        codes = pc.take(labels.to_physical().to_arrow(), chunk.indices)
-        parts.append(pl.from_arrow(codes).cat.to(dtype).alias(name))
-    return pl.concat(parts, rechunk=False) if parts else pl.Series(name, [], dtype=dtype)
+    labels, codes = _dictionary_codes(column, name)
+    # `categorical` keeps a named mapping alive until the ids have their dtype.
+    categorical = labels.cast(pl.String).cast(dtype, strict=True)
+    result = pl.DataFrame([codes]).lazy().select(
+        pl.lit(categorical.to_physical()).gather(pl.col(name)).cat.to(dtype).alias(name)
+    ).collect(engine="streaming").to_series()
+    del categorical
+    return result
 
 
 def _strings_from_dictionary(column, name):
@@ -62,16 +79,9 @@ def _strings_from_dictionary(column, name):
     twice on one thread: 136 ms for 9.9M rows of 5000 labels. Polars instead
     gathers from the small label column by code, in parallel: 6 ms.
     """
-    parts = []
-    for chunk in _one_dictionary(column).chunks:
-        indices = chunk.indices
-        # Codes are non-negative: an int32 view as UInt32 is exact and free.
-        indices = indices.view(pa.uint32()) if indices.type == pa.int32() else indices.cast(pa.uint32())
-        labels = pl.from_arrow(chunk.dictionary).cast(pl.String)
-        codes = pl.DataFrame({"codes": pl.from_arrow(indices)})
-        parts.append(codes.lazy().select(pl.lit(labels).gather(pl.col("codes")).alias(name))
-                     .collect().to_series())
-    return pl.concat(parts, rechunk=False) if parts else pl.Series(name, [], dtype=pl.String)
+    labels, codes = _dictionary_codes(column, name)
+    return pl.DataFrame([codes]).lazy().select(
+        pl.lit(labels.cast(pl.String)).gather(pl.col(name)).alias(name)).collect().to_series()
 
 
 def _known_codes(column, dtype, name, categories):

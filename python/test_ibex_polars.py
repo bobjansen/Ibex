@@ -1150,18 +1150,19 @@ class EngineTests(unittest.TestCase):
         for codes, labels in ((pa.int32(), pa.string()), (pa.int8(), pa.large_string())):
             chunks = [pa.DictionaryArray.from_arrays(pa.array([0, 2, None, 1], type=codes),
                                                     pa.array(["z", "a", "b"], type=labels)).slice(1),
-                      pa.DictionaryArray.from_arrays(pa.array([1, None, 0], type=codes),
+                      pa.DictionaryArray.from_arrays(pa.array([1, None, 0, 0, 2, 1, 1], type=codes),
                                                     pa.array(["b", "z", "a"], type=labels))]
-            table = pa.table({"g": pa.chunked_array(chunks), "x": [1., 2., 3., 4., 5., 6.]})
+            table = pa.table({"g": pa.chunked_array(chunks), "x": [float(x) for x in range(10)]})
             with patch.object(pl, "from_arrow", wraps=pl.from_arrow) as convert:
                 result = _to_polars(table, expected, output)
-                # Only labels and codes cross into Polars, never a decoded column.
+                # Only labels and codes cross into Polars, never a decoded
+                # column: no string array longer than the two dictionaries.
                 self.assertFalse(any((pa.types.is_string(call.args[0].type)
                                       or pa.types.is_large_string(call.args[0].type))
-                                     and len(call.args[0]) > 3
+                                     and len(call.args[0]) > 6
                                      for call in convert.call_args_list if hasattr(call.args[0], "type")))
             self.assertEqual(result.schema, expected)
-            self.assertEqual(result["g"].to_list(), ["b", None, "a", "z", None, "b"])
+            self.assertEqual(result["g"].to_list(), ["b", None, "a", "z", None, "b", "b", "a", "z", "z"])
             self.assertEqual(result["x"].to_list(), table["x"].to_pylist())
         empty = _to_polars(table.slice(0, 0), expected, output)
         self.assertEqual(empty.schema, expected)
@@ -1252,6 +1253,20 @@ class EngineTests(unittest.TestCase):
             grouped = query.group_by("venue", "symbol").agg(pl.sum("value"), pl.len()).sort("venue", "symbol")
             grouped.sink_parquet(ibex_path, engine=self.engine)
             assert_frame_equal(pl.read_parquet(ibex_path), grouped.collect(engine="streaming"))
+
+    def test_dictionary_codes_shift_only_for_a_new_dictionary(self):
+        same = pa.array(["a", "b", "c"])
+        other = pa.array(["c", "a"])
+        column = pa.chunked_array([
+            pa.DictionaryArray.from_arrays(pa.array([2, 0], type=pa.int32()), same),
+            # Equal labels in another buffer: the codes need no shift.
+            pa.DictionaryArray.from_arrays(pa.array([1, None], type=pa.int32()), pa.array(["a", "b", "c"])),
+            pa.DictionaryArray.from_arrays(pa.array([0, 1], type=pa.int32()), other),
+            pa.DictionaryArray.from_arrays(pa.array([1], type=pa.int32()), same)])
+        labels, codes = _engine._dictionary_codes(column, "g")
+        self.assertEqual(labels.to_list(), ["a", "b", "c", "c", "a", "a", "b", "c"])
+        self.assertEqual(codes.to_list(), [2, 0, 1, None, 3, 4, 6])
+        self.assertEqual(labels.gather(codes).to_list(), ["c", "a", "b", None, "c", "a", "b"])
 
     def test_sink_parquet_passes_writer_options_and_targets_through(self):
         with tempfile.TemporaryDirectory() as directory:

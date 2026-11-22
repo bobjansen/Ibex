@@ -58,10 +58,27 @@ fi
 # findings while linting each src/*.cpp that includes it (--header-filter).
 # Do the same here: lint a translation unit that includes the header, and
 # report only the header's own diagnostics.
+# Options (with the value after -p) apply to every run; files are split into
+# translation units, linted together as given, and headers, each linted alone.
 args=()
+units=()
 headers=()
+expect_value=false
+after_dashes=false
 for arg in "$@"; do
+    if [[ "$after_dashes" == true || "$arg" == "--" ]]; then
+        args+=("$arg")  # compile flags after `--`
+        after_dashes=true
+        continue
+    fi
+    if [[ "$expect_value" == true ]]; then
+        args+=("$arg")
+        expect_value=false
+        continue
+    fi
     case "$arg" in
+        -p | --p) args+=("$arg"); expect_value=true; continue ;;
+        -*) args+=("$arg"); continue ;;
         *.hpp | *.h)
             if [[ -f "$arg" ]]; then
                 headers+=("$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")")
@@ -69,11 +86,11 @@ for arg in "$@"; do
             fi
             ;;
     esac
-    args+=("$arg")
+    units+=("$arg")
 done
 
 if [[ ${#headers[@]} -eq 0 ]]; then
-    exec "$CLANG_TIDY_BIN" "${args[@]}"
+    exec "$CLANG_TIDY_BIN" "${args[@]}" "${units[@]}"
 fi
 
 # The translation unit to lint a header through: a src/ .cpp that includes it,
@@ -91,6 +108,9 @@ unit_for_header() {
 }
 
 status=0
+if [[ ${#units[@]} -gt 0 ]] && ! "$CLANG_TIDY_BIN" "${args[@]}" "${units[@]}"; then
+    status=1
+fi
 for header in "${headers[@]}"; do
     unit="$(unit_for_header "$header")"
     if [[ -z "$unit" ]]; then

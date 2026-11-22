@@ -64,7 +64,10 @@ inline auto install_stdout_sink(StdoutSink* sink) -> StdoutSink* {
 
 template <typename... Args>
 void print(std::FILE* stream, format_string<Args...> pattern, Args&&... args) {
-    const auto text = std::format(pattern, std::forward<Args>(args)...);
+    // A named type, not `auto`: deduced from the pack, `text` would make the
+    // append below a dependent call, which misc-const-correctness cannot see
+    // into, so it asks for a const sink that `append` cannot take.
+    const std::string text = std::format(pattern, std::forward<Args>(args)...);
     if (stream == stdout) {
         if (auto* sink = detail::stdout_sink().load(std::memory_order_acquire)) {
             sink->append(text);

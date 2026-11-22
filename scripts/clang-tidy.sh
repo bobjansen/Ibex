@@ -52,4 +52,59 @@ if [[ "$needs_build_dir" -eq 1 ]]; then
     set -- -p "$REPO_ROOT/build" "$@"
 fi
 
-exec "$CLANG_TIDY_BIN" "$@"
+# A header has no entry in the compile database, so clang-tidy run on one
+# borrows the flags of an unrelated entry (without -std=c++23, std::format
+# does not exist). CI never lints a header directly: it reports a header's
+# findings while linting each src/*.cpp that includes it (--header-filter).
+# Do the same here: lint a translation unit that includes the header, and
+# report only the header's own diagnostics.
+args=()
+headers=()
+for arg in "$@"; do
+    case "$arg" in
+        *.hpp | *.h)
+            if [[ -f "$arg" ]]; then
+                headers+=("$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")")
+                continue
+            fi
+            ;;
+    esac
+    args+=("$arg")
+done
+
+if [[ ${#headers[@]} -eq 0 ]]; then
+    exec "$CLANG_TIDY_BIN" "${args[@]}"
+fi
+
+# The translation unit to lint a header through: a src/ .cpp that includes it,
+# spelled either <ibex/...> (public headers) or by file name (internal ones).
+unit_for_header() {
+    local header="$1" spelling unit
+    if [[ "$header" == "$REPO_ROOT/include/"* ]]; then
+        spelling="${header#"$REPO_ROOT/include/"}"
+    else
+        spelling="$(basename "$header")"
+    fi
+    unit="$(grep -rlF --include='*.cpp' "$spelling" "$REPO_ROOT/src" |
+        xargs -r grep -lE "^#include [<\"](.*/)?${spelling//./\\.}[>\"]" 2>/dev/null | head -1 || true)"
+    printf '%s' "$unit"
+}
+
+status=0
+for header in "${headers[@]}"; do
+    unit="$(unit_for_header "$header")"
+    if [[ -z "$unit" ]]; then
+        echo "error: no src/*.cpp includes $header directly; lint a translation unit that does" >&2
+        status=1
+        continue
+    fi
+    echo "clang-tidy: $header (through ${unit#"$REPO_ROOT/"})" >&2
+    escaped="$(printf '%s' "$header" | sed 's/[.[\*^$()+?{}|]/\\&/g')"
+    # line-filter limits reporting to the header, so the unit's own findings
+    # stay out of a header lint.
+    if ! "$CLANG_TIDY_BIN" "${args[@]}" "--header-filter=^${escaped}\$" \
+        "--line-filter=[{\"name\":\"$header\"}]" "$unit"; then
+        status=1
+    fi
+done
+exit "$status"

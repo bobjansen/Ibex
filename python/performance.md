@@ -48,19 +48,50 @@ were 0.93× and 0.88×.
 For the native hand-written Ibex queries against Polars and DuckDB on AWS,
 see the [published benchmark snapshot](../benchmarking/aws/README.md#published-benchmark-snapshot).
 
+## h2o groupby through `IbexEngine`
+
+The h2o db-benchmark's Polars groupby queries, unchanged, on resident 10M-row
+frames: `G1_1e7_*` with K groups per id column, one dataset with 5% nulls and
+one pre-sorted. Ibex/Polars-streaming ratios of each question's minimum over
+five runs after a warmup, against Polars 2.1.0, 2026-11-22 (`7d41f173`); every
+answer validated. Each cell is **8 threads / 1 thread**.
+
+| Question | K=1e2 | K=1e2, 5% NA | K=1e2, sorted | K=1e1 | K=2e0 |
+|---|---:|---:|---:|---:|---:|
+| q1 sum v1 by id1 | 0.46 / 0.18 | 0.56 / 0.41 | 0.65 / 0.44 | 0.72 / 0.21 | 0.55 / 0.30 |
+| q2 sum v1 by id1:id2 | 0.58 / 0.31 | 0.56 / 0.37 | 0.58 / 0.31 | 0.54 / 0.22 | 0.84 / 0.26 |
+| q3 sum v1 mean v3 by id3 | 0.86 / 0.45 | 0.80 / 0.51 | 0.82 / 0.45 | 0.77 / 0.39 | 0.95 / 0.51 |
+| q4 mean v1:v3 by id4 | 0.72 / 0.39 | 0.72 / 0.55 | 0.71 / 0.40 | 0.74 / 0.39 | 1.14 / 0.57 |
+| q5 sum v1:v3 by id6 | 0.78 / 0.49 | 0.81 / 0.54 | 0.77 / 0.51 | 0.79 / 0.55 | 1.00 / 0.73 |
+| q6 median v3 sd v3 by id4 id5 | 0.50 / 0.39 | 0.40 / 0.28 | 0.45 / 0.39 | 0.34 / 0.40 | 0.41 / 0.48 |
+| q7 max v1 - min v2 by id3 | 1.13 / 0.57 | 1.15 / 0.69 | 1.02 / 0.56 | 0.95 / 0.56 | 1.05 / 0.73 |
+| q8 largest two v3 by id6 | 0.30 / 0.44 | 0.36 / 0.54 | 0.29 / 0.44 | 0.13 / 0.26 | 0.06 / 0.18 |
+| q9 regression v1 v2 by id2 id4 | 0.78 / 0.43 | 0.75 / 0.39 | 0.73 / 0.42 | 0.93 / 0.45 | 1.59 / 0.48 |
+| q10 sum v3 count by id1:id6 | 1.15 / 1.05 | 1.26 / 1.23 | 1.19 / 1.27 | 1.20 / 1.13 | 1.25 / 1.11 |
+| **geomean** | **0.68 / 0.43** | **0.68 / 0.51** | **0.67 / 0.48** | **0.62 / 0.40** | **0.69 / 0.47** |
+
+Ibex is faster on 38 of the 50 eight-thread cells and 45 of the 50 one-thread
+cells. The consistent loss is q10, a sum and count keyed by all six id
+columns, at 1.05–1.27×; q8 (the two largest values per group) is where Ibex
+gains most. Against Polars 2.0.0 on 2026-11-08 (seven questions) the
+eight-thread geomeans were 0.75–1.22×.
+
 ## h2o joins through `IbexEngine`
 
-`J1_1e7_NA_0_0`, a 10M-row `x` joined to small / medium / big tables, with
-compact Int32 storage (then `IBEX_COMPACT_INT32=1`, now the default); median paired Ibex/Polars ratios, 2026-11-10:
+`J1_1e7_NA_0_0`, a 10M-row `x` joined to small / medium / big tables, same
+run and method as the groupby table:
 
 | Question | 8 threads | 1 thread |
 |---|---:|---:|
-| q1 small inner on int | 1.24 | 0.83 |
-| q2 medium inner on int | 1.35 | 0.91 |
-| q3 medium outer (left) on int | 1.43 | 1.19 |
-| q4 medium inner on factor | 1.24 | 0.75 |
-| q5 big inner on int | 0.88 | 0.47 |
+| q1 small inner on int | 1.45 | 0.83 |
+| q2 medium inner on int | 1.35 | 0.94 |
+| q3 medium outer (left) on int | 0.78 | 0.70 |
+| q4 medium inner on factor | 1.29 | 0.81 |
+| q5 big inner on int | 0.87 | 0.47 |
+| **geomean** | **1.11** | **0.73** |
 
+The small and medium inner joins still lose at eight threads; the left join
+(q3) has won since the streaming left join landed (it was 1.43× on 11-10).
 The native joins are as fast as Polars or faster; the remainder is
 converting ~9M-row results to Polars, chiefly `cat.to`'s per-row category
 validation. Status, mechanisms and how to measure:

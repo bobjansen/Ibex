@@ -148,6 +148,7 @@ target_link_libraries(ibex_tests
 if(TARGET ibex_parquet)
     target_sources(ibex_tests PRIVATE test_parquet_bool_decode.cpp
                                       test_parquet_selected_runs.cpp
+                                      test_parquet_dictionary_cache.cpp
                                       test_parquet_chunked_source.cpp
                                       test_parquet_int32_ingestion.cpp
                                       test_parquet_key_filter_estimate.cpp)

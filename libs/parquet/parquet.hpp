@@ -1680,16 +1680,90 @@ inline auto decode_string_column(parquet::arrow::FileReader& reader, int leaf_in
     return emitted;
 }
 
-inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int leaf_index,
-                                     const ibex::runtime::Selection* selection,
-                                     const DirectDecodeGroups& groups,
-                                     std::vector<std::string>& dictionary,
-                                     ibex::Column<ibex::Categorical>::codes_storage& codes,
-                                     DirectValidity& validity) -> std::size_t {
+/// One scan's dictionary columns, each as the first unit to decode it found
+/// its labels, for the scan's later units to share.
+///
+/// A writer gives every row group's column chunk its own dictionary page,
+/// usually over the same labels, though not in the same order (Polars lists
+/// them as each row group first meets them). Each unit then built the same
+/// dictionary again, string by string, and the scan's unifier interned each
+/// unit's anew to remap it onto its shared one. A unit whose pages hold only a
+/// cached entry's labels maps them through the entry's index -- lookups, no
+/// inserts or allocations -- and shares the entry's dictionary, so the
+/// unifier sees one dictionary and interns it once.
+class ParquetDictionaryCache {
+   public:
+    struct Entry {
+        /// What a unit's pages are looked up in. The cache's own copy:
+        /// `shared`'s dictionary only grows, but it is shared with every
+        /// column handed out, and may grow on another thread.
+        std::vector<std::string> labels;
+        ibex::Column<ibex::Categorical>::index_map index;  ///< label -> code in `labels`
+        /// No rows; the units' columns are `shared.with_codes(codes)`.
+        ibex::Column<ibex::Categorical> shared;
+    };
+
+    [[nodiscard]] auto find(int leaf_index) const -> std::shared_ptr<const Entry> {
+        const std::lock_guard lock(mutex_);
+        const auto found = entries_.find(leaf_index);
+        return found == entries_.end() ? nullptr : found->second;
+    }
+
+    /// The entry for `leaf_index`: `labels`, unless another unit published
+    /// first.
+    auto publish(int leaf_index, const std::vector<std::string>& labels)
+        -> std::shared_ptr<const Entry> {
+        const std::lock_guard lock(mutex_);
+        auto& entry = entries_[leaf_index];
+        if (entry == nullptr) {
+            Entry built{.labels = labels, .index = {}, .shared = ibex::Column<ibex::Categorical>{labels}};
+            built.index.reserve(labels.size());
+            for (std::size_t i = 0; i < labels.size(); ++i) {
+                built.index.emplace(labels[i], static_cast<std::int32_t>(i));
+            }
+            entry = std::make_shared<const Entry>(std::move(built));
+        }
+        return entry;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::map<int, std::shared_ptr<const ParquetDictionaryCache::Entry>> entries_;
+};
+
+/// Decode a dictionary column's selected rows as codes over `dictionary`.
+///
+/// With a `cache`, a unit whose every page dictionary holds only cached labels
+/// maps its codes through the entry's index and sets `shared` to the entry: the
+/// codes are over its dictionary, and `dictionary` is left empty. On the first
+/// page with another label (or a PLAIN page) the unit falls back to interning,
+/// starting from the cached labels so the codes it wrote stay valid. A unit
+/// that found no entry publishes its dictionary for the units after it.
+inline auto decode_dictionary_column(
+    parquet::arrow::FileReader& reader, int leaf_index, const ibex::runtime::Selection* selection,
+    const DirectDecodeGroups& groups, std::vector<std::string>& dictionary,
+    ibex::Column<ibex::Categorical>::codes_storage& codes, DirectValidity& validity,
+    ParquetDictionaryCache* cache = nullptr,
+    std::shared_ptr<const ParquetDictionaryCache::Entry>* shared = nullptr) -> std::size_t {
+    const auto cached = cache != nullptr ? cache->find(leaf_index) : nullptr;
+    // Codes are over `cached->labels` until a page differs.
+    bool on_cached = cached != nullptr;
     // Hashed and looked up by view: a label already interned costs no
     // allocation, and a unit's first dictionary no tree of string compares.
     ibex::Column<ibex::Categorical>::index_map index;
+    auto leave_cached = [&] {
+        if (!on_cached) {
+            return;
+        }
+        on_cached = false;
+        dictionary = cached->labels;
+        index.reserve(dictionary.size());
+        for (std::size_t i = 0; i < dictionary.size(); ++i) {
+            index.emplace(dictionary[i], static_cast<std::int32_t>(i));
+        }
+    };
     auto intern = [&](std::string_view value) {
+        leave_cached();
         if (auto found = index.find(value); found != index.end()) {
             return found->second;
         }
@@ -1697,6 +1771,23 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
         index.emplace(std::string(value), code);
         dictionary.emplace_back(value);
         return code;
+    };
+    // `map[i]` = the cached code of page label i, when every label is cached.
+    auto map_to_cached = [&](const parquet::ByteArray* page, std::int32_t size,
+                             std::vector<std::int32_t>& map) {
+        map.clear();
+        map.reserve(static_cast<std::size_t>(size));
+        for (std::int32_t i = 0; i < size; ++i) {
+            const auto found = cached->index.find(std::string_view(
+                reinterpret_cast<const char*>(page[i].ptr),  // NOLINT(*-reinterpret-cast)
+                page[i].len));
+            if (found == cached->index.end()) {
+                map.clear();
+                return false;
+            }
+            map.push_back(found->second);
+        }
+        return true;
     };
 
     std::unique_ptr<std::int32_t[]> local_codes(
@@ -1807,8 +1898,12 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                 interned_dictionary = local_dictionary;
                 interned_size = dictionary_size;
                 local_to_global.clear();
+                if (on_cached) {
+                    (void)map_to_cached(local_dictionary, dictionary_size, local_to_global);
+                }
                 local_to_global.reserve(static_cast<std::size_t>(dictionary_size));
-                for (std::int32_t i = 0; i < dictionary_size; ++i) {
+                for (std::int32_t i = static_cast<std::int32_t>(local_to_global.size());
+                     i < dictionary_size; ++i) {
                     const auto& value = local_dictionary[i];
                     local_to_global.push_back(intern(std::string_view(
                         reinterpret_cast<const char*>(value.ptr),  // NOLINT(*-reinterpret-cast)
@@ -1895,6 +1990,17 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
             throw std::runtime_error("parquet::read: column ended before its row group");
         }
         group_start += group_rows;
+    }
+    if (shared != nullptr) {
+        if (on_cached) {
+            *shared = cached;
+        } else if (cache != nullptr && cached == nullptr && !dictionary.empty()) {
+            auto entry = cache->publish(leaf_index, dictionary);
+            if (entry->labels == dictionary) {
+                *shared = std::move(entry);
+                dictionary.clear();
+            }
+        }
     }
     return emitted;
 }
@@ -2646,7 +2752,8 @@ inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow:
 
 inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field& field,
                           int leaf_index, const ibex::runtime::Selection* selection,
-                          const DirectDecodeGroups& groups, std::size_t output_rows)
+                          const DirectDecodeGroups& groups, std::size_t output_rows,
+                          ParquetDictionaryCache* dictionary_cache = nullptr)
     -> ibex::runtime::ColumnEntry {
     DirectValidity validity(output_rows);
     ibex::runtime::ColumnEntry entry;
@@ -2751,11 +2858,15 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
             std::vector<std::string> dictionary;
             ibex::Column<ibex::Categorical>::codes_storage codes;
             codes.reserve(output_rows);
-            auto emitted = decode_dictionary_column(reader, leaf_index, selection, groups,
-                                                    dictionary, codes, validity);
+            std::shared_ptr<const ParquetDictionaryCache::Entry> shared;
+            auto emitted =
+                decode_dictionary_column(reader, leaf_index, selection, groups, dictionary, codes,
+                                         validity, dictionary_cache, &shared);
             verify(emitted);
             entry.column = std::make_shared<ibex::runtime::ColumnValue>(
-                ibex::Column<ibex::Categorical>{std::move(dictionary), std::move(codes)});
+                shared != nullptr
+                    ? shared->shared.with_codes(std::move(codes))
+                    : ibex::Column<ibex::Categorical>{std::move(dictionary), std::move(codes)});
             break;
         }
         case arrow::Type::DATE32: {
@@ -2927,7 +3038,9 @@ struct DecodeTask {
 inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> readers,
                                 const arrow::Schema& schema, const std::vector<int>& field_indices,
                                 const ibex::runtime::Selection* selection, std::size_t source_rows,
-                                const DirectDecodeGroups& groups) -> ibex::runtime::Table {
+                                const DirectDecodeGroups& groups,
+                                ParquetDictionaryCache* dictionary_cache = nullptr)
+    -> ibex::runtime::Table {
     if (readers.empty()) {
         throw std::runtime_error("parquet::read: no reader for decode");
     }
@@ -3075,7 +3188,7 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
         }
         entries[task.column] =
             direct_column(worker_reader, *schema.field(field_indices[task.column]),
-                          leaves[task.column], selection, task.range, task.rows);
+                          leaves[task.column], selection, task.range, task.rows, dictionary_cache);
     };
 
     const std::size_t workers = std::min(readers.size(), tasks.size());
@@ -4582,6 +4695,9 @@ class ParquetLazyReaderFactoryState {
         }
     }
 
+    /// Shared by every unit this factory's readers decode: one scan.
+    auto dictionary_cache() -> ParquetDictionaryCache& { return dictionary_cache_; }
+
     auto make_reader() -> std::unique_ptr<parquet::arrow::FileReader> {
         {
             std::lock_guard lock(first_reader_mutex_);
@@ -4607,6 +4723,7 @@ class ParquetLazyReaderFactoryState {
     std::unique_ptr<parquet::arrow::FileReader> first_reader_;
     std::string path_;
     std::mutex first_reader_mutex_;
+    ParquetDictionaryCache dictionary_cache_;
 };
 
 /// One independent Parquet decoder product. The Arrow schema and name index are
@@ -4680,7 +4797,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                                static_cast<std::size_t>(std::max(1, groups.end - groups.begin));
             auto readers = parallel_readers(tasks, exec);
             return direct_decode_table(std::span{readers}, *schema_, column_indices, selection,
-                                       rows_, groups);
+                                       rows_, groups, &factory_->dictionary_cache());
         } catch (const std::exception& e) {
             return std::unexpected("parquet::read: failed to read columns from " + path_ + " (" +
                                    e.what() + ")");

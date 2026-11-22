@@ -2040,6 +2040,8 @@ auto Emitter::emit_agg_func(ir::AggFunc func) -> std::string {
             return "FirstNull";
         case ir::AggFunc::LastNull:
             return "LastNull";
+        case ir::AggFunc::SqlMax:
+            return "SqlMax";
         case ir::AggFunc::Median:
             return "Median";
         case ir::AggFunc::Stddev:

@@ -41,6 +41,7 @@
 #include <variant>
 #include <vector>
 
+#include "float_extrema.hpp"
 #include "runtime_internal.hpp"
 #include "welford.hpp"
 #include "xxhash_internal.hpp"
@@ -880,6 +881,13 @@ inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc fu
             dst.double_value += src.double_value;
             dst.count += src.count;
             return;
+        case ir::AggFunc::SqlMax:
+            if (src.present()) {
+                dst.double_value = dst.present() ? float_sql_max(dst.double_value, src.double_value)
+                                                 : src.double_value;
+                dst.mark_present();
+            }
+            return;
         case ir::AggFunc::Min:
         case ir::AggFunc::Max:
             if (!src.present()) {
@@ -902,8 +910,8 @@ inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc fu
                                                          : std::max(dst.int_value, src.int_value);
             } else {
                 dst.double_value = func == ir::AggFunc::Min
-                                       ? std::min(dst.double_value, src.double_value)
-                                       : std::max(dst.double_value, src.double_value);
+                                       ? float_min(dst.double_value, src.double_value)
+                                       : float_max(dst.double_value, src.double_value);
             }
             return;
         case ir::AggFunc::Stddev: {

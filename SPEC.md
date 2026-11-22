@@ -784,6 +784,10 @@ count(col)  // counts only the non-null values of col; 0 (not null) if there are
 count_distinct(col)  // counts the distinct non-null values of col; 0 (not null) if there are none
 mean(col)   // averages only non-null values
 median(col) // ignores null rows; NaN ranks above every number
+min(col)    // ignores null rows; skips NaN unless every value is NaN (Float64)
+max(col)    // as min
+sql_min(col) // min with NaN ranked above every number, as in SQL: the same result as min
+sql_max(col) // max with NaN ranked above every number, as in SQL: NaN if any value is NaN
 first(col)  // first non-null value; null for an all-null group
 last(col)   // last non-null value; null for an all-null group
 first_null(col) // value of the first row, including null; null for empty input
@@ -795,7 +799,7 @@ corr(x, y)  // as cov, and null when either column is constant over those rows
 ```
 
 Over a `Decimal(p, s)` column, `sum` is `Decimal(38, s)` (exact, and an error
-past 38 digits); `min`, `max`, `first`, `last`, `first_null` and `last_null` keep the column's type;
+past 38 digits); `min`, `max`, `sql_min`, `sql_max`, `first`, `last`, `first_null` and `last_null` keep the column's type;
 `mean` divides the exact sum in decimal (without capping the quotient's scale at 38) and only then
 converts to `Float64`, so `mean` of `0.10, 0.20, 0.30` is exactly `0.2`; `count` and
 `count_distinct` are `Int64`. The statistical aggregates (`median`, `std`,
@@ -809,7 +813,10 @@ as null in an `update ... by` field (including compound expressions such as
 
 IEEE floating-point `NaN`, `+Inf`, and `-Inf` values are **not** null. They are
 stored as ordinary `Float64` payloads and are therefore not skipped
-automatically by aggregate functions.
+automatically by aggregate functions, with one exception: `min` and `max` skip
+`NaN` unless every present value in the group is `NaN`, which is Polars' rule.
+`sql_min` and `sql_max` rank `NaN` above every number, as DuckDB and PostgreSQL
+do, so `sql_max` is `NaN` when any value is and `sql_min` agrees with `min`.
 
 #### Null Keys
 
@@ -2925,7 +2932,9 @@ The following built-in functions are **aggregate functions**. They consume a
 | `sum(col)`            | `Series<Numeric>`  | Same numeric type | Returns null for an all-null group. |
 | `mean(col)`           | `Series<Numeric>`  | `Float64`  | |
 | `min(col)`            | `Series<T>`        | `T`        | `T` is numeric, `Date`, `Timestamp` or `String` (including categorical). Strings compare byte-wise, i.e. by UTF-8 code point, so `"Z" < "a"`; dates and timestamps chronologically. |
-| `max(col)`            | `Series<T>`        | `T`        | As `min`. |
+| `max(col)`            | `Series<T>`        | `T`        | As `min`. Over Float64 both skip NaN unless every value is NaN. |
+| `sql_min(col)`        | `Series<T>`        | `T`        | `min` with NaN ranked above every number, as in SQL; always the same result as `min`. |
+| `sql_max(col)`        | `Series<T>`        | `T`        | `max` with NaN ranked above every number, as in SQL: NaN when any value is NaN. Otherwise as `max`. |
 | `count()`             | (none)             | `Int64`    | Counts rows in the group, nulls included. |
 | `count(col)`          | `Series<T>`        | `Int64`    | Counts the **non-null** values of `col`; `0` (not null) for a group with none. The argument must be a column name. |
 | `count_distinct(col)` | `Series<T>`        | `Int64`    | Counts the number of **distinct non-null** values of `col` in the group; `0` (not null) for a group with none. `T` may be any scalar type. |

@@ -8,6 +8,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -45,9 +46,11 @@ class AggregateChunks final : public runtime::Operator {
     std::weak_ptr<runtime::ColumnValue> previous_;
 };
 auto aggregate_chunks(std::vector<runtime::Chunk> chunks, const std::vector<ir::ColumnRef>& keys,
-                      const std::vector<ir::AggSpec>& aggs, bool require_release = false) {
+                      const std::vector<ir::AggSpec>& aggs, bool require_release = false,
+                      std::size_t threads = 1) {
     runtime::ExecutionContext exec;
-    exec.parallel_threads = 1;
+    exec.parallel_threads = threads;
+    exec.parallel_min_rows = 0;
     return runtime::MaterializeOperator(
                runtime::make_chunked_aggregate_operator(
                    std::make_unique<AggregateChunks>(std::move(chunks), require_release), &keys,
@@ -154,6 +157,59 @@ TEST_CASE("sorted aggregate preserves null keys introduced in later chunks", "[a
     REQUIRE(runtime::is_null(*out->find_entry("k"), preceding_groups + 1));
     REQUIRE(ints(*out, "s")[preceding_groups] == (first_later_valid ? 30 : 10));
     REQUIRE(ints(*out, "s")[preceding_groups + 1] == (first_later_valid ? 80 : 100));
+}
+
+TEST_CASE("streamed min and max skip NaN across chunks", "[aggregate][nan]") {
+    // Each group's NaN arrives in a different chunk from its numbers, so the
+    // per-chunk fold and the merge both meet the NaN-first case. Group 3 is
+    // all NaN; group 5 is {-inf, NaN}.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    const bool keys_sorted = GENERATE(false, true);
+    const std::size_t threads = GENERATE(std::size_t{1}, std::size_t{4});
+    INFO("sorted " << keys_sorted << " threads " << threads);
+    runtime::Chunk first;
+    runtime::Chunk second;
+    if (keys_sorted) {
+        first.add_column("k", Column<std::int64_t>{1, 2, 3});
+        first.add_column("v", Column<double>{nan, 2.0, nan});
+        second.add_column("k", Column<std::int64_t>{3, 4, 4, 5, 5});
+        second.add_column("v", Column<double>{nan, 4.0, 6.0, -inf, nan});
+        sorted(first);
+        sorted(second);
+    } else {
+        first.add_column("k", Column<std::int64_t>{1, 2, 3, 5, 2});
+        first.add_column("v", Column<double>{nan, 2.0, nan, nan, 5.0});
+        second.add_column("k", Column<std::int64_t>{1, 4, 2, 3, 1, 4, 5});
+        second.add_column("v", Column<double>{1.0, 4.0, nan, nan, 3.0, 6.0, -inf});
+    }
+    auto out =
+        aggregate_chunks({first, second}, {{.name = "k"}},
+                         {{.func = ir::AggFunc::Min, .column = {.name = "v"}, .alias = "lo"},
+                          {.func = ir::AggFunc::Max, .column = {.name = "v"}, .alias = "hi"}},
+                         false, threads);
+    REQUIRE(out.has_value());
+    // Group 1 holds 1 and 3 unsorted, 1 alone sorted (its later rows would
+    // break the order); every other group is the same either way.
+    const std::map<std::int64_t, std::pair<double, double>> expected{
+        {1, keys_sorted ? std::pair{nan, nan} : std::pair{1.0, 3.0}},
+        {2, keys_sorted ? std::pair{2.0, 2.0} : std::pair{2.0, 5.0}},
+        {3, {nan, nan}},
+        {4, {4.0, 6.0}},
+        {5, {-inf, -inf}}};
+    const auto& k = ints(*out, "k");
+    const auto& lo = std::get<Column<double>>(*out->find("lo"));
+    const auto& hi = std::get<Column<double>>(*out->find("hi"));
+    REQUIRE(k.size() == expected.size());
+    const auto same = [](double actual, double wanted) {
+        return std::isnan(wanted) ? std::isnan(actual) : actual == wanted;
+    };
+    for (std::size_t row = 0; row < k.size(); ++row) {
+        INFO("group " << k[row]);
+        const auto& [want_lo, want_hi] = expected.at(k[row]);
+        CHECK(same(lo[row], want_lo));
+        CHECK(same(hi[row], want_hi));
+    }
 }
 
 TEST_CASE("sorted string extrema use the supported aggregate path", "[aggregate][audit]") {

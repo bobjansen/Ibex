@@ -138,6 +138,7 @@ constexpr auto kMoreCompletionBuiltins = std::to_array<std::string_view>({
     "rolling_sum",  "round",
     "scalar",       "seed_rng",
     "seq",          "skew",
+    "sql_max",      "sql_min",
     "sqrt",         "std",
     "sum",          "summary",
     "trunc",        "filter",

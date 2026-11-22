@@ -315,6 +315,7 @@ enum class AggFunc : std::uint8_t {
                 ///< neither constant; always returns double).
     FirstNull,  ///< First row value, including null; null for empty input.
     LastNull,   ///< Last row value, including null; null for empty input.
+    SqlMax,     ///< sql_max(col): as Max, but NaN ranks above every number, so any NaN wins.
 };
 
 /// Whether `func` reads two columns (`AggSpec::column` and `AggSpec::paired`).

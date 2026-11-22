@@ -44,6 +44,7 @@
 #include <immintrin.h>
 #endif
 
+#include "float_extrema.hpp"
 #include "interpreter_internal.hpp"
 
 namespace ibex::runtime {
@@ -2023,11 +2024,11 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
                                             break;
                                         case ir::AggFunc::Min:
                                             for (std::size_t j = lo + 1; j < hi; ++j)
-                                                v = std::min(v, src[j]);
+                                                v = fold_min(v, src[j]);
                                             break;
                                         case ir::AggFunc::Max:
                                             for (std::size_t j = lo + 1; j < hi; ++j)
-                                                v = std::max(v, src[j]);
+                                                v = fold_max(v, src[j]);
                                             break;
                                         case ir::AggFunc::Sum: {
                                             T sum = T{};
@@ -2294,22 +2295,25 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
                             out.add_column(agg.alias, std::move(c));
                             return;
                         }
-                        const T init = agg.func == ir::AggFunc::Min ? std::numeric_limits<T>::max()
-                                       : agg.func == ir::AggFunc::Max
-                                           ? std::numeric_limits<T>::lowest()
-                                           : T{};
+                        // A floating-point extremum starts at NaN, "no number
+                        // yet", so an all-NaN bucket stays NaN (float_extrema.hpp).
+                        const T init =
+                            agg.func != ir::AggFunc::Min && agg.func != ir::AggFunc::Max ? T{}
+                            : std::is_floating_point_v<T>  ? std::numeric_limits<T>::quiet_NaN()
+                            : agg.func == ir::AggFunc::Min ? std::numeric_limits<T>::max()
+                                                           : std::numeric_limits<T>::lowest();
                         std::vector<T> acc(n_out, init);
                         switch (agg.func) {
                             case ir::AggFunc::Min:
                                 for (std::size_t i = 0; i < rows; ++i) {
                                     T& a = acc[row_out[i]];
-                                    a = std::min(a, src[i]);
+                                    a = fold_min(a, src[i]);
                                 }
                                 break;
                             case ir::AggFunc::Max:
                                 for (std::size_t i = 0; i < rows; ++i) {
                                     T& a = acc[row_out[i]];
-                                    a = std::max(a, src[i]);
+                                    a = fold_max(a, src[i]);
                                 }
                                 break;
                             default:  // Sum

@@ -63,6 +63,8 @@ auto agg_name(ir::AggFunc func) -> std::string_view {
             return "first_null";
         case ir::AggFunc::LastNull:
             return "last_null";
+        case ir::AggFunc::SqlMax:
+            return "sql_max";
         case ir::AggFunc::Median:
             return "median";
         case ir::AggFunc::Stddev:

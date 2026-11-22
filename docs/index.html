@@ -98,7 +98,8 @@
         <p>Named clauses describe each transformation, and columns are
         referenced directly by name. Aggregates <code>first</code> and <code>last</code>
         skip nulls; <code>first_null</code> and <code>last_null</code> preserve the edge row,
-        including its null value. In Ibex you write <code>px</code>, not
+        including its null value. <code>min</code> and <code>max</code> skip NaN as Polars
+        does; <code>sql_max</code> ranks NaN highest as SQL does. In Ibex you write <code>px</code>, not
         <code>pl.col("px")</code>.</p>
       </article>
       <article class="card">

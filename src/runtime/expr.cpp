@@ -851,7 +851,7 @@ auto validate_builtin(std::string_view name, const BuiltinFn& fn) -> void {
     }
     if (const auto* aggregate = std::get_if<AggregateExec>(&fn.exec);
         aggregate != nullptr && static_cast<std::uint8_t>(aggregate->func) >
-                                    static_cast<std::uint8_t>(ir::AggFunc::LastNull)) {
+                                    static_cast<std::uint8_t>(ir::AggFunc::SqlMax)) {
         builtin_invariant(name, "AggregateExec has an invalid aggregate function id");
     }
 }
@@ -1905,7 +1905,8 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 return ExprType::Int;
             }
             if (name == "sum" || name == "min" || name == "max" || name == "first" ||
-                name == "last" || name == "first_null" || name == "last_null") {
+                name == "last" || name == "first_null" || name == "last_null" ||
+                name == "sql_min" || name == "sql_max") {
                 // Type-preserving reductions.
                 if (a.empty()) {
                     return std::unexpected(std::string(name) + "(): expected column argument");
@@ -1914,11 +1915,13 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             }
             return ExprType::Double;  // mean/median/std/ewma/quantile/skew/kurtosis/cov/corr
         };
-        constexpr std::array<std::pair<std::string_view, ir::AggFunc>, 18> agg_funcs{{
+        constexpr std::array<std::pair<std::string_view, ir::AggFunc>, 20> agg_funcs{{
             {"sum", ir::AggFunc::Sum},
             {"mean", ir::AggFunc::Mean},
             {"min", ir::AggFunc::Min},
             {"max", ir::AggFunc::Max},
+            {"sql_min", ir::AggFunc::Min},
+            {"sql_max", ir::AggFunc::SqlMax},
             {"count", ir::AggFunc::Count},
             {"count_distinct", ir::AggFunc::CountDistinct},
             {"first", ir::AggFunc::First},

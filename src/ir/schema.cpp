@@ -288,6 +288,7 @@ auto agg_result_type(const AggSpec& agg, const SchemaInfo& input) -> std::option
         case AggFunc::Last:
         case AggFunc::FirstNull:
         case AggFunc::LastNull:
+        case AggFunc::SqlMax:
             // These preserve the input column's type.
             if (const auto* field = input.find(agg.column.name)) {
                 return field->type;

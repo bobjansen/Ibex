@@ -128,6 +128,7 @@ auto agg_nullability(const AggSpec& agg, const SchemaInfo& input, bool grouped) 
         case AggFunc::Last:
         case AggFunc::FirstNull:
         case AggFunc::LastNull:
+        case AggFunc::SqlMax:
         case AggFunc::Mean:
         case AggFunc::Median:
             // A value drawn from, or a mean over, at least one present value.

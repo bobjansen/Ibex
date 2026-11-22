@@ -41,6 +41,7 @@
 #include <immintrin.h>
 #endif
 
+#include "float_extrema.hpp"
 #include "interpreter_internal.hpp"
 #include "runtime_internal.hpp"
 #include "welford.hpp"
@@ -110,6 +111,23 @@ auto global_aggregate_of_empty(const std::vector<ColumnEntry>& empty_columns,
 auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group_by,
                      const std::vector<ir::AggSpec>& aggregations, const ExecutionContext* exec)
     -> std::expected<Table, std::string> {
+    // sql_max differs from max only in how it ranks NaN, so over anything but
+    // Float64 it is max, and the paths below meet it only on Float64.
+    if (std::ranges::any_of(aggregations, [&](const ir::AggSpec& agg) {
+            const auto* col = input.find(agg.column.name);
+            return agg.func == ir::AggFunc::SqlMax &&
+                   (col == nullptr || !std::holds_alternative<Column<double>>(*col));
+        })) {
+        std::vector<ir::AggSpec> as_max = aggregations;
+        for (auto& agg : as_max) {
+            const auto* col = input.find(agg.column.name);
+            if (agg.func == ir::AggFunc::SqlMax &&
+                (col == nullptr || !std::holds_alternative<Column<double>>(*col))) {
+                agg.func = ir::AggFunc::Max;
+            }
+        }
+        return aggregate_table(input, group_by, as_max, exec);
+    }
     // A Decimal input needs int128 accumulators with checked overflow, which
     // the fixed-width slots below do not have; that path delegates any other
     // aggregate in the query back here.
@@ -273,10 +291,11 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
 
         if (agg.func == ir::AggFunc::FirstNull || agg.func == ir::AggFunc::LastNull ||
-            agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
-            agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
-            agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis ||
-            agg.func == ir::AggFunc::CountDistinct || ir::agg_is_paired(agg.func)) {
+            agg.func == ir::AggFunc::SqlMax || agg.func == ir::AggFunc::Median ||
+            agg.func == ir::AggFunc::Stddev || agg.func == ir::AggFunc::Ewma ||
+            agg.func == ir::AggFunc::Quantile || agg.func == ir::AggFunc::Skew ||
+            agg.func == ir::AggFunc::Kurtosis || agg.func == ir::AggFunc::CountDistinct ||
+            ir::agg_is_paired(agg.func)) {
             // CountDistinct keeps a per-group set of seen values -- like the
             // moment aggregates it cannot be folded into a scalar accumulator,
             // so it takes the row-wise grouping path below.
@@ -342,14 +361,22 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             // an edge row independently of its validity.
             if ((agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
                  agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max ||
-                 agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last ||
-                 agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
-                 agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
-                 agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) &&
+                 agg.func == ir::AggFunc::SqlMax || agg.func == ir::AggFunc::First ||
+                 agg.func == ir::AggFunc::Last || agg.func == ir::AggFunc::Median ||
+                 agg.func == ir::AggFunc::Stddev || agg.func == ir::AggFunc::Ewma ||
+                 agg.func == ir::AggFunc::Quantile || agg.func == ir::AggFunc::Skew ||
+                 agg.func == ir::AggFunc::Kurtosis) &&
                 agg_validity[i] != nullptr && !(*agg_validity[i])[row]) {
                 continue;
             }
             const ColumnValue& column = *agg_columns[i];
+            if (agg.func == ir::AggFunc::SqlMax) {  // Float64 only, see the top
+                const double value = std::get<Column<double>>(column)[row];
+                slot.double_value =
+                    slot.has_value ? float_sql_max(slot.double_value, value) : value;
+                slot.has_value = true;
+                continue;
+            }
             if (agg.func == ir::AggFunc::FirstNull || agg.func == ir::AggFunc::LastNull) {
                 // count records encounter, independently of the selected row's validity.
                 if (agg.func == ir::AggFunc::FirstNull && slot.count != 0) {
@@ -491,6 +518,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Last:
                     case ir::AggFunc::FirstNull:
                     case ir::AggFunc::LastNull:
+                    case ir::AggFunc::SqlMax:
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
@@ -519,14 +547,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         slot.count += 1;
                         break;
                     case ir::AggFunc::Min:
-                        if (!slot.has_value || value < slot.double_value) {
-                            slot.double_value = value;
-                        }
+                        slot.double_value =
+                            slot.has_value ? float_min(slot.double_value, value) : value;
                         break;
                     case ir::AggFunc::Max:
-                        if (!slot.has_value || value > slot.double_value) {
-                            slot.double_value = value;
-                        }
+                        slot.double_value =
+                            slot.has_value ? float_max(slot.double_value, value) : value;
                         break;
                     case ir::AggFunc::Count:
                     case ir::AggFunc::CountDistinct:
@@ -534,6 +560,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Last:
                     case ir::AggFunc::FirstNull:
                     case ir::AggFunc::LastNull:
+                    case ir::AggFunc::SqlMax:
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
@@ -612,6 +639,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Last:
                     case ir::AggFunc::FirstNull:
                     case ir::AggFunc::LastNull:
+                    case ir::AggFunc::SqlMax:
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
@@ -639,14 +667,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         slot.count += 1;
                         break;
                     case ir::AggFunc::Min:
-                        if (!slot.has_value || value < slot.double_value) {
-                            slot.double_value = value;
-                        }
+                        slot.double_value =
+                            slot.has_value ? float_min(slot.double_value, value) : value;
                         break;
                     case ir::AggFunc::Max:
-                        if (!slot.has_value || value > slot.double_value) {
-                            slot.double_value = value;
-                        }
+                        slot.double_value =
+                            slot.has_value ? float_max(slot.double_value, value) : value;
                         break;
                     case ir::AggFunc::Count:
                     case ir::AggFunc::CountDistinct:
@@ -654,6 +680,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Last:
                     case ir::AggFunc::FirstNull:
                     case ir::AggFunc::LastNull:
+                    case ir::AggFunc::SqlMax:
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
@@ -699,6 +726,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 case ir::AggFunc::Kurtosis:
                 case ir::AggFunc::Cov:
                 case ir::AggFunc::Corr:
+                case ir::AggFunc::SqlMax:  // Float64 only, see the top
                     column = Column<double>{};
                     break;
                 case ir::AggFunc::Sum:
@@ -765,6 +793,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 case ir::AggFunc::Sum:
                 case ir::AggFunc::Min:
                 case ir::AggFunc::Max:
+                case ir::AggFunc::SqlMax:
                     if (slot.kind == ExprType::Double) {
                         append_scalar(*column, slot.double_value);
                     } else if (slot.kind == ExprType::String) {
@@ -829,6 +858,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             case ir::AggFunc::Sum:
             case ir::AggFunc::Min:
             case ir::AggFunc::Max:
+            case ir::AggFunc::SqlMax:
             case ir::AggFunc::First:
             case ir::AggFunc::Last:
             case ir::AggFunc::FirstNull:
@@ -1040,10 +1070,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         break;
                     }
                     case ir::AggFunc::Min: {
-                        std::vector<double> acc(n_groups, std::numeric_limits<double>::infinity());
+                        std::vector<double> acc(n_groups, std::numeric_limits<double>::quiet_NaN());
                         for (std::size_t row = 0; row < rows; ++row) {
                             const std::uint32_t g = gids[row];
-                            acc[g] = std::min(data[row], acc[g]);
+                            acc[g] = float_min(acc[g], data[row]);
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
                             slot_for(g).double_value = acc[g];
@@ -1052,10 +1082,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         break;
                     }
                     case ir::AggFunc::Max: {
-                        std::vector<double> acc(n_groups, -std::numeric_limits<double>::infinity());
+                        std::vector<double> acc(n_groups, std::numeric_limits<double>::quiet_NaN());
                         for (std::size_t row = 0; row < rows; ++row) {
                             const std::uint32_t g = gids[row];
-                            acc[g] = std::max(data[row], acc[g]);
+                            acc[g] = float_max(acc[g], data[row]);
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
                             slot_for(g).double_value = acc[g];
@@ -1858,12 +1888,13 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto func = aggregations[i].func;
             if (func == ir::AggFunc::Sum || func == ir::AggFunc::Mean || func == ir::AggFunc::Min ||
-                func == ir::AggFunc::Max || func == ir::AggFunc::First ||
-                func == ir::AggFunc::Last || func == ir::AggFunc::FirstNull ||
-                func == ir::AggFunc::LastNull || func == ir::AggFunc::Median ||
-                func == ir::AggFunc::Stddev || func == ir::AggFunc::Ewma ||
-                func == ir::AggFunc::Quantile || func == ir::AggFunc::Skew ||
-                func == ir::AggFunc::Kurtosis || ir::agg_is_paired(func)) {
+                func == ir::AggFunc::Max || func == ir::AggFunc::SqlMax ||
+                func == ir::AggFunc::First || func == ir::AggFunc::Last ||
+                func == ir::AggFunc::FirstNull || func == ir::AggFunc::LastNull ||
+                func == ir::AggFunc::Median || func == ir::AggFunc::Stddev ||
+                func == ir::AggFunc::Ewma || func == ir::AggFunc::Quantile ||
+                func == ir::AggFunc::Skew || func == ir::AggFunc::Kurtosis ||
+                ir::agg_is_paired(func)) {
                 track_agg_validity[i] = 1U;
                 agg_validity_out[i].reserve(group_order.size());
             }

@@ -7180,6 +7180,179 @@ TEST_CASE("Interpret quantile aggregation (p=0 and p=1)") {
     CHECK((*qv_max)[0] == Catch::Approx(5.0));
 }
 
+TEST_CASE("min and max skip NaN unless every value is NaN, sql_max ranks it highest",
+          "[interpreter][aggregate][nan]") {
+    // Polars' rule for min/max: NaN loses to any number, so a group is NaN only
+    // when all of its values are. sql_max ranks NaN above every number (DuckDB,
+    // PostgreSQL); sql_min is min. Each group puts its NaN in a different place
+    // because the old kernels kept a NaN that arrived first, and skipped it
+    // otherwise.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    const std::vector<std::int64_t> keys{1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5, 5};
+    const std::vector<double> values{nan, 1.0, 3.0, 2.0, nan, 5.0, nan, nan, 4.0, 6.0, -inf, nan};
+    struct Expected {
+        double lo, hi, sql_hi;
+    };
+    const std::array<Expected, 5> expected{
+        {{1.0, 3.0, nan}, {2.0, 5.0, nan}, {nan, nan, nan}, {4.0, 6.0, 6.0}, {-inf, -inf, nan}}};
+    const auto same = [](double actual, double wanted) {
+        return std::isnan(wanted) ? std::isnan(actual) : actual == wanted;
+    };
+    const auto table_with = [&](bool text_keys) {
+        runtime::Table table;
+        if (text_keys) {
+            Column<std::string> names;
+            for (const auto key : keys) {
+                names.push_back(std::string(1, static_cast<char>('a' + key - 1)));
+            }
+            table.add_column("g", std::move(names));
+        } else {
+            table.add_column("g", Column<std::int64_t>(keys));
+        }
+        table.add_column("v", Column<double>(values));
+        return table;
+    };
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    const auto check_grouped = [&](const runtime::Table& table, const char* query) {
+        INFO(query);
+        runtime::TableRegistry registry;
+        registry.emplace("t", table);
+        auto ir = require_ir(query);
+        for (const auto* exec : {&serial, &parallel}) {
+            auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+            REQUIRE(result.has_value());
+            REQUIRE(result->rows() == expected.size());
+            const auto& lo = std::get<Column<double>>(*result->find("lo"));
+            const auto& hi = std::get<Column<double>>(*result->find("hi"));
+            const auto& sql_lo = std::get<Column<double>>(*result->find("sql_lo"));
+            const auto& sql_hi = std::get<Column<double>>(*result->find("sql_hi"));
+            for (std::size_t g = 0; g < expected.size(); ++g) {
+                INFO("group " << g + 1 << " threads " << exec->parallel_threads);
+                CHECK(same(lo[g], expected[g].lo));
+                CHECK(same(hi[g], expected[g].hi));
+                CHECK(same(sql_lo[g], expected[g].lo));
+                CHECK(same(sql_hi[g], expected[g].sql_hi));
+            }
+        }
+    };
+    constexpr const char* kQuery =
+        "t[select { lo = min(v), hi = max(v), sql_lo = sql_min(v), sql_hi = sql_max(v) }, by g]"
+        "[order g];";
+
+    SECTION("integer key") {
+        check_grouped(table_with(false), kQuery);
+    }
+    SECTION("string key") {
+        check_grouped(table_with(true), kQuery);
+    }
+    SECTION("alongside an aggregate that needs the row-wise path") {
+        check_grouped(table_with(false),
+                      "t[select { lo = min(v), hi = max(v), sql_lo = sql_min(v), "
+                      "sql_hi = sql_max(v), m = median(v) }, by g][order g];");
+    }
+    SECTION("ungrouped") {
+        runtime::TableRegistry registry;
+        registry.emplace("t", table_with(false));
+        auto ir = require_ir("t[select { lo = min(v), hi = max(v), sql_hi = sql_max(v) }];");
+        for (const auto* exec : {&serial, &parallel}) {
+            auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+            REQUIRE(result.has_value());
+            CHECK(std::get<Column<double>>(*result->find("lo"))[0] == -inf);
+            CHECK(std::get<Column<double>>(*result->find("hi"))[0] == 6.0);
+            CHECK(std::isnan(std::get<Column<double>>(*result->find("sql_hi"))[0]));
+        }
+    }
+    SECTION("nulls are skipped before NaN is ranked") {
+        // Group 1: {null, NaN, 1} -> 1; group 2: {null, NaN} -> NaN; group 3:
+        // {null} -> null for all three.
+        Column<double> raw{0.0, nan, 1.0, 0.0, nan, 0.0};
+        runtime::ValidityBitmap valid(raw.size(), true);
+        valid.set(0, false);
+        valid.set(3, false);
+        valid.set(5, false);
+        runtime::Table table;
+        table.add_column("g", Column<std::int64_t>{1, 1, 1, 2, 2, 3});
+        table.add_column("v", std::move(raw), std::move(valid));
+        runtime::TableRegistry registry;
+        registry.emplace("t", table);
+        auto ir = require_ir(
+            "t[select { lo = min(v), hi = max(v), sql_hi = sql_max(v) }, by g][order g];");
+        for (const auto* exec : {&serial, &parallel}) {
+            auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, *exec);
+            REQUIRE(result.has_value());
+            const auto* lo = result->find_entry("lo");
+            const auto* hi = result->find_entry("hi");
+            const auto* sql_hi = result->find_entry("sql_hi");
+            const auto& lo_v = std::get<Column<double>>(*lo->column);
+            const auto& hi_v = std::get<Column<double>>(*hi->column);
+            const auto& sql_v = std::get<Column<double>>(*sql_hi->column);
+            CHECK(lo_v[0] == 1.0);
+            CHECK(hi_v[0] == 1.0);
+            CHECK(std::isnan(sql_v[0]));
+            CHECK(std::isnan(lo_v[1]));
+            CHECK(std::isnan(hi_v[1]));
+            CHECK(std::isnan(sql_v[1]));
+            for (const auto* entry : {lo, hi, sql_hi}) {
+                REQUIRE(entry->validity.has_value());
+                CHECK((*entry->validity)[1]);
+                CHECK_FALSE((*entry->validity)[2]);
+            }
+        }
+    }
+    SECTION("sql_max over integers is max") {
+        runtime::Table table;
+        table.add_column("g", Column<std::int64_t>{1, 1, 2});
+        table.add_column("v", Column<std::int64_t>{3, 7, -2});
+        runtime::TableRegistry registry;
+        registry.emplace("t", table);
+        auto ir = require_ir("t[select { hi = sql_max(v), lo = sql_min(v) }, by g][order g];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto& hi = std::get<Column<std::int64_t>>(*result->find("hi"));
+        const auto& lo = std::get<Column<std::int64_t>>(*result->find("lo"));
+        REQUIRE(hi.size() == 2);
+        CHECK(hi[0] == 7);
+        CHECK(hi[1] == -2);
+        CHECK(lo[0] == 3);
+        CHECK(lo[1] == -2);
+    }
+    SECTION("resample buckets") {
+        // Buckets of 2ns: {NaN, 1}, {2, NaN}, {NaN, NaN}.
+        runtime::Table table;
+        table.add_column("ts",
+                         Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                           ts_from_nanos(3), ts_from_nanos(4), ts_from_nanos(5)});
+        table.add_column("symbol", Column<std::string>{"A", "A", "A", "A", "A", "A"});
+        table.add_column("val", Column<double>{nan, 1.0, 2.0, nan, nan, nan});
+        table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+        runtime::TableRegistry registry;
+        registry.emplace("data", table);
+        for (const char* query :
+             {"data[resample 2ns, select { lo = min(val), hi = max(val) }];",
+              "data[resample 2ns, by symbol, select { lo = min(val), hi = max(val) }];"}) {
+            INFO(query);
+            auto ir = require_ir(query);
+            auto result = runtime::interpret(*ir, registry);
+            REQUIRE(result.has_value());
+            const auto& lo = std::get<Column<double>>(*result->find("lo"));
+            const auto& hi = std::get<Column<double>>(*result->find("hi"));
+            REQUIRE(lo.size() == 3);
+            CHECK(lo[0] == 1.0);
+            CHECK(hi[0] == 1.0);
+            CHECK(lo[1] == 2.0);
+            CHECK(hi[1] == 2.0);
+            CHECK(std::isnan(lo[2]));
+            CHECK(std::isnan(hi[2]));
+        }
+    }
+}
+
 TEST_CASE("median and quantile rank NaN above every number like Polars and DuckDB") {
     // NaN sorts above +inf (as in `order`), so it fills the top positions: a
     // selected position inside that tail is NaN, one below it is not. Expected

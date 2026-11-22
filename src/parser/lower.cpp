@@ -6798,6 +6798,12 @@ class Lowerer {
         if (name == "max") {
             return ir::AggFunc::Max;
         }
+        if (name == "sql_min") {
+            return ir::AggFunc::Min;  // NaN ranks highest, so SQL's min is min
+        }
+        if (name == "sql_max") {
+            return ir::AggFunc::SqlMax;
+        }
         if (name == "count") {
             return ir::AggFunc::Count;
         }

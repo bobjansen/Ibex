@@ -1,0 +1,14 @@
+// min/max skip NaN unless a group holds nothing else (Polars' rule);
+// sql_max ranks NaN above every number (DuckDB, PostgreSQL), so any NaN wins.
+// sql_min always agrees with min: a NaN ranked highest never is the minimum.
+let quotes = Table {
+    symbol = ["AAPL", "AAPL", "MSFT", "MSFT", "NVDA"],
+    num    = [101.2, 0.0, 299.8, 300.2, 0.0],
+    den    = [1.0, 0.0, 1.0, 1.0, 0.0]
+};
+// 0/0 is NaN: AAPL holds {101.2, NaN}, MSFT no NaN, NVDA only NaN.
+quotes[update { px = num / den }][select {
+    lo = min(px),         // 101.2, 299.8, NaN
+    hi = max(px),         // 101.2, 300.2, NaN
+    sql_hi = sql_max(px), // NaN,   300.2, NaN
+}, by symbol, order symbol];

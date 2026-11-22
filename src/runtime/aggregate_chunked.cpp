@@ -8222,7 +8222,7 @@ class HashAggregateState final {
                     }
                     auto& slot = slot_for(gids[row]);
                     const double v = data[row];
-                    slot.double_value = slot.present() ? std::min(slot.double_value, v) : v;
+                    slot.double_value = slot.present() ? float_min(slot.double_value, v) : v;
                     slot.mark_present();
                 }
                 break;
@@ -8234,7 +8234,7 @@ class HashAggregateState final {
                     }
                     auto& slot = slot_for(gids[row]);
                     const double v = data[row];
-                    slot.double_value = slot.present() ? std::max(slot.double_value, v) : v;
+                    slot.double_value = slot.present() ? float_max(slot.double_value, v) : v;
                     slot.mark_present();
                 }
                 break;
@@ -8850,14 +8850,14 @@ class HashAggregateState final {
                     case ir::AggFunc::Min:
                         each([&](std::size_t r) {
                             slot.double_value =
-                                slot.present() ? std::min(slot.double_value, data[r]) : data[r];
+                                slot.present() ? float_min(slot.double_value, data[r]) : data[r];
                             slot.mark_present();
                         });
                         break;
                     case ir::AggFunc::Max:
                         each([&](std::size_t r) {
                             slot.double_value =
-                                slot.present() ? std::max(slot.double_value, data[r]) : data[r];
+                                slot.present() ? float_max(slot.double_value, data[r]) : data[r];
                             slot.mark_present();
                         });
                         break;
@@ -10990,7 +10990,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     }
                     if constexpr (std::is_same_v<T, const double*>) {
                         slot.double_value =
-                            slot.present() ? std::min(slot.double_value, data[row]) : data[row];
+                            slot.present() ? float_min(slot.double_value, data[row]) : data[row];
                     } else {
                         const std::int64_t v = data[row];
                         slot.int_value = slot.present() ? std::min(slot.int_value, v) : v;
@@ -11005,7 +11005,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     }
                     if constexpr (std::is_same_v<T, const double*>) {
                         slot.double_value =
-                            slot.present() ? std::max(slot.double_value, data[row]) : data[row];
+                            slot.present() ? float_max(slot.double_value, data[row]) : data[row];
                     } else {
                         const std::int64_t v = data[row];
                         slot.int_value = slot.present() ? std::max(slot.int_value, v) : v;

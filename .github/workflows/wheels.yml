@@ -193,3 +193,10 @@ jobs:
           EOF
           gh release create wheels-latest dist/* --prerelease --target "$GITHUB_SHA" \
             --title "Python wheels (main)" --notes-file notes.md
+          # `gh release create` with files makes a draft, uploads, then
+          # publishes it. On 2026-11-22 the publish did not stick: the job
+          # passed, the release stayed a draft, and pip saw no wheels (a
+          # draft's assets are not on expanded_assets). Publish explicitly
+          # and fail unless the release is public.
+          gh release edit wheels-latest --draft=false
+          test "$(gh release view wheels-latest --json isDraft --jq .isDraft)" = false

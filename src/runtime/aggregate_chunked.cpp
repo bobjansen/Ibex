@@ -1774,6 +1774,199 @@ class HashAggregateState final {
                par_.accumulation.worker_cap >= 2;
     }
 
+    /// `parts` joined into one chunk on the worker pool; nullopt when they
+    /// need what only `MaterializeOperator`'s join does (a Categorical column
+    /// over another dictionary than the first part's, which it unifies; a
+    /// schema mismatch, which it reports).
+    ///
+    /// The join ran on the thread driving the query, serially: a many-group
+    /// `by { symbol, day }` over a 10M-row Parquet scan spent 61 ms of its
+    /// 248 there, against none in memory. A fixed-width column (Categorical
+    /// codes included, compact Int32 storage kept compact) is sized once for
+    /// the batch without initializing it (`NoInitVector`), and every part is
+    /// copied to its offset by a task of its own; a String or Bool column, or
+    /// Int64 parts that mix compact and wide storage, is appended by one task.
+    [[nodiscard]] static auto join_batch_by_column(std::vector<Chunk>& parts)
+        -> std::optional<Chunk> {
+        const Chunk& head = parts.front();
+        const std::size_t n_cols = head.columns.size();
+        if (n_cols == 0) {
+            return std::nullopt;
+        }
+        std::vector<std::size_t> offsets(parts.size() + 1, 0);
+        for (std::size_t p = 0; p < parts.size(); ++p) {
+            const Chunk& part = parts[p];
+            if (part.columns.size() != n_cols) {
+                return std::nullopt;
+            }
+            for (std::size_t c = 0; c < n_cols; ++c) {
+                const ColumnEntry& entry = part.columns[c];
+                const ColumnEntry& first = head.columns[c];
+                if (entry.name != first.name || entry.column->index() != first.column->index()) {
+                    return std::nullopt;
+                }
+                if (const auto* cat = std::get_if<Column<Categorical>>(entry.column.get());
+                    cat != nullptr &&
+                    cat->dictionary_identity() !=
+                        std::get<Column<Categorical>>(*first.column).dictionary_identity()) {
+                    return std::nullopt;
+                }
+            }
+            offsets[p + 1] = offsets[p] + part.rows();
+        }
+        const std::size_t total = offsets.back();
+
+        // Per column: `copy_part(p)` copies part p to its offset in a column
+        // sized for the batch (`finish` then hands that column out), or none:
+        // the column is appended whole by one task.
+        struct Plan {
+            std::function<void(std::size_t)> copy_part;
+            std::function<ColumnValue()> finish;
+        };
+        std::vector<Plan> plans(n_cols);
+        // Categorical codes, or compact Int32 values.
+        std::vector<::ibex::detail::NoInitVector<std::int32_t>> int32_buffers(n_cols);
+        std::vector<ColumnValue> wide(n_cols);
+        const auto column_of = [&](std::size_t p, std::size_t c) -> const ColumnValue& {
+            return *parts[p].columns[c].column;
+        };
+        const auto rows_of = [&](std::size_t p) { return offsets[p + 1] - offsets[p]; };
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            Plan& plan = plans[c];
+            std::visit(
+                [&](const auto& first) {
+                    using Col = std::decay_t<decltype(first)>;
+                    if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                        int32_buffers[c].resize(total);
+                        plan.copy_part = [&, c, dest = int32_buffers[c].data()](std::size_t p) {
+                            std::copy_n(std::get<Col>(column_of(p, c)).codes_data(), rows_of(p),
+                                        dest + offsets[p]);
+                        };
+                        plan.finish = [&, c] {
+                            return ColumnValue{std::get<Col>(column_of(0, c))
+                                                   .with_codes(std::move(int32_buffers[c]))};
+                        };
+                    } else if constexpr (std::is_same_v<Col, Column<std::int64_t>>) {
+                        std::size_t compact = 0;
+                        for (std::size_t p = 0; p < parts.size(); ++p) {
+                            compact += std::get<Col>(column_of(p, c)).is_compact_int32() ? 1 : 0;
+                        }
+                        // All compact Int32: the batch stays compact, half the
+                        // bytes to copy and to read. All wide: a wide copy.
+                        // Mixed parts are appended whole.
+                        if (compact == parts.size()) {
+                            int32_buffers[c].resize(total);
+                            plan.copy_part = [&, c, dest = int32_buffers[c].data()](std::size_t p) {
+                                std::copy_n(std::get<Col>(column_of(p, c)).compact_int32_data(),
+                                            rows_of(p), dest + offsets[p]);
+                            };
+                            plan.finish = [&, c] {
+                                return ColumnValue{
+                                    Col::from_compact_int32(std::move(int32_buffers[c]))};
+                            };
+                        } else if (compact == 0) {
+                            Col out;
+                            out.resize_for_overwrite(total);
+                            wide[c] = std::move(out);
+                            plan.copy_part = [&, c,
+                                              dest = std::get<Col>(wide[c]).data()](std::size_t p) {
+                                std::copy_n(std::get<Col>(column_of(p, c)).data(), rows_of(p),
+                                            dest + offsets[p]);
+                            };
+                            plan.finish = [&, c] { return std::move(wide[c]); };
+                        }
+                    } else if constexpr (requires { typename Col::value_type; } &&
+                                         !std::is_same_v<Col, Column<std::string>> &&
+                                         !std::is_same_v<Col, Column<bool>>) {
+                        using T = Col::value_type;
+                        if constexpr (::ibex::detail::overwrite_safe_v<T> &&
+                                      requires(Col col) { col.resize_for_overwrite(total); }) {
+                            Col out;
+                            out.resize_for_overwrite(total);
+                            wide[c] = std::move(out);
+                            plan.copy_part = [&, c,
+                                              dest = std::get<Col>(wide[c]).data()](std::size_t p) {
+                                std::copy_n(std::get<Col>(column_of(p, c)).data(), rows_of(p),
+                                            dest + offsets[p]);
+                            };
+                            plan.finish = [&, c] { return std::move(wide[c]); };
+                        }
+                    }
+                },
+                *head.columns[c].column);
+        }
+
+        // Tasks: one per (copied column, part), one per appended column, one per
+        // nullable column's validity.
+        struct Task {
+            std::size_t column;
+            std::size_t part;  // SIZE_MAX: append the whole column / validity
+            bool validity;
+        };
+        std::vector<Task> tasks;
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            if (plans[c].copy_part) {
+                for (std::size_t p = 0; p < parts.size(); ++p) {
+                    tasks.push_back(Task{.column = c, .part = p, .validity = false});
+                }
+            } else {
+                tasks.push_back(Task{.column = c, .part = SIZE_MAX, .validity = false});
+            }
+            const bool nullable = std::ranges::any_of(
+                parts, [c](const Chunk& part) { return part.columns[c].validity.has_value(); });
+            if (nullable) {
+                tasks.push_back(Task{.column = c, .part = SIZE_MAX, .validity = true});
+            }
+        }
+        std::vector<ColumnEntry> columns(n_cols);
+        const auto run = [&](std::size_t t) {
+            const Task& task = tasks[t];
+            const std::size_t c = task.column;
+            if (task.validity) {
+                std::optional<ValidityBitmap> validity = parts[0].columns[c].validity;
+                for (std::size_t p = 1; p < parts.size(); ++p) {
+                    materialize_append_validity(validity, offsets[p], parts[p].columns[c].validity,
+                                                offsets[p + 1] - offsets[p]);
+                }
+                columns[c].validity = std::move(validity);
+                return;
+            }
+            if (task.part != SIZE_MAX) {
+                plans[c].copy_part(task.part);
+                return;
+            }
+            ColumnValue value = column_of(0, c);
+            for (std::size_t p = 1; p < parts.size(); ++p) {
+                append_column_values(value, column_of(p, c));
+            }
+            columns[c].column = std::make_shared<ColumnValue>(std::move(value));
+        };
+        // `submit` runs one body per worker (clamped to the pool), so the tasks
+        // are handed out through a shared cursor.
+        auto& pool = process_worker_pool();
+        std::atomic<std::size_t> next{0};
+        auto batch = pool.submit(std::min(tasks.size(), pool.size()), [&](std::size_t) {
+            for (std::size_t t = next.fetch_add(1, std::memory_order_relaxed); t < tasks.size();
+                 t = next.fetch_add(1, std::memory_order_relaxed)) {
+                run(t);
+            }
+        });
+        batch.wait();
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            columns[c].name = head.columns[c].name;
+            if (plans[c].copy_part) {
+                columns[c].column = std::make_shared<ColumnValue>(plans[c].finish());
+            }
+        }
+        Table table;
+        table.columns = std::move(columns);
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            table.index[table.columns[c].name] = c;
+        }
+        table.set_properties(head.properties());
+        return table_to_chunk(std::move(table));
+    }
+
     /// `first` and the chunks after it, joined until the batch reaches
     /// `stream_batch_rows` or the input ends (which the next Discovery then
     /// reports). Joined as `MaterializeOperator` joins a stream: one schema,
@@ -1803,6 +1996,9 @@ class HashAggregateState final {
             return std::move(parts.front());
         }
         aggregate_stream_batches().fetch_add(1, std::memory_order_relaxed);
+        if (auto joined = join_batch_by_column(parts)) {
+            return std::move(*joined);
+        }
         auto joined =
             MaterializeOperator(std::make_unique<HeldChunksOperator>(std::move(parts))).run();
         if (!joined.has_value()) {

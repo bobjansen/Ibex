@@ -2198,6 +2198,140 @@ TEST_CASE("a streamed aggregate joins small chunks into batches with the same an
     }
 }
 
+TEST_CASE("a streamed aggregate's batch of shared-dictionary chunks joins column by column",
+          "[runtime][chunked][aggregate][nulls]") {
+    // The batch join copies each fixed-width part to its offset in a column
+    // sized once, a task per part. That needs chunks over one dictionary (the
+    // Parquet dictionary cache gives a scan that), and covers a compact Int32
+    // key and a compact value column (both kept compact), a double gaining
+    // nulls part way, and a String column appended whole. 6 parts by 5
+    // columns are more tasks than workers. Checked against a grouping
+    // computed here, batched, unbatched and serially.
+    constexpr std::size_t kChunkRows = 5'000;
+    constexpr std::size_t kChunks = 41;
+    const std::vector<std::string> labels{"p", "q", "r", "s", "t", "u", "v"};
+    const auto label_at = [&](std::size_t row) { return (row * 7919) % labels.size(); };
+    const auto day_at = [](std::size_t row) {
+        return static_cast<std::int64_t>((row * 104'729) % 200'003);
+    };
+    const auto w_at = [](std::size_t row) { return static_cast<std::int32_t>((row % 997) - 400); };
+    const auto v_null = [](std::size_t row) { return row >= 100'000 && row % 13 == 0; };
+    const auto v_at = [](std::size_t row) { return static_cast<double>(row % 41) * 0.5; };
+    const auto s_at = [](std::size_t row) { return std::string(1 + (row % 3), 'x'); };
+    const Column<Categorical> shared(labels, {});
+
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("trades", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        for (std::size_t part = 0; part < kChunks; ++part) {
+            Column<Categorical>::codes_storage codes;
+            ibex::detail::NoInitVector<std::int32_t> day;
+            ibex::detail::NoInitVector<std::int32_t> w;
+            Column<double> v;
+            Column<std::string> text;
+            runtime::ValidityBitmap v_valid;
+            v_valid.assign(kChunkRows, true);
+            bool any_null = false;
+            for (std::size_t r = 0; r < kChunkRows; ++r) {
+                const std::size_t row = (part * kChunkRows) + r;
+                codes.push_back(static_cast<Column<Categorical>::code_type>(label_at(row)));
+                day.push_back(static_cast<std::int32_t>(day_at(row)));
+                w.push_back(w_at(row));
+                v.push_back(v_null(row) ? 0.0 : v_at(row));
+                v_valid.set(r, !v_null(row));
+                any_null = any_null || v_null(row);
+                text.push_back(s_at(row));
+            }
+            runtime::Chunk chunk;
+            const auto add = [&](std::string name, runtime::ColumnValue value,
+                                 std::optional<runtime::ValidityBitmap> validity) {
+                runtime::ColumnEntry entry;
+                entry.name = std::move(name);
+                entry.column = std::make_shared<runtime::ColumnValue>(std::move(value));
+                entry.validity = std::move(validity);
+                chunk.columns.push_back(std::move(entry));
+            };
+            add("c", shared.with_codes(std::move(codes)), std::nullopt);
+            add("day", Column<std::int64_t>::from_compact_int32(std::move(day)), std::nullopt);
+            add("w", Column<std::int64_t>::from_compact_int32(std::move(w)), std::nullopt);
+            add("v", std::move(v),
+                any_null ? std::optional<runtime::ValidityBitmap>{std::move(v_valid)}
+                         : std::nullopt);
+            add("s", std::move(text), std::nullopt);
+            chunks.push_back(std::move(chunk));
+        }
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    struct Sums {
+        double total = 0;
+        std::int64_t values = 0;
+        std::int64_t w = 0;
+        std::int64_t chars = 0;
+    };
+    using Key = std::pair<std::string, std::int64_t>;
+    std::vector<Key> order;
+    std::map<Key, Sums> sums;
+    for (std::size_t row = 0; row < kChunks * kChunkRows; ++row) {
+        const Key key{labels[label_at(row)], day_at(row)};
+        auto [it, inserted] = sums.try_emplace(key);
+        if (inserted) {
+            order.push_back(key);
+        }
+        it->second.w += w_at(row);
+        it->second.chars += static_cast<std::int64_t>(s_at(row).size());
+        if (!v_null(row)) {
+            it->second.total += v_at(row);
+            ++it->second.values;
+        }
+    }
+
+    auto program = parser::parse(
+        "extern fn trades() -> DataFrame from \"x.hpp\"; "
+        "trades()[select { total = sum(v), values = count(v), w = sum(w), "
+        "chars = sum(length(s)) }, by { c, day }];");
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+    for (const std::size_t batch_rows : {std::size_t{30'000}, std::size_t{0}}) {
+        for (const std::size_t threads : {std::size_t{8}, std::size_t{1}}) {
+            INFO("batch rows " << batch_rows << " threads " << threads);
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            runtime::AggregatePhasePolicy policy;
+            policy.stream_batch_rows = batch_rows;
+            exec.aggregate_phase_policy = policy;
+            const runtime::TableRegistry registry;
+            const auto batches_before = runtime::aggregate_stream_batches().load();
+            const auto out =
+                runtime::interpret(*ir.value(), registry, nullptr, &externs, nullptr, exec);
+            INFO((out.has_value() ? std::string{} : out.error()));
+            REQUIRE(out.has_value());
+            const auto batches = runtime::aggregate_stream_batches().load() - batches_before;
+            CHECK((batches > 0) == (batch_rows != 0 && threads > 1));
+            REQUIRE(out->rows() == order.size());
+            const auto& cats = std::get<Column<Categorical>>(*out->find("c"));
+            const auto& days = std::get<Column<std::int64_t>>(*out->find("day"));
+            const auto& totals = std::get<Column<double>>(*out->find("total"));
+            const auto& values = std::get<Column<std::int64_t>>(*out->find("values"));
+            const auto& ws = std::get<Column<std::int64_t>>(*out->find("w"));
+            const auto& chars = std::get<Column<std::int64_t>>(*out->find("chars"));
+            for (std::size_t g = 0; g < order.size(); ++g) {
+                INFO("group " << g);
+                REQUIRE(std::string(cats[g]) == order[g].first);
+                REQUIRE(days[g] == order[g].second);
+                const Sums& want = sums.at(order[g]);
+                REQUIRE(totals[g] == want.total);
+                REQUIRE(values[g] == want.values);
+                REQUIRE(ws[g] == want.w);
+                REQUIRE(chars[g] == want.chars);
+            }
+        }
+    }
+}
+
 TEST_CASE("Bool group-by keys take the integer key paths", "[runtime][chunked][aggregate][nulls]") {
     // A Bool key is read as 0/1 by the single-int and int-pair paths and
     // emitted back as Bool. `b` gains nulls only past row 150k, so in chunks a

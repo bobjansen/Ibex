@@ -105,6 +105,11 @@ class ReplSession {
         /// retain bindings. False decodes each lazy source a statement reads
         /// whole, into one chunk.
         bool plan_table_expressions = true;
+        /// When set, the result of the source's last statement goes here, as
+        /// it is produced, instead of into `ExecutionResult::table`: chunk by
+        /// chunk when the statement is a table expression the planner runs,
+        /// otherwise whole in one call. The sink runs on the calling thread.
+        runtime::TableChunkSink chunk_sink;
     };
 
     [[nodiscard]] auto execute(std::string_view source) -> ExecutionResult;

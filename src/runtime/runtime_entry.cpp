@@ -67,6 +67,41 @@ auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
     return sink.run();
 }
 
+auto drain_operator_chunks(OperatorPtr op, const TableChunkSink& sink)
+    -> std::expected<void, std::string> {
+    // As for materialize_operator: a consumer takes every chunk, so batching
+    // them for a breaker that is not there would only copy each row again.
+    (void)pipeline_executor_detail::unbatch_pipeline_output(*op);
+    while (true) {
+        if (interrupt_requested()) {
+            return std::unexpected(interrupt_message());
+        }
+        auto next = op->next();
+        if (!next.has_value()) {
+            return std::unexpected(std::move(next.error()));
+        }
+        if (!next->has_value()) {
+            return {};
+        }
+        Chunk chunk = std::move(**next);
+        if (chunk.rows() == 0) {
+            continue;
+        }
+        Table table;
+        table.columns = std::move(chunk.columns);
+        for (std::size_t i = 0; i < table.columns.size(); ++i) {
+            table.index[table.columns[i].name] = i;
+        }
+        table.set_properties(chunk.properties());
+        if (table.columns.empty()) {
+            table.logical_rows = chunk.logical_rows;
+        }
+        if (auto sent = sink(std::move(table)); !sent.has_value()) {
+            return sent;
+        }
+    }
+}
+
 auto materialize_plan(const ir::Node& node, const TableRegistry& registry,
                       const ScalarRegistry* scalars, const ExternRegistry* externs,
                       const ExecutionContext& exec, ModelResult* model_out)

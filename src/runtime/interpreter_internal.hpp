@@ -2015,6 +2015,9 @@ enum class FloatCleanMode : std::uint8_t {
 /// Drain `op` into a table: `MaterializeOperator`, with a streaming pipeline's
 /// output batching switched off first (`unbatch_pipeline_output`).
 [[nodiscard]] auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string>;
+/// Drain `op` into `sink` chunk by chunk (`interpret_chunks`).
+[[nodiscard]] auto drain_operator_chunks(OperatorPtr op, const TableChunkSink& sink)
+    -> std::expected<void, std::string>;
 /// Build `node` through the physical path (`build_operator`) and drain it to a
 /// table. The one way a materializing step evaluates a relational input: a
 /// fallback node's inputs, a deferred probe's right side, a stream's

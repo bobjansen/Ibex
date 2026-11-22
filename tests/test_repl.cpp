@@ -3776,6 +3776,146 @@ TEST_CASE("ReplSession: planned expressions stream bound lazy sources", "[repl][
     CHECK(session.execute("input[select { total = sum(v) }];").ok);
 }
 
+TEST_CASE("ReplSession: a chunk sink receives the last statement's result as it runs",
+          "[repl][session][sink]") {
+    // Four units of 2 rows each (values 1..8); whole-source decoding is refused,
+    // so the scan really streams.
+    class UnitReader final : public ibex::runtime::LazySourceReader {
+       public:
+        auto decode_units() -> std::vector<ibex::runtime::SourceUnit> override {
+            return {{.start = 0, .rows = 2},
+                    {.start = 2, .rows = 2},
+                    {.start = 4, .rows = 2},
+                    {.start = 6, .rows = 2}};
+        }
+        auto decode(const std::vector<std::string>& names,
+                    const ibex::runtime::Selection* selection,
+                    const ibex::runtime::SourceUnit* unit, const ibex::runtime::ExecutionContext&)
+            -> std::expected<ibex::runtime::Table, std::string> override {
+            if (unit == nullptr) {
+                return std::unexpected("whole-source decode forbidden");
+            }
+            std::vector<std::int64_t> values;
+            for (auto row = unit->start; row < unit->start + unit->rows; ++row) {
+                if (selection == nullptr ||
+                    std::ranges::find(*selection, row) != selection->end()) {
+                    values.push_back(static_cast<std::int64_t>(row + 1));
+                }
+            }
+            ibex::runtime::Table result;
+            result.logical_rows = values.size();
+            for (const auto& name : names) {
+                result.add_column(name, ibex::Column<std::int64_t>{values});
+            }
+            return result;
+        }
+    };
+    ibex::runtime::ExternRegistry registry;
+    registry.register_lazy_table(
+        "units",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            ibex::runtime::Table schema;
+            schema.add_column("v", ibex::Column<std::int64_t>{});
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), 8,
+                []() -> std::expected<ibex::runtime::LazySourceReaderPtr, std::string> {
+                    return std::make_unique<UnitReader>();
+                });
+        });
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session.execute("extern fn units() -> DataFrame from \"fake.hpp\";").ok);
+
+    struct Received {
+        std::vector<std::vector<std::int64_t>> chunks;
+        [[nodiscard]] auto rows() const {
+            std::vector<std::int64_t> all;
+            for (const auto& chunk : chunks) {
+                all.insert(all.end(), chunk.begin(), chunk.end());
+            }
+            return all;
+        }
+    };
+    const auto run = [&](const std::string& source, Received& received, const char* column = "w") {
+        ibex::repl::ReplSession::ExecuteOptions options;
+        options.render = false;
+        options.chunk_sink =
+            [&received, column](ibex::runtime::Table chunk) -> std::expected<void, std::string> {
+            const auto* values = std::get_if<ibex::Column<std::int64_t>>(chunk.find(column));
+            if (values == nullptr) {
+                return std::unexpected("chunk without its column");
+            }
+            received.chunks.emplace_back(values->begin(), values->end());
+            return {};
+        };
+        return session.execute(source, std::move(options));
+    };
+
+    SECTION("a streamed scan arrives chunk by chunk, and nothing is kept") {
+        Received received;
+        const auto result =
+            run("let k = 3; units()[filter v > ^k][update { w = v * 10 }];", received);
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        CHECK(received.chunks.size() > 1);
+        CHECK(received.rows() == std::vector<std::int64_t>{40, 50, 60, 70, 80});
+        CHECK_FALSE(result.table.has_value());
+        CHECK(result.tables.empty());
+    }
+    SECTION("earlier statements run as usual") {
+        Received received;
+        const auto result = run(
+            "let a = units()[filter v <= 2]; let b = units()[filter v > 6];"
+            " a[update { w = v + 100 }];",
+            received);
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        CHECK(received.rows() == std::vector<std::int64_t>{101, 102});
+    }
+    SECTION("a value no plan streamed arrives whole") {
+        Received received;
+        const auto result = run("Table { w = [7, 8, 9] };", received);
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        REQUIRE(received.chunks.size() == 1);
+        CHECK(received.rows() == std::vector<std::int64_t>{7, 8, 9});
+    }
+    SECTION("a scalar last value reaches no sink") {
+        Received received;
+        const auto result = run("units()[filter v > 6]; 1 + 1;", received);
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        CHECK(received.chunks.empty());
+        CHECK(result.scalar.has_value());
+    }
+    SECTION("a plan evaluated for an argument is not the result") {
+        // `head` of a function's table argument: the argument is planned on
+        // its own, deeper than the statement, and must not reach the sink.
+        Received received;
+        const auto result = run(
+            "fn top(t: DataFrame) -> DataFrame { t[head 2]; }"
+            " top(units()[update { w = v * 2 }]);",
+            received);
+        CAPTURE(result.error);
+        REQUIRE(result.ok);
+        CHECK(received.rows() == std::vector<std::int64_t>{2, 4});
+    }
+    SECTION("an error from the sink stops the query") {
+        ibex::repl::ReplSession::ExecuteOptions options;
+        options.render = false;
+        std::size_t calls = 0;
+        options.chunk_sink = [&calls](ibex::runtime::Table) -> std::expected<void, std::string> {
+            ++calls;
+            return std::unexpected("disk full");
+        };
+        const auto result =
+            session.execute("units()[update { w = v }];", std::move(options));
+        CHECK_FALSE(result.ok);
+        CHECK(result.error.find("disk full") != std::string::npos);
+        CHECK(calls == 1);
+    }
+}
+
 TEST_CASE("ReplSession: print output comes back without rendering results", "[repl][session]") {
     ibex::runtime::ExternRegistry registry;
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);

@@ -458,11 +458,29 @@ auto plan_table_expressions() -> bool& {
     return enabled;
 }
 
+// `ExecuteOptions::chunk_sink`. Armed while the session's own batch runs its
+// last statement, so an import's last statement or an earlier `let` never
+// reaches it, and taken only by the plan of that statement's own expression
+// (`target`): one evaluated for it, such as a function's table argument, is
+// another expression and materializes.
+struct ResultChunkSink {
+    const runtime::TableChunkSink* sink = nullptr;
+    const std::vector<parser::Stmt>* batch = nullptr;  // the session's batch
+    const parser::Expr* target = nullptr;              // while armed
+    bool used = false;
+};
+auto result_chunk_sink() -> ResultChunkSink& {
+    static thread_local ResultChunkSink state;
+    return state;
+}
+
 [[nodiscard]] auto optimize_and_execute_plan(
     ir::NodePtr plan, const runtime::TableRegistry& base_tables,
     const std::set<std::string>& lazy_callees, const runtime::ExternRegistry& externs,
     const runtime::ScalarRegistry& scalars, bool root_order_insensitive = false,
-    const LazyTableRegistry& bound_lazy_sources = {}) -> std::expected<runtime::Table, std::string>;
+    const LazyTableRegistry& bound_lazy_sources = {},
+    const runtime::TableChunkSink* chunk_sink = nullptr)
+    -> std::expected<runtime::Table, std::string>;
 
 struct BoundCallArg {
     const parser::Param* param = nullptr;
@@ -3821,8 +3839,14 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 lazy_callees.insert(name);
             }
         }
+        // The statement's own expression, not one evaluated for it, streams.
+        const runtime::TableChunkSink* chunk_sink = nullptr;
+        if (auto& sink = result_chunk_sink(); sink.target == &expr && !sink.used) {
+            sink.used = true;
+            chunk_sink = sink.sink;
+        }
         return optimize_and_execute_plan(std::move(*lowered), tables, lazy_callees, externs,
-                                         scalars, false, lazy_tables);
+                                         scalars, false, lazy_tables, chunk_sink);
     }
 
     // Projection pushdown. Ask the plan which columns it actually reads from
@@ -5532,6 +5556,27 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             ibex::formatting::print("error: interrupted\n");
             return false;
         }
+        // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
+        struct ArmChunkSink {
+            bool armed = false;
+            ~ArmChunkSink() {
+                if (armed) {
+                    result_chunk_sink().target = nullptr;
+                }
+            }
+        } arm_chunk_sink;
+        if (auto& sink = result_chunk_sink(); sink.sink != nullptr && sink.batch == &statements &&
+                                              stmt_index + 1 == statements.size()) {
+            if (const auto* expr_stmt = std::get_if<parser::ExprStmt>(&stmt)) {
+                // Parentheses evaluate the expression inside them.
+                const parser::Expr* target = expr_stmt->expr.get();
+                while (const auto* group = std::get_if<parser::GroupExpr>(&target->node)) {
+                    target = group->expr.get();
+                }
+                sink.target = target;
+                arm_chunk_sink.armed = true;
+            }
+        }
         if (print_comment_groups != nullptr && stmt_index < print_comment_groups->size()) {
             print_comment_group((*print_comment_groups)[stmt_index]);
         }
@@ -6028,7 +6073,8 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     ir::NodePtr plan, const runtime::TableRegistry& base_tables,
     const std::set<std::string>& lazy_callees, const runtime::ExternRegistry& externs,
     const runtime::ScalarRegistry& scalars, bool root_order_insensitive,
-    const LazyTableRegistry& bound_lazy_sources) -> std::expected<runtime::Table, std::string> {
+    const LazyTableRegistry& bound_lazy_sources, const runtime::TableChunkSink* chunk_sink)
+    -> std::expected<runtime::Table, std::string> {
     auto [rewritten, sources] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
     runtime::TableRegistry tables = base_tables;
     LazyTableRegistry lazy_sources = bound_lazy_sources;
@@ -6407,6 +6453,14 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     // eagerly -- narrowed the same way the statement path narrows them.
     for (auto& [name, table] : detail::narrow_demanded_tables(demand, tables)) {
         tables.insert_or_assign(name, std::move(table));
+    }
+    if (chunk_sink != nullptr) {
+        if (auto streamed =
+                runtime::interpret_chunks(*rewritten, tables, &scalars, &externs, exec, *chunk_sink);
+            !streamed.has_value()) {
+            return std::unexpected(std::move(streamed.error()));
+        }
+        return runtime::Table{};  // its rows went to the sink
     }
     return runtime::interpret(*rewritten, tables, &scalars, &externs, nullptr, exec);
 }
@@ -7861,7 +7915,14 @@ auto ReplSession::execute(std::string_view source, ExecuteOptions options) -> Ex
     const RenderScope render(options.render, options.plan_table_expressions);
     StdoutCapture capture;
     active_execution_result() = &result;
-    const bool ok = execute_statements(
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
+    struct ChunkSinkScope {
+        ~ChunkSinkScope() { result_chunk_sink() = {}; }
+    } const chunk_sink_scope;
+    if (options.chunk_sink) {
+        result_chunk_sink() = {.sink = &options.chunk_sink, .batch = &parsed->statements};
+    }
+    bool ok = execute_statements(
         parsed->statements, impl_->tables, impl_->lazy_tables, impl_->scalars, impl_->columns,
         impl_->models, impl_->functions, impl_->compile_time_lists, impl_->extern_decls,
         *impl_->registry, impl_->resources, impl_->config.plugin_search_paths,
@@ -7869,6 +7930,21 @@ auto ReplSession::execute(std::string_view source, ExecuteOptions options) -> Ex
         &impl_->function_sources, &impl_->declaration_docs, &impl_->imports, normalized,
         &impl_->usings);
     active_execution_result() = nullptr;
+    // A last value no planned query streamed (an eager path, a scalar-free
+    // table literal) reaches the sink whole.
+    if (ok && options.chunk_sink && !result_chunk_sink().used && result.table.has_value()) {
+        result.tables.clear();
+        if (result.table->rows() > 0) {
+            if (auto sent = options.chunk_sink(std::move(*result.table)); !sent.has_value()) {
+                ibex::formatting::print("error: {}\n", sent.error());
+                ok = false;
+            }
+        }
+        result.table.reset();
+    } else if (options.chunk_sink) {
+        result.tables.clear();
+        result.table.reset();
+    }
     std::string output = capture.take();
     result.ok = ok;
     if (!ok) {

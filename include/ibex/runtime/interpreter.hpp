@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -1257,6 +1258,18 @@ class ExternArgs;
                              const ScalarRegistry* scalars, const ExternRegistry* externs,
                              ModelResult* model_out, const ExecutionContext& exec)
     -> std::expected<Table, std::string>;
+
+/// Receives a query's result one chunk at a time; an error stops the query.
+using TableChunkSink = std::function<std::expected<void, std::string>(Table)>;
+
+/// `interpret()` that hands each result chunk to `sink` as it is produced
+/// instead of concatenating them, so a consumer (a file writer) can work while
+/// the query still runs. The chunks, in order, are the rows `interpret` would
+/// return; a result with no rows produces no call.
+[[nodiscard]] auto interpret_chunks(const ir::Node& node, const TableRegistry& registry,
+                                    const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                    const ExecutionContext& exec, const TableChunkSink& sink)
+    -> std::expected<void, std::string>;
 
 /// Invoke an extern whose first argument is a table. The scalar result, if
 /// any, is intentionally discarded: this API is the execution seam for

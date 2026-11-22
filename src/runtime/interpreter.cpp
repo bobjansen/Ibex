@@ -622,6 +622,24 @@ auto interpret(const ir::Node& node, const TableRegistry& registry, const Scalar
     return materialize_operator(std::move(op.value()));
 }
 
+auto interpret_chunks(const ir::Node& node, const TableRegistry& registry,
+                      const ScalarRegistry* scalars, const ExternRegistry* externs,
+                      const ExecutionContext& exec, const TableChunkSink& sink)
+    -> std::expected<void, std::string> {
+    const QueryExecutionLease lease;
+    if (!lease.held()) {
+        return std::unexpected(query_in_flight_message());
+    }
+    if (auto tuned = tune_allocator_once(); !tuned) {
+        return std::unexpected(tuned.error());
+    }
+    auto op = build_operator(node, registry, scalars, externs, exec, nullptr);
+    if (!op.has_value()) {
+        return std::unexpected(std::move(op.error()));
+    }
+    return drain_operator_chunks(std::move(op.value()), sink);
+}
+
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
                const ExternRegistry* externs, ModelResult* model_out)
     -> std::expected<Table, std::string> {

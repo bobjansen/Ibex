@@ -86,6 +86,16 @@ class EngineTests(unittest.TestCase):
                         self.equal(frame.filter(predicate))
                 self.equal(frame.filter(pl.len() == pl.len()))
 
+    def test_grouped_extrema_skip_nan_like_polars(self):
+        # Plain native min/max: a NaN first, in the middle, last, alone, beside
+        # -inf and beside a null in each group.
+        nan, inf = float("nan"), float("inf")
+        frame = pl.DataFrame({"g": [1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7],
+                              "x": [nan, 1., 3., 2., nan, 5., nan, nan, 4., 6., -inf, nan,
+                                    None, nan, None]}).lazy()
+        self.equal(frame.group_by("g").agg(lo=pl.col("x").min(), hi=pl.col("x").max()).sort("g"))
+        self.equal(frame.select(lo=pl.col("x").min(), hi=pl.col("x").max()))
+
     def test_filter_reductions_share_input_and_preserve_step_boundaries(self):
         frame = pl.DataFrame({"x": [1, 3, 5, 7, None], "y": [9, 8, 7, 6, 5]}).lazy()
         # All predicates in one filter read the original input; a subsequent

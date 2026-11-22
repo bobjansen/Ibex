@@ -92,15 +92,9 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             native = op.removesuffix("_non_null") if op.endswith("_non_null") else op + "_null"
             return f"{native}({render(args[0])})"
         if op in ("polars_min", "polars_max"):
-            # Polars ignores NaNs when any ordinary value is present, but an
-            # all-NaN (non-null) group produces NaN. Native extrema use IEEE.
-            # null_if_nan, not an equivalent `case` on is_nan: in a group by
-            # the `case` input makes the extrema ~10x slower (string x int
-            # key, 10M rows, 1.25M groups: 400 vs 36 ms).
-            value = render(args[0])
-            # With no ordinary value, mean is NaN for all-NaN groups and
-            # null for empty/all-null groups. It supplies the exact fallback.
-            return f"coalesce({op.removeprefix('polars_')}(null_if_nan({value})), mean({value}))"
+            # Native min/max follow Polars: NaN is skipped unless every value
+            # in the group is NaN.
+            return f"{op.removeprefix('polars_')}({render(args[0])})"
         if op == "polars_median":
             return f"median({render(args[0])})"
         if op == "polars_std":

@@ -1645,14 +1645,17 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                                      std::vector<std::string>& dictionary,
                                      ibex::Column<ibex::Categorical>::codes_storage& codes,
                                      DirectValidity& validity) -> std::size_t {
-    std::map<std::string, std::int32_t, std::less<>> index;
-    auto intern = [&](std::string value) {
-        auto [it, inserted] = index.try_emplace(value, 0);
-        if (inserted) {
-            it->second = static_cast<std::int32_t>(dictionary.size());
-            dictionary.push_back(std::move(value));
+    // Hashed and looked up by view: a label already interned costs no
+    // allocation, and a unit's first dictionary no tree of string compares.
+    ibex::Column<ibex::Categorical>::index_map index;
+    auto intern = [&](std::string_view value) {
+        if (auto found = index.find(value); found != index.end()) {
+            return found->second;
         }
-        return it->second;
+        const auto code = static_cast<std::int32_t>(dictionary.size());
+        index.emplace(std::string(value), code);
+        dictionary.emplace_back(value);
+        return code;
     };
 
     std::unique_ptr<std::int32_t[]> local_codes(
@@ -1707,6 +1710,8 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
         // "local" codes are then global codes, and `local_to_global` becomes
         // the identity so the emit loops below serve both cases.
         bool plain_pages = false;
+        const parquet::ByteArray* interned_dictionary = nullptr;
+        std::int32_t interned_size = 0;
 
         std::size_t row = 0;
         while (row < group_rows && typed->HasNext()) {
@@ -1737,7 +1742,7 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                                                nullptr, plain_values.get(), &codes_read);
                 for (std::int64_t i = 0; i < codes_read; ++i) {
                     const auto& value = plain_values[static_cast<std::size_t>(i)];
-                    local_codes[static_cast<std::size_t>(i)] = intern(std::string(
+                    local_codes[static_cast<std::size_t>(i)] = intern(std::string_view(
                         reinterpret_cast<const char*>(value.ptr),  // NOLINT(*-reinterpret-cast)
                         value.len));
                 }
@@ -1750,13 +1755,21 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
             if (levels_read <= 0) {
                 throw std::runtime_error("parquet::read: dictionary decoder made no progress");
             }
-            if (local_dictionary != nullptr) {
+            // Every batch exposes the chunk's dictionary again. A column chunk
+            // has one dictionary page, so it is interned once, not once per
+            // batch: re-interning 5000 labels per 64k rows was a third of a
+            // filtered scan's CPU.
+            if (local_dictionary != nullptr &&
+                (local_dictionary != interned_dictionary || dictionary_size != interned_size)) {
+                interned_dictionary = local_dictionary;
+                interned_size = dictionary_size;
                 local_to_global.clear();
                 local_to_global.reserve(static_cast<std::size_t>(dictionary_size));
                 for (std::int32_t i = 0; i < dictionary_size; ++i) {
                     const auto& value = local_dictionary[i];
-                    local_to_global.push_back(
-                        intern(std::string(reinterpret_cast<const char*>(value.ptr), value.len)));
+                    local_to_global.push_back(intern(std::string_view(
+                        reinterpret_cast<const char*>(value.ptr),  // NOLINT(*-reinterpret-cast)
+                        value.len)));
                 }
             }
             if (local_to_global.empty() && codes_read != 0) {
@@ -1773,6 +1786,26 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                 }
                 validity.append_valid(static_cast<std::size_t>(codes_read));
                 emitted += static_cast<std::size_t>(codes_read);
+                row += static_cast<std::size_t>(levels_read);
+                continue;
+            }
+            if (selection != nullptr && codes_read == levels_read) {
+                // No null in this batch: a row's code is at its own offset, so
+                // only the selected rows are looked at, as the string scan
+                // filter does, instead of walking and testing every row.
+                const std::size_t batch_first = group_start + row;
+                const std::size_t batch_end = batch_first + static_cast<std::size_t>(levels_read);
+                std::size_t taken = 0;
+                for (; selected_pos < selected_end && (*selection)[selected_pos] < batch_end;
+                     ++selected_pos, ++taken) {
+                    const auto local = local_codes[(*selection)[selected_pos] - batch_first];
+                    if (local < 0 || static_cast<std::size_t>(local) >= local_to_global.size()) {
+                        throw std::runtime_error("parquet::read: invalid dictionary index");
+                    }
+                    codes.push_back(local_to_global[static_cast<std::size_t>(local)]);
+                }
+                validity.append_valid(taken);
+                emitted += taken;
                 row += static_cast<std::size_t>(levels_read);
                 continue;
             }

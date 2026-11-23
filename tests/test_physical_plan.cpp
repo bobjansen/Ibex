@@ -441,9 +441,10 @@ TEST_CASE("The planner fuses a project over an update over a filter", "[physical
 }
 
 // A run below a serial step has to actually reach the workers, not merely be
-// described. `df[filter ...][update ...]` puts the update above the run: the
-// filter's morsels fan out, the ordered merger reassembles them, and the update
-// runs once over the finished table.
+// described. `df[filter ...][update ...]` admits the update into the run only
+// for a consumer that takes its morsels as they come (`stream_only_updates`);
+// a materialized result takes it back out, so the filter's morsels fan out,
+// are reassembled, and the update runs once over the finished table.
 TEST_CASE("A parallel run below a serial step still reaches the workers",
           "[physical][execute][parallel]") {
     constexpr std::size_t kRows = 40'000;
@@ -460,7 +461,8 @@ TEST_CASE("A parallel run below a serial step still reaches the workers",
     const auto plan = runtime::physical::plan_physical(*ir, registry, nullptr);
     REQUIRE(plan.migrated);
     REQUIRE(plan.mode == runtime::physical::PipelineMode::MorselParallel);
-    REQUIRE(plan.parallel_begin == 1);
+    REQUIRE(plan.parallel_begin == 0);
+    REQUIRE(plan.stream_only_updates == 1);
 
     runtime::ExecutionContext serial;
     serial.parallel_threads = 1;

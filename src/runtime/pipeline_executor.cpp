@@ -1700,6 +1700,8 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
                                  const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
+    // Taken first, so no pipeline built under this one (its input's) sees it.
+    const bool streaming_consumer = take_chunk_stream_consumer_offer();
     std::vector<MapStep> operators = parallel_pipeline_operators(plan);
     const ir::Node* input_node = physical::parallel_input_node(plan);
     if (input_node == nullptr) {
@@ -1740,7 +1742,14 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
             operators.begin(),
             operators.begin() + static_cast<std::ptrdiff_t>(plan.stream_only_bottom_updates));
     }
-    if (plan.stream_only_updates == 0) {
+    // Over an in-memory table the planner admits the updates above a filter
+    // run for a consumer that takes the run's chunks as they come (see
+    // `ChunkStreamConsumerOffer`): each worker then computes them over its
+    // morsel's survivors while they are in cache, instead of a second pass
+    // over the filtered table. On a q06-shaped global aggregate over 10M
+    // rows, that pass re-read the gathered columns from memory.
+    if (plan.stream_only_updates == 0 ||
+        (streaming_consumer && plan.source == physical::SourceKind::TableScan)) {
         return build_materialized_map_run(plan, operators, input_node, registry, scalars, externs,
                                           exec, model_out);
     }
@@ -2931,6 +2940,22 @@ ScanWorkerSinkOffer::~ScanWorkerSinkOffer() {
 
 auto take_offered_scan_worker_sink() -> std::shared_ptr<ScanWorkerSink> {
     return std::exchange(offered_scan_worker_sink, nullptr);
+}
+
+namespace {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+thread_local bool offered_chunk_stream_consumer = false;
+}  // namespace
+
+ChunkStreamConsumerOffer::ChunkStreamConsumerOffer(bool offered)
+    : previous_(std::exchange(offered_chunk_stream_consumer, offered)) {}
+
+ChunkStreamConsumerOffer::~ChunkStreamConsumerOffer() {
+    offered_chunk_stream_consumer = previous_;
+}
+
+auto take_chunk_stream_consumer_offer() -> bool {
+    return std::exchange(offered_chunk_stream_consumer, false);
 }
 
 }  // namespace ibex::runtime

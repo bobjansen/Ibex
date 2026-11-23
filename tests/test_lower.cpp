@@ -321,10 +321,11 @@ TEST_CASE("A bare update bounds the parallel run", "[runtime][pipeline]") {
     }
     {
         // An update above a filter does not drag the filter out of a parallel
-        // pipeline. One plan describes both halves: the run is the filter, the
-        // update is composed serially above it, and the source feeds it. This
-        // used to be found by re-planning at each node on the way down — the
-        // plan now says it outright.
+        // pipeline. One plan describes both halves: the run is the filter and
+        // the source feeds it. The update joins the run only for a consumer
+        // that takes the filter's morsels as they come
+        // (`ChunkStreamConsumerOffer`), which `stream_only_updates` records;
+        // otherwise the executor composes it serially above the run.
         auto program = require_parse("df[filter price > 5][update { n = price * 2 }];");
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
@@ -334,10 +335,9 @@ TEST_CASE("A bare update bounds the parallel run", "[runtime][pipeline]") {
         REQUIRE(plan.steps.size() == 2);
         CHECK(plan.steps[0].node->kind() == ir::NodeKind::Update);
         CHECK(plan.steps[1].node->kind() == ir::NodeKind::Filter);
-        // The run starts below the update, not at the root.
-        CHECK(plan.parallel_begin == 1);
+        CHECK(plan.parallel_begin == 0);
         CHECK(plan.parallel_end == 2);
-        CHECK(plan.stream_only_updates == 0);
+        CHECK(plan.stream_only_updates == 1);
         const ir::Node* input = runtime::physical::parallel_input_node(plan);
         REQUIRE(input != nullptr);
         CHECK(input->kind() == ir::NodeKind::Scan);

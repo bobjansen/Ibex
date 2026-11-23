@@ -109,4 +109,33 @@ class ScanWorkerSinkOffer {
 /// The sink on offer, if any, which it also withdraws: one pipeline takes it.
 [[nodiscard]] auto take_offered_scan_worker_sink() -> std::shared_ptr<ScanWorkerSink>;
 
+/// Tells the next morsel run built on this thread, for the lifetime of the
+/// scope, that its consumer takes its chunks one at a time rather than
+/// materializing them: an aggregate, which batches small chunks itself.
+///
+/// Such a run over an in-memory table keeps the row-local updates above its
+/// filter (`Plan::stream_only_updates`) on its workers, computed over each
+/// morsel's survivors while they are in cache. Without a streaming consumer
+/// the updates run above the materialized run instead: a run that is
+/// materialized would pay a merge concat for them, which its two-phase filter
+/// otherwise avoids. A consumer opens one only around building an input that
+/// is a map chain directly over a registered table, so the one run built
+/// inside it is the consumer's own.
+class ChunkStreamConsumerOffer {
+   public:
+    explicit ChunkStreamConsumerOffer(bool offered);
+    ~ChunkStreamConsumerOffer();
+    ChunkStreamConsumerOffer(const ChunkStreamConsumerOffer&) = delete;
+    ChunkStreamConsumerOffer(ChunkStreamConsumerOffer&&) = delete;
+    auto operator=(const ChunkStreamConsumerOffer&) -> ChunkStreamConsumerOffer& = delete;
+    auto operator=(ChunkStreamConsumerOffer&&) -> ChunkStreamConsumerOffer& = delete;
+
+   private:
+    bool previous_;
+};
+
+/// Whether a streaming consumer is on offer, which it also withdraws: one run
+/// takes it.
+[[nodiscard]] auto take_chunk_stream_consumer_offer() -> bool;
+
 }  // namespace ibex::runtime

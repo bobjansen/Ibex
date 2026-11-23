@@ -19810,6 +19810,63 @@ TEST_CASE("Scan pipeline streams a bare row-local update", "[runtime][parallel][
     CHECK(unstreamed_stats.parallel_fields.load() >= 1);
 }
 
+// Over a registered table the update above a filter run joins it only for an
+// aggregate, which takes the run's morsels as they come
+// (`ChunkStreamConsumerOffer`): each worker computes it over its morsel's
+// survivors while they are in cache. A materialized result keeps the two-phase
+// filter, with the update above it, since in the run it would cost a merge.
+TEST_CASE("A filter run over a table computes its update on the workers for an aggregate",
+          "[runtime][parallel][pipeline]") {
+    std::vector<std::int64_t> xs(4000);
+    // NOLINTNEXTLINE(modernize-use-ranges): Apple libc++ does not provide ranges::iota.
+    std::iota(xs.begin(), xs.end(), std::int64_t{0});
+    runtime::Table df;
+    df.add_column("x", Column<std::int64_t>{xs});
+    runtime::TableRegistry tables;
+    tables.emplace("df", df);
+    std::int64_t want_sum = 0;
+    for (std::int64_t x = 501; x < 4000; ++x) {
+        want_sum += x * 2;
+    }
+    const auto context = [](runtime::ParallelPipelineStats* stats, std::size_t threads) {
+        runtime::ExecutionContext exec{.execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+        exec.parallel_grain = 256;
+        exec.parallel_stats = stats;
+        return exec;
+    };
+
+    auto aggregate =
+        require_ir("df[filter x > 500][update { y = x * 2 }][select { s = sum(y), n = count() }];");
+    runtime::ParallelPipelineStats stats;
+    auto out =
+        runtime::interpret(*aggregate, tables, nullptr, nullptr, nullptr, context(&stats, 4));
+    INFO((out.has_value() ? std::string{} : out.error()));
+    REQUIRE(out.has_value());
+    // The update kept the run off the two-phase filter: it ran in the workers.
+    CHECK(stats.parallel_pipelines.load() == 1);
+    CHECK(stats.two_phase_filters.load() == 0);
+    CHECK(std::get<Column<std::int64_t>>(*out->find("s"))[0] == want_sum);
+    CHECK(std::get<Column<std::int64_t>>(*out->find("n"))[0] == 3499);
+    auto serial =
+        runtime::interpret(*aggregate, tables, nullptr, nullptr, nullptr, context(nullptr, 1));
+    REQUIRE(serial.has_value());
+    CHECK(std::get<Column<std::int64_t>>(*serial->find("s"))[0] == want_sum);
+
+    auto rows = require_ir("df[filter x > 500][update { y = x * 2 }];");
+    runtime::ParallelPipelineStats row_stats;
+    auto materialized =
+        runtime::interpret(*rows, tables, nullptr, nullptr, nullptr, context(&row_stats, 4));
+    REQUIRE(materialized.has_value());
+    CHECK(row_stats.two_phase_filters.load() == 1);
+    CHECK(row_stats.parallel_fields.load() >= 1);
+    const auto& y = std::get<Column<std::int64_t>>(*materialized->find("y"));
+    REQUIRE(y.size() == 3499);
+    CHECK(y[0] == 1002);
+    CHECK(y[y.size() - 1] == 7998);
+}
+
 // An update below a run (TPC-H q22: a computed column, then a filter on it)
 // joins the streamed run (`Plan::stream_only_bottom_updates`): one scan
 // pipeline computes, filters and projects each unit. Before, the update

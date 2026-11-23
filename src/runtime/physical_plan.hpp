@@ -566,6 +566,13 @@ struct Plan {
     /// the executor composes them serially above it, which is where a bare
     /// update always runs over a materialized table (see
     /// `execution_capability(const ir::Node&)` for why).
+    ///
+    /// Over a registered table the run never streams its source, but a run
+    /// that filters produces its survivors morsel by morsel anyway. Such a run
+    /// records the updates above it too, and keeps them when its consumer
+    /// takes those morsels as they come (an aggregate, through
+    /// `ChunkStreamConsumerOffer`): each worker computes them over its
+    /// morsel's survivors while they are still in cache.
     std::size_t stream_only_updates = 0;
     /// The same at the BOTTOM of the run, `[parallel_end -
     /// stream_only_bottom_updates, parallel_end)`: row-local updates between

@@ -458,7 +458,22 @@ auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
 /// not a join's probe side) is known only at execution; the executor strips
 /// these steps back out when it does not.
 void admit_stream_only_updates(Plan& plan, bool found_run) {
-    if (plan.source != SourceKind::LazyScan) {
+    if (plan.source == SourceKind::TableScan) {
+        // A registered table never streams, but a run over it that filters
+        // produces its survivors morsel by morsel anyway. For a consumer that
+        // takes those morsels as they come, the executor keeps the updates
+        // above the filter on the run's workers (`ChunkStreamConsumerOffer`);
+        // for any other it strips them back out, as for an unstreamed scan.
+        const bool filters =
+            found_run && plan.parallel_end == plan.steps.size() &&
+            std::any_of(plan.steps.begin() + static_cast<std::ptrdiff_t>(plan.parallel_begin),
+                        plan.steps.end(), [](const MapStep& step) {
+                            return step.node->kind() == ir::NodeKind::Filter;
+                        });
+        if (!filters) {
+            return;
+        }
+    } else if (plan.source != SourceKind::LazyScan) {
         return;
     }
     if (found_run && plan.parallel_end != plan.steps.size()) {

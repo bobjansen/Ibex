@@ -189,6 +189,12 @@ N workers each run a private copy of the row-local chain over one unit into a
 - _Adjacent updates._ Row-local updates directly above or below the run join
   the worker chains when the run streams (`Plan::stream_only_updates`,
   `stream_only_bottom_updates`) and are composed serially when it does not.
+  A filter run over a registered table keeps the updates above it for an
+  aggregate (`ChunkStreamConsumerOffer`), which takes the morsels as they come:
+  the update then reads each morsel's survivors in cache instead of the whole
+  filtered table again. _Why:_ a q06-shaped global aggregate over 10M in-memory
+  rows went from 5.9 to 4.6 ms at 8 cores; with 93% of rows kept, 15.0 to 10.9 ms.
+  A materialized result keeps the two-phase filter, which a merge would cost.
 
 **`PipelinedStageOperator`** — a two-slot double buffer running its child on a
 raw thread, so a breaker's probe input is produced concurrently with the

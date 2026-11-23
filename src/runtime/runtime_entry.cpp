@@ -496,6 +496,10 @@ auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
 /// Defined below; the semi/anti join site offers its right side a scan sink on
 /// the same condition the aggregate does.
 auto is_row_local_chain_over_lazy_scan(const ir::Node& node, const TableRegistry& registry) -> bool;
+auto is_row_local_chain_over_table_scan(const ir::Node& node, const TableRegistry& registry)
+    -> bool;
+auto is_row_local_chain_over_scan(const ir::Node& node, const TableRegistry& registry, bool lazy)
+    -> bool;
 
 /// The row count of the source under a chain of Filter, Project, Rename and
 /// Update nodes -- a deferred lazy source or an in-memory table -- or nullopt
@@ -790,6 +794,18 @@ class OneGroupIfUngroupedOperator final : public Operator {
 /// pipeline's workers see.
 auto is_row_local_chain_over_lazy_scan(const ir::Node& node, const TableRegistry& registry)
     -> bool {
+    return is_row_local_chain_over_scan(node, registry, /*lazy=*/true);
+}
+
+/// The same chain over a scan of a registered table: the input a
+/// `ChunkStreamConsumerOffer` is made for.
+auto is_row_local_chain_over_table_scan(const ir::Node& node, const TableRegistry& registry)
+    -> bool {
+    return is_row_local_chain_over_scan(node, registry, /*lazy=*/false);
+}
+
+auto is_row_local_chain_over_scan(const ir::Node& node, const TableRegistry& registry, bool lazy)
+    -> bool {
     const ir::Node* cur = &node;
     while (true) {
         bool runs_in_stream = false;
@@ -803,7 +819,7 @@ auto is_row_local_chain_over_lazy_scan(const ir::Node& node, const TableRegistry
                 runs_in_stream = physical::is_stream_admissible_update(*cur);
                 break;
             case ir::NodeKind::Scan:
-                return !registry.contains(ir::node_cast<ir::ScanNode>(*cur).source_name());
+                return registry.contains(ir::node_cast<ir::ScanNode>(*cur).source_name()) != lazy;
             default:
                 return false;
         }
@@ -976,8 +992,15 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
             scan_sink = make_aggregate_scan_worker_sink(&agg.group_by(), &agg.aggregations(), exec,
                                                         *parallelism, ap.columns);
         }
+        // And over a registered table, tell its filter run that the chunks
+        // it makes are taken as they come, so the updates above the filter
+        // run on its workers rather than over the materialized result.
+        const bool streaming_consumer =
+            exec.can_fan_out() &&
+            is_row_local_chain_over_table_scan(*agg.children().front(), registry);
         auto child_op = [&] {
             const ScanWorkerSinkOffer offer(scan_sink);
+            const ChunkStreamConsumerOffer consumer(streaming_consumer);
             return build_operator(*agg.children().front(), registry, scalars, externs, exec,
                                   model_out);
         }();

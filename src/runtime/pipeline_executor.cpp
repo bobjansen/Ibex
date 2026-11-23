@@ -2136,24 +2136,6 @@ class DeferredScanSourceOperator final : public Operator {
     std::size_t window_ = 1;
 };
 
-/// Replays a list of chunks once; the input of `MaterializeOperator` when the
-/// unit pipeline batches several units' output into one chunk.
-class ChunkListSource final : public Operator {
-   public:
-    explicit ChunkListSource(std::vector<Chunk> chunks) : chunks_(std::move(chunks)) {}
-
-    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
-        if (position_ == chunks_.size()) {
-            return std::optional<Chunk>{};
-        }
-        return std::optional<Chunk>{std::move(chunks_[position_++])};
-    }
-
-   private:
-    std::vector<Chunk> chunks_;
-    std::size_t position_ = 0;
-};
-
 // A one-chunk source owned by one scan-pipeline worker. The worker replaces
 // the pending chunk for every source unit it claims, then pulls the private
 // row-local chain exactly once. Keeping the chain private is what makes its

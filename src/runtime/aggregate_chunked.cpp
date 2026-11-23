@@ -1574,24 +1574,6 @@ class GroupKeyStore {
     std::vector<std::uint64_t> null_masks_;
 };
 
-/// Replays chunks already pulled from a stream, in order, for
-/// `HashAggregateState::gather_batch` to join.
-class HeldChunksOperator final : public Operator {
-   public:
-    explicit HeldChunksOperator(std::vector<Chunk> chunks) : chunks_(std::move(chunks)) {}
-
-    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
-        if (next_ == chunks_.size()) {
-            return std::optional<Chunk>{};
-        }
-        return std::optional<Chunk>{std::move(chunks_[next_++])};
-    }
-
-   private:
-    std::vector<Chunk> chunks_;
-    std::size_t next_ = 0;
-};
-
 class HashAggregateState final {
    public:
     /// `Cat` carries a Categorical's *code*, which the pair path may treat as
@@ -2000,7 +1982,7 @@ class HashAggregateState final {
             return std::move(*joined);
         }
         auto joined =
-            MaterializeOperator(std::make_unique<HeldChunksOperator>(std::move(parts))).run();
+            MaterializeOperator(std::make_unique<ChunkListSource>(std::move(parts))).run();
         if (!joined.has_value()) {
             return std::unexpected(std::move(joined.error()));
         }

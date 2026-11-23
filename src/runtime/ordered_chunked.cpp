@@ -429,24 +429,6 @@ class ChunkedOrderOperator final : public Operator {
     bool still_sorted_ = true;
 };
 
-/// Yields prebuilt chunks in order, for concatenating them through
-/// `materialize_operator`.
-class ChunkListSource final : public Operator {
-   public:
-    explicit ChunkListSource(std::vector<Chunk> chunks) : chunks_(std::move(chunks)) {}
-
-    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
-        if (pos_ >= chunks_.size()) {
-            return std::optional<Chunk>{};
-        }
-        return std::optional<Chunk>{std::move(chunks_[pos_++])};
-    }
-
-   private:
-    std::vector<Chunk> chunks_;
-    std::size_t pos_ = 0;
-};
-
 class ChunkedOrderedLimitOperator final : public Operator {
    public:
     enum class KeepMode : std::uint8_t { First, Last };

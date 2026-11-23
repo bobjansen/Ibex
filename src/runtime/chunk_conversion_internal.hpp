@@ -9,8 +9,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace ibex::runtime {
 
@@ -31,6 +34,25 @@ struct ChunkIdentity {
 [[nodiscard]] inline auto chunk_identity_of(const Chunk& chunk) -> ChunkIdentity {
     return ChunkIdentity{.sequence = chunk.sequence, .row_offset = chunk.row_offset};
 }
+
+/// Replays a list of chunks once, in order: the input of a
+/// `MaterializeOperator` that concatenates them, or of an operator handed back
+/// chunks it held.
+class ChunkListSource final : public Operator {
+   public:
+    explicit ChunkListSource(std::vector<Chunk> chunks) : chunks_(std::move(chunks)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (position_ == chunks_.size()) {
+            return std::optional<Chunk>{};
+        }
+        return std::optional<Chunk>{std::move(chunks_[position_++])};
+    }
+
+   private:
+    std::vector<Chunk> chunks_;
+    std::size_t position_ = 0;
+};
 
 [[nodiscard]] inline auto table_to_chunk(Table table, ChunkIdentity identity) -> Chunk {
     auto chunk = table_to_chunk(std::move(table));

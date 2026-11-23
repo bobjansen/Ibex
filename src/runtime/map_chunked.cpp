@@ -865,8 +865,16 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     // without touching it, and answers for an unconfigured context too -- on a
     // single-core box that is a budget of one just as surely as an explicit
     // `IBEX_CORES=1` is.
-    if (exec.can_fan_out() && plan.mode == physical::PipelineMode::MorselParallel &&
-        index == plan.parallel_begin) {
+    //
+    // One exception at a budget of one: a run over an in-memory table whose
+    // consumer streams its chunks (`ChunkStreamConsumerOffer`). Its input is
+    // the table itself, so there is no materialize to pay, and the run is
+    // driven morsel by morsel on this thread (`SerialMorselRunOperator`).
+    const bool serial_range_run = !exec.can_fan_out() &&
+                                  plan.source == physical::SourceKind::TableScan &&
+                                  chunk_stream_consumer_offered();
+    if ((exec.can_fan_out() || serial_range_run) &&
+        plan.mode == physical::PipelineMode::MorselParallel && index == plan.parallel_begin) {
         if (plan.parallel_begin > 0) {
             // Steps above the run execute on its output, after its workers are
             // done with each chunk; a consumer's worker sink would see a chunk

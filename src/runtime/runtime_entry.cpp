@@ -342,7 +342,7 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                     "parallel_hash_builds={} streamed_probes={} parallel_aggregate_partitions={} "
                     "parallel_aggregate_finalizes={} "
                     "grouped_lifted_group_state={} chunk_direct_updates={} "
-                    "untranslated_categorical_columns={} late_topks={}\n",
+                    "untranslated_categorical_columns={} late_topks={} serial_range_runs={}\n",
                     stats.parallel_pipelines.load(), stats.serial_pipelines.load(),
                     stats.morsels.load(), stats.pipelined_scans.load(),
                     stats.pipelined_stages.load(), stats.range_heads.load(),
@@ -352,7 +352,8 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                     stats.parallel_aggregate_partitions.load(),
                     stats.parallel_aggregate_finalizes.load(),
                     stats.grouped_lifted_group_state.load(), stats.chunk_direct_updates.load(),
-                    stats.untranslated_categorical_columns.load(), stats.late_topks.load());
+                    stats.untranslated_categorical_columns.load(), stats.late_topks.load(),
+                    stats.serial_range_runs.load());
             } catch (...) {  // NOLINT(bugprone-empty-catch)
             }
         }
@@ -994,9 +995,9 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         }
         // And over a registered table, tell its filter run that the chunks
         // it makes are taken as they come, so the updates above the filter
-        // run on its workers rather than over the materialized result.
+        // run on its workers rather than over the materialized result -- or,
+        // at a budget of one, that it may run morsel by morsel on this thread.
         const bool streaming_consumer =
-            exec.can_fan_out() &&
             is_row_local_chain_over_table_scan(*agg.children().front(), registry);
         auto child_op = [&] {
             const ScanWorkerSinkOffer offer(scan_sink);

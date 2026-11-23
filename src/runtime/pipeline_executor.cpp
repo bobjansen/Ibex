@@ -489,6 +489,51 @@ struct MorselWorkerChain {
     }
     return worker;
 }
+
+/// One worker chain driven on the calling thread, morsel by morsel: a range-
+/// headed run at a compute budget of one, for a consumer that takes its chunks
+/// as they come (`ChunkStreamConsumerOffer`).
+///
+/// The whole-table chunk the serial path otherwise runs writes the filter's
+/// mask over every row, then gathers the survivors and computes the updates in
+/// passes of their own, each re-reading from memory what the filter streamed
+/// through cache. Morsel by morsel, the predicate's columns are still in cache
+/// when the survivors are gathered and the updates run over them. A q06-shaped
+/// global aggregate over 10M in-memory rows on one core: 16.4 -> 14.7 ms.
+///
+/// The chunks are emitted in sequence order, empty ones included, exactly as the
+/// parallel pipeline's ordered merger releases them.
+class SerialMorselRunOperator final : public Operator {
+   public:
+    SerialMorselRunOperator(std::unique_ptr<Table> input, MorselWorkerChain worker,
+                            std::size_t grain, std::uint64_t morsels)
+        : input_(std::move(input)), worker_(std::move(worker)), grain_(grain), morsels_(morsels) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (next_sequence_ == morsels_) {
+            return std::optional<Chunk>{};
+        }
+        const std::uint64_t sequence = next_sequence_++;
+        const auto [begin, end] = morsel_row_range(input_->rows(), grain_, sequence);
+        worker_.source->set_morsel(begin, end, sequence);
+        auto produced = worker_.chain->next();
+        if (!produced.has_value()) {
+            return std::unexpected(std::move(produced.error()));
+        }
+        if (!produced->has_value()) {
+            return std::unexpected("morsel pipeline: worker produced no output morsel");
+        }
+        return produced;
+    }
+
+   private:
+    std::unique_ptr<Table> input_;
+    MorselWorkerChain worker_;
+    std::size_t grain_;
+    std::uint64_t morsels_;
+    std::uint64_t next_sequence_ = 0;
+};
+
 auto ring_producer_parks() -> std::atomic<std::uint64_t>& {
     static std::atomic<std::uint64_t> count{0};
     return count;
@@ -1557,7 +1602,8 @@ auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<MapS
 auto build_materialized_map_run(const physical::Plan& plan, const std::vector<MapStep>& operators,
                                 const ir::Node* input_node, const TableRegistry& registry,
                                 const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                const ExecutionContext& exec, ModelResult* model_out)
+                                const ExecutionContext& exec, ModelResult* model_out,
+                                bool streaming_consumer)
     -> std::expected<OperatorPtr, std::string> {
     // Build the run's input through the pipeline's source, the way the serial
     // composer does, so an aggregate under the run's filter gets its
@@ -1652,6 +1698,25 @@ auto build_materialized_map_run(const physical::Plan& plan, const std::vector<Ma
         }
         return std::make_unique<MorselPipelineOperator>(std::move(owned), std::move(workers), grain,
                                                         expected_morsels, process_worker_pool());
+    }
+
+    // No second worker, but a consumer that streams and a head filter that
+    // evaluates by range: run the one worker chain here, morsel by morsel, so
+    // each morsel's survivors are gathered and updated while still in cache.
+    // A consumer that materializes keeps the whole-table chunk -- per-morsel
+    // output would cost it a concat the single chunk does not.
+    if (streaming_consumer && !exec.can_fan_out() && expected_morsels >= 2 && !operators.empty() &&
+        (range_filter_head(operators.front(), *owned).has_value() ||
+         range_update_filter_columns(operators.front(), *owned).has_value())) {
+        auto worker = build_morsel_worker_chain(operators, *owned, scalars, externs, exec);
+        if (!worker.has_value()) {
+            return std::unexpected(std::move(worker.error()));
+        }
+        if (exec.parallel_stats != nullptr) {
+            exec.parallel_stats->serial_range_runs.fetch_add(1, std::memory_order_relaxed);
+        }
+        return std::make_unique<SerialMorselRunOperator>(std::move(owned), std::move(*worker),
+                                                         grain, expected_morsels);
     }
 
     if (!morselize) {
@@ -1751,7 +1816,7 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
     if (plan.stream_only_updates == 0 ||
         (streaming_consumer && plan.source == physical::SourceKind::TableScan)) {
         return build_materialized_map_run(plan, operators, input_node, registry, scalars, externs,
-                                          exec, model_out);
+                                          exec, model_out, streaming_consumer);
     }
     // The plan admitted the run's top updates for a streamed run only (see
     // `Plan::stream_only_updates`). This one materializes its input, so they
@@ -1764,7 +1829,7 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
     auto run = below.empty()
                    ? build_pipeline_source(plan, registry, scalars, externs, exec, model_out)
                    : build_materialized_map_run(plan, below, input_node, registry, scalars, externs,
-                                                exec, model_out);
+                                                exec, model_out, false);
     if (!run.has_value()) {
         return run;
     }
@@ -2956,6 +3021,10 @@ ChunkStreamConsumerOffer::~ChunkStreamConsumerOffer() {
 
 auto take_chunk_stream_consumer_offer() -> bool {
     return std::exchange(offered_chunk_stream_consumer, false);
+}
+
+auto chunk_stream_consumer_offered() -> bool {
+    return offered_chunk_stream_consumer;
 }
 
 }  // namespace ibex::runtime

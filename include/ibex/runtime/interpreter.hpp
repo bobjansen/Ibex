@@ -912,6 +912,10 @@ struct ParallelPipelineStats {
     /// either way, and the first phase falls back to the ordinary operator on
     /// any failure, so a pruning gap would cost the speed with every test green.
     std::atomic<std::uint64_t> late_topks{0};
+    /// Range-headed morsel runs driven on the calling thread at a compute budget
+    /// of one (`SerialMorselRunOperator`). The whole-table chunk gives the same
+    /// answer, so a narrowed gate would cost the speed with every test green.
+    std::atomic<std::uint64_t> serial_range_runs{0};
     /// Grouped windowed updates whose groups were spread across worker threads.
     /// Same reason as the counters above: the output is identical either way,
     /// so without this a gate that quietly stopped matching — a newly nullable

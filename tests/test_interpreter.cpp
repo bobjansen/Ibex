@@ -19867,6 +19867,76 @@ TEST_CASE("A filter run over a table computes its update on the workers for an a
     CHECK(y[y.size() - 1] == 7998);
 }
 
+// At a compute budget of one the same aggregate runs its filter run morsel by
+// morsel on the calling thread (`SerialMorselRunOperator`), so each morsel's
+// survivors are gathered and updated while still in cache. Order-sensitive
+// aggregates see the rows in row order, empty morsels included; a materialized
+// result keeps the single whole-table chunk.
+TEST_CASE("A filter run over a table streams morsels serially for an aggregate on one core",
+          "[runtime][pipeline]") {
+    std::vector<std::int64_t> xs(4000);
+    // NOLINTNEXTLINE(modernize-use-ranges): Apple libc++ does not provide ranges::iota.
+    std::iota(xs.begin(), xs.end(), std::int64_t{0});
+    std::vector<std::int64_t> gs(4000);
+    for (std::size_t i = 0; i < gs.size(); ++i) {
+        gs[i] = static_cast<std::int64_t>(i % 3);
+    }
+    runtime::Table df;
+    df.add_column("x", Column<std::int64_t>{xs});
+    df.add_column("g", Column<std::int64_t>{gs});
+    runtime::TableRegistry tables;
+    tables.emplace("df", df);
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext exec{.execution_profile = nullptr};
+    exec.parallel_threads = 1;
+    exec.parallel_grain = 256;
+    exec.parallel_stats = &stats;
+
+    // Rows 0..600 and 1200..1800 fail, so whole morsels come out empty.
+    auto aggregate = require_ir(
+        "df[filter (x < 600 || x >= 1800) && x > 1 && x < 3990][update { y = x * 2 }]"
+        "[select { s = sum(y), n = count(), f = first(x), l = last(x) }, by g];");
+    auto out = runtime::interpret(*aggregate, tables, nullptr, nullptr, nullptr, exec);
+    INFO((out.has_value() ? std::string{} : out.error()));
+    REQUIRE(out.has_value());
+    CHECK(stats.serial_range_runs.load() == 1);
+    REQUIRE(out->rows() == 3);
+    const auto& g = std::get<Column<std::int64_t>>(*out->find("g"));
+    const auto& s = std::get<Column<std::int64_t>>(*out->find("s"));
+    const auto& n = std::get<Column<std::int64_t>>(*out->find("n"));
+    const auto& f = std::get<Column<std::int64_t>>(*out->find("f"));
+    const auto& l = std::get<Column<std::int64_t>>(*out->find("l"));
+    for (std::size_t row = 0; row < 3; ++row) {
+        std::int64_t want_s = 0;
+        std::int64_t want_n = 0;
+        std::int64_t want_f = -1;
+        std::int64_t want_l = -1;
+        for (std::int64_t x = 0; x < 4000; ++x) {
+            if (x % 3 != g[row] || !((x < 600 || x >= 1800) && x > 1 && x < 3990)) {
+                continue;
+            }
+            want_s += x * 2;
+            ++want_n;
+            want_f = want_f < 0 ? x : want_f;
+            want_l = x;
+        }
+        CHECK(s[row] == want_s);
+        CHECK(n[row] == want_n);
+        CHECK(f[row] == want_f);
+        CHECK(l[row] == want_l);
+    }
+
+    auto rows = require_ir("df[filter x > 500 && x < 3990 && g == 1][update { y = x * 2 }];");
+    runtime::ParallelPipelineStats row_stats;
+    exec.parallel_stats = &row_stats;
+    auto materialized = runtime::interpret(*rows, tables, nullptr, nullptr, nullptr, exec);
+    REQUIRE(materialized.has_value());
+    CHECK(row_stats.serial_range_runs.load() == 0);
+    const auto& y = std::get<Column<std::int64_t>>(*materialized->find("y"));
+    REQUIRE(y.size() == 1163);
+    CHECK(y[0] == 1004);
+}
+
 // A dense grouping walks each morsel a block at a time: the block's cells,
 // then every aggregate over them. Rows reach each group in row order, so
 // first/last and the sums are those of a plain pass. Large enough for several

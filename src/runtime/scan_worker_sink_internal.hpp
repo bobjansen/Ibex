@@ -138,4 +138,7 @@ class ChunkStreamConsumerOffer {
 /// takes it.
 [[nodiscard]] auto take_chunk_stream_consumer_offer() -> bool;
 
+/// Whether a streaming consumer is on offer, without withdrawing it.
+[[nodiscard]] auto chunk_stream_consumer_offered() -> bool;
+
 }  // namespace ibex::runtime

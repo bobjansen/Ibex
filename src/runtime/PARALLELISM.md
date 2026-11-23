@@ -195,6 +195,12 @@ N workers each run a private copy of the row-local chain over one unit into a
   filtered table again. _Why:_ a q06-shaped global aggregate over 10M in-memory
   rows went from 5.9 to 4.6 ms at 8 cores; with 93% of rows kept, 15.0 to 10.9 ms.
   A materialized result keeps the two-phase filter, which a merge would cost.
+  At a compute budget of one the same offer still admits the run: its one
+  worker chain is driven morsel by morsel on the calling thread
+  (`SerialMorselRunOperator`, counter `serial_range_runs`) instead of over one
+  whole-table chunk, when its head filter evaluates by range. _Why:_ the
+  whole-table chunk gathers the survivors and runs the updates in passes of
+  their own, re-reading from memory what the filter already streamed.
 
 **`PipelinedStageOperator`** — a two-slot double buffer running its child on a
 raw thread, so a breaker's probe input is produced concurrently with the

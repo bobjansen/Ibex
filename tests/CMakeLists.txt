@@ -152,7 +152,8 @@ if(TARGET ibex_parquet)
                                       test_parquet_dictionary_cache.cpp
                                       test_parquet_chunked_source.cpp
                                       test_parquet_int32_ingestion.cpp
-                                      test_parquet_key_filter_estimate.cpp)
+                                      test_parquet_key_filter_estimate.cpp
+                                      test_parquet_writer_dictionary.cpp)
     target_include_directories(ibex_tests SYSTEM PRIVATE
         $<TARGET_PROPERTY:ibex_parquet,INCLUDE_DIRECTORIES>)
     target_link_libraries(ibex_tests PRIVATE ibex_parquet parquet_shared arrow_shared)

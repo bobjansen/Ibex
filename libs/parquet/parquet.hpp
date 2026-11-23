@@ -6053,6 +6053,25 @@ class Writer {
         return stats;
     }
 
+    /// The definition levels of `count` present values of an optional flat
+    /// column, as a V1 data page opens with them: a 4-byte length, then one RLE
+    /// run of level 1. Returns the bytes and how many of them are used.
+    static auto present_levels(int64_t count) -> std::pair<std::array<uint8_t, 10>, std::size_t> {
+        std::array<uint8_t, 10> levels{};
+        auto run = static_cast<uint32_t>(count) * 2;
+        std::size_t end = sizeof(uint32_t);
+        while (run >= 128) {
+            levels[end++] = static_cast<uint8_t>((run & 127) | 128);
+            run >>= 7;
+        }
+        levels[end++] = static_cast<uint8_t>(run);
+        levels[end++] = 1;
+        const auto level_bytes =
+            arrow::bit_util::ToLittleEndian(static_cast<uint32_t>(end - sizeof(uint32_t)));
+        std::memcpy(levels.data(), &level_bytes, sizeof(level_bytes));
+        return {levels, end};
+    }
+
     /// A present flat column can reach PageWriter in its PLAIN representation.
     /// The only levels needed are one RLE run for each optional data page.
     template <typename Stats>
@@ -6082,18 +6101,7 @@ class Writer {
             int64_t size = length;
             std::shared_ptr<arrow::Buffer> page;
             if (optional) {
-                std::array<uint8_t, 10> levels{};
-                auto run = static_cast<uint32_t>(count) * 2;
-                std::size_t end = sizeof(uint32_t);
-                while (run >= 128) {
-                    levels[end++] = static_cast<uint8_t>((run & 127) | 128);
-                    run >>= 7;
-                }
-                levels[end++] = static_cast<uint8_t>(run);
-                levels[end++] = 1;
-                const auto level_bytes =
-                    arrow::bit_util::ToLittleEndian(static_cast<uint32_t>(end - sizeof(uint32_t)));
-                std::memcpy(levels.data(), &level_bytes, sizeof(level_bytes));
+                const auto [levels, end] = present_levels(count);
                 size += static_cast<int64_t>(end);
                 check(payload->Resize(size, false));
                 std::memcpy(payload->mutable_data(), levels.data(), end);
@@ -6129,6 +6137,253 @@ class Writer {
                           });
     }
 
+    /// Appends `indices` to `out` in Parquet's RLE / bit-packed hybrid at
+    /// `bit_width` (1..32), the body of an RLE_DICTIONARY data page after its
+    /// bit-width byte. A run of at least eight equal indices becomes an RLE
+    /// run; the rest is bit-packed eight values at a time, the last group
+    /// zero-padded. A literal run must hold whole groups, so one that ends
+    /// before a long run borrows the run's first values to fill its last group.
+    template <typename Index>
+    static void encode_hybrid(std::span<const Index> indices, int bit_width,
+                              std::vector<uint8_t>& out) {
+        const std::size_t n = indices.size();
+        const auto width = static_cast<std::size_t>(bit_width);
+        const std::size_t value_bytes = (width + 7) / 8;
+        // Worst case: every group bit-packed, plus a header for each run.
+        const std::size_t start = out.size();
+        out.resize(start + (((n + 7) / 8) * width) + (((n / 8) + 2) * (5 + value_bytes)));
+        uint8_t* dst = out.data() + start;
+        const auto varint = [&dst](uint64_t header) {
+            while (header >= 128) {
+                *dst++ = static_cast<uint8_t>((header & 127) | 128);
+                header >>= 7;
+            }
+            *dst++ = static_cast<uint8_t>(header);
+        };
+        const auto pack = [&](std::size_t begin, std::size_t count) {
+            const std::size_t groups = (count + 7) / 8;
+            varint((static_cast<uint64_t>(groups) << 1) | 1);
+            uint64_t acc = 0;
+            std::size_t bits = 0;
+            const std::size_t full = count;
+            for (std::size_t k = 0; k < groups * 8; ++k) {
+                const uint64_t v = k < full ? static_cast<uint64_t>(indices[begin + k]) : 0;
+                acc |= v << bits;
+                bits += width;
+                while (bits >= 8) {
+                    *dst++ = static_cast<uint8_t>(acc);
+                    acc >>= 8;
+                    bits -= 8;
+                }
+            }
+        };
+        const auto repeat = [&](Index index, std::size_t count) {
+            varint(static_cast<uint64_t>(count) << 1);
+            const auto v = static_cast<uint64_t>(index);
+            for (std::size_t b = 0; b < value_bytes; ++b) {
+                *dst++ = static_cast<uint8_t>(v >> (8 * b));
+            }
+        };
+        std::size_t literal_begin = 0;
+        std::size_t i = 0;
+        while (i < n) {
+            std::size_t j = i + 1;
+            while (j < n && indices[j] == indices[i]) {
+                ++j;
+            }
+            const std::size_t run = j - i;
+            if (run >= 8) {
+                const std::size_t pending = i - literal_begin;
+                const std::size_t fill = (8 - (pending % 8)) % 8;
+                if (run - fill >= 8) {
+                    if (pending + fill != 0) {
+                        pack(literal_begin, pending + fill);
+                    }
+                    repeat(indices[i], run - fill);
+                    literal_begin = j;
+                }
+            }
+            i = j;
+        }
+        if (literal_begin < n) {
+            pack(literal_begin, n - literal_begin);
+        }
+        out.resize(static_cast<std::size_t>(dst - out.data()));
+    }
+
+    /// Dictionary-encodes a null-free numeric chunk itself: the dictionary in
+    /// first-seen order, then RLE_DICTIONARY data pages of hybrid indices.
+    /// Arrow's generic encoder spent most of a numeric write hashing every value
+    /// and flushing its index runs. False when the dictionary would outgrow the
+    /// page limit, where Arrow's writer falls back to PLAIN mid-chunk.
+    template <typename Physical, typename Array>
+    auto write_dictionary_numbers(const Array& array, ::parquet::PageWriter& pages,
+                                  ::parquet::ColumnChunkMetaDataBuilder& metadata) const -> bool {
+        using T = std::remove_cvref_t<decltype(*array.raw_values())>;
+        const T* values = array.raw_values();
+        const auto n = static_cast<std::size_t>(array.length());
+        std::vector<T> dictionary;
+        std::vector<uint32_t> indices(n);
+        const auto limit = static_cast<std::size_t>(props_->dictionary_pagesize_limit());
+        bool small_range = false;
+        if constexpr (std::is_integral_v<T>) {
+            const auto [lo, hi] = std::minmax_element(values, values + n);
+            const auto span =
+                static_cast<uint64_t>(static_cast<int64_t>(*hi) - static_cast<int64_t>(*lo));
+            if (span < (uint64_t{1} << 20) && span <= 4 * static_cast<uint64_t>(n)) {
+                small_range = true;
+                const T base = *lo;
+                std::vector<uint32_t> slot(static_cast<std::size_t>(span) + 1,
+                                           std::numeric_limits<uint32_t>::max());
+                for (std::size_t row = 0; row < n; ++row) {
+                    auto& entry = slot[static_cast<std::size_t>(values[row] - base)];
+                    if (entry == std::numeric_limits<uint32_t>::max()) {
+                        entry = static_cast<uint32_t>(dictionary.size());
+                        dictionary.push_back(values[row]);
+                    }
+                    indices[row] = entry;
+                }
+            }
+        }
+        if (!small_range) {
+            using Key = std::conditional_t<sizeof(T) == 8, uint64_t, uint32_t>;
+            robin_hood::unordered_flat_map<Key, uint32_t> slots;
+            for (std::size_t row = 0; row < n; ++row) {
+                const auto [it, inserted] = slots.try_emplace(
+                    std::bit_cast<Key>(values[row]), static_cast<uint32_t>(dictionary.size()));
+                if (inserted) {
+                    if ((dictionary.size() + 1) * sizeof(T) > limit) {
+                        return false;
+                    }
+                    dictionary.push_back(values[row]);
+                }
+                indices[row] = it->second;
+            }
+        }
+        if (dictionary.size() * sizeof(T) > limit) {
+            return false;
+        }
+
+        const auto* column = metadata.descr();
+        const bool statistics = props_->statistics_enabled(column->path());
+        auto chunk_stats = ::parquet::MakeStatistics<Physical>(column);
+        write_dictionary_pages(arrow::Buffer::Wrap(dictionary.data(), dictionary.size()),
+                               dictionary.size(), std::span<const uint32_t>{indices}, pages,
+                               metadata, [&](std::size_t row, std::size_t count) {
+                                   ::parquet::EncodedStatistics page_stats;
+                                   if (statistics) {
+                                       auto stats = ::parquet::MakeStatistics<Physical>(column);
+                                       stats->Update(values + row, static_cast<int64_t>(count), 0);
+                                       chunk_stats->Merge(*stats);
+                                       page_stats = stats->Encode();
+                                   }
+                                   return page_stats;
+                               });
+        if (statistics) {
+            metadata.SetStatistics(chunk_stats->Encode());
+        }
+        return true;
+    }
+
+    /// The pages of a dictionary-encoded, null-free chunk: the PLAIN dictionary
+    /// page `dictionary` of `entries` values, then RLE_DICTIONARY data pages of
+    /// `indices`, each carrying `page_stats(row, count)`. Closes `pages`.
+    template <typename Index, typename PageStats>
+    void write_dictionary_pages(const std::shared_ptr<arrow::Buffer>& dictionary,
+                                std::size_t entries, std::span<const Index> indices,
+                                ::parquet::PageWriter& pages,
+                                ::parquet::ColumnChunkMetaDataBuilder& metadata,
+                                PageStats page_stats) const {
+        const auto* column = metadata.descr();
+        const bool optional = column->max_definition_level() != 0;
+        pages.WriteDictionaryPage(::parquet::DictionaryPage(
+            dictionary, static_cast<int32_t>(entries), ::parquet::Encoding::PLAIN));
+
+        // Size pages by their bit-packed index bytes, in whole groups of eight,
+        // at the chunk's widest index. Each page then packs at the width of its
+        // own widest index, narrower in early pages of a dictionary still
+        // growing through the chunk.
+        const auto bit_width =
+            static_cast<std::size_t>(entries <= 1 ? 1 : std::bit_width(entries - 1));
+        const auto page_rows = std::max<std::size_t>(
+            8,
+            (static_cast<std::size_t>(props_->data_pagesize()) * 8 / bit_width) & ~std::size_t{7});
+        std::shared_ptr<arrow::ResizableBuffer> compressed;
+        if (pages.has_compressor()) {
+            compressed = value(arrow::AllocateResizableBuffer(0));
+        }
+        std::vector<uint8_t> body;
+        const std::size_t n = indices.size();
+        for (std::size_t row = 0; row < n; row += page_rows) {
+            const std::size_t count = std::min(n - row, page_rows);
+            body.clear();
+            if (optional) {
+                const auto [levels, end] = present_levels(static_cast<int64_t>(count));
+                body.insert(body.end(), levels.begin(), levels.begin() + end);
+            }
+            const auto page_indices = indices.subspan(row, count);
+            const int page_width = std::max(
+                1, static_cast<int>(
+                       std::bit_width(static_cast<uint64_t>(std::ranges::max(page_indices)))));
+            body.push_back(static_cast<uint8_t>(page_width));
+            encode_hybrid(page_indices, page_width, body);
+            const auto size = static_cast<int64_t>(body.size());
+            std::shared_ptr<arrow::Buffer> page = arrow::Buffer::Wrap(body.data(), body.size());
+            if (compressed) {
+                pages.Compress(*page, compressed.get());
+                page = compressed;
+            }
+            pages.WriteDataPage(::parquet::DataPageV1(
+                page, static_cast<int32_t>(count), ::parquet::Encoding::RLE_DICTIONARY,
+                ::parquet::Encoding::RLE, ::parquet::Encoding::RLE, size, page_stats(row, count)));
+        }
+        pages.Close(true, false);
+    }
+
+    /// A text chunk `build_text_dictionary` already dictionary-encoded, written
+    /// through `write_dictionary_pages` rather than Arrow's column writer, which
+    /// re-scanned the codes for validity and re-encoded them run by run. As
+    /// that path does, no page statistics, and the chunk's come from the
+    /// dictionary. False when there are nulls or the dictionary page would be
+    /// over the limit: Arrow's writer then decides as before.
+    auto write_dictionary_text(const arrow::DictionaryArray& values, ::parquet::PageWriter& pages,
+                               ::parquet::ColumnChunkMetaDataBuilder& metadata) const -> bool {
+        if (values.null_count() != 0 || values.indices()->type_id() != arrow::Type::INT32 ||
+            values.dictionary()->type_id() != arrow::Type::STRING) {
+            return false;
+        }
+        const auto& labels = static_cast<const arrow::StringArray&>(*values.dictionary());
+        const auto bytes = static_cast<std::size_t>(labels.total_values_length()) +
+                           (sizeof(uint32_t) * static_cast<std::size_t>(labels.length()));
+        if (bytes > static_cast<std::size_t>(props_->dictionary_pagesize_limit())) {
+            return false;
+        }
+        auto dictionary = value(arrow::AllocateBuffer(static_cast<int64_t>(bytes)));
+        uint8_t* out = dictionary->mutable_data();
+        for (int64_t i = 0; i < labels.length(); ++i) {
+            const auto label = labels.GetView(i);
+            const auto length =
+                arrow::bit_util::ToLittleEndian(static_cast<uint32_t>(label.size()));
+            std::memcpy(out, &length, sizeof(length));
+            out += sizeof(length);
+            std::memcpy(out, label.data(), label.size());
+            out += label.size();
+        }
+        const auto& codes = static_cast<const arrow::Int32Array&>(*values.indices());
+        const std::span<const int32_t> indices{codes.raw_values(),
+                                               static_cast<std::size_t>(codes.length())};
+        write_dictionary_pages(
+            std::shared_ptr<arrow::Buffer>(std::move(dictionary)),
+            static_cast<std::size_t>(labels.length()), indices, pages, metadata,
+            [](std::size_t, std::size_t) { return ::parquet::EncodedStatistics{}; });
+        const auto* column = metadata.descr();
+        if (props_->statistics_enabled(column->path())) {
+            metadata.SetStatistics(
+                dictionary_statistics(values, props_->max_statistics_size(column->path())));
+        }
+        return true;
+    }
+
     auto write_plain(const arrow::Array& array, bool allow_dictionary, ::parquet::PageWriter& pages,
                      ::parquet::ColumnChunkMetaDataBuilder& metadata) const -> bool {
         if (array.null_count() != 0 || std::endian::native != std::endian::little) {
@@ -6148,7 +6403,22 @@ class Writer {
             return true;
         }
         if (allow_dictionary) {
-            return false;
+            switch (array.type_id()) {
+                case arrow::Type::DICTIONARY:
+                    return write_dictionary_text(static_cast<const arrow::DictionaryArray&>(array),
+                                                 pages, metadata);
+                case arrow::Type::INT32:
+                    return write_dictionary_numbers<::parquet::Int32Type>(
+                        static_cast<const arrow::Int32Array&>(array), pages, metadata);
+                case arrow::Type::INT64:
+                    return write_dictionary_numbers<::parquet::Int64Type>(
+                        static_cast<const arrow::Int64Array&>(array), pages, metadata);
+                case arrow::Type::DOUBLE:
+                    return write_dictionary_numbers<::parquet::DoubleType>(
+                        static_cast<const arrow::DoubleArray&>(array), pages, metadata);
+                default:
+                    return false;
+            }
         }
         switch (array.type_id()) {
             case arrow::Type::INT32:

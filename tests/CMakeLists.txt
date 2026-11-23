@@ -15,6 +15,7 @@ set(IBEX_TEST_SOURCES
     test_column.cpp
     test_compact_int32.cpp
     test_compact_filter.cpp
+    test_fused_conjunction.cpp
     test_integer_no_cache.cpp
     test_correlation.cpp
     test_csv.cpp

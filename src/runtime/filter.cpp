@@ -1527,6 +1527,203 @@ auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
     }
 }
 
+// ─── Fused conjunction ────────────────────────────────────────────────────────
+//
+// `a && b && c && ...` whose every leaf compares a numeric column without nulls
+// with a literal, evaluated one block of rows at a time: each leaf ANDs into
+// the same L1-resident block of mask bytes. Evaluated leaf by leaf, every leaf
+// wrote a whole-range byte mask and every AND re-read two of them; a q06-shaped
+// filter (`day` in a range, `price < x` under NaN ordering, `qty < y`) spent
+// as much on those masks as on reading its columns. Compact Int32 columns and
+// the NaN-ordered compare join in, which the pair kernel above takes neither.
+
+/// Rows per block: a multiple of 64 (whole keep words), and a block's mask
+/// bytes plus its values (at most 8 bytes a row per leaf) stay in L1.
+constexpr std::size_t kFusedBlockRows = 2048;
+
+/// ANDs leaf `values[i] op literal` into `out[i]` for `n` rows.
+using FusedLeafFn = void (*)(const void* values, std::int64_t lit_int, double lit_dbl,
+                             std::uint8_t* out, std::size_t n);
+
+struct FusedLeaf {
+    FusedLeafFn fn = nullptr;
+    /// Physical values at the evaluated range's first row.
+    const void* values = nullptr;
+    std::size_t width = 0;  // bytes per value
+    std::int64_t lit_int = 0;
+    double lit_dbl = 0.0;
+    /// Wide Int64 or Double under IEEE: a leaf the pair kernel also takes.
+    bool pair_kernel_leaf = false;
+};
+
+/// `NanHigh`: Polars' order, NaN above every number. It is only instantiated
+/// for Double values against a literal that is not NaN, where it differs from
+/// IEEE only for `>` and `>=` (a NaN row passes): `!(a <= b)` and `!(a < b)`.
+template <ir::CompareOp Op, bool NanHigh, typename V, typename L>
+void fused_leaf_and(const void* values, std::int64_t lit_int, double lit_dbl,
+                    std::uint8_t* __restrict out, std::size_t n) {
+    const auto* __restrict v = static_cast<const V*>(values);
+    L b{};
+    if constexpr (std::is_same_v<L, double>) {
+        b = lit_dbl;
+    } else {
+        b = static_cast<L>(lit_int);
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto a = static_cast<L>(v[i]);
+        bool keep = false;
+        if constexpr (Op == ir::CompareOp::Eq)
+            keep = a == b;
+        if constexpr (Op == ir::CompareOp::Ne)
+            keep = a != b;
+        if constexpr (Op == ir::CompareOp::Lt)
+            keep = a < b;
+        if constexpr (Op == ir::CompareOp::Le)
+            keep = a <= b;
+        if constexpr (Op == ir::CompareOp::Gt)
+            keep = NanHigh ? !(a <= b) : a > b;
+        if constexpr (Op == ir::CompareOp::Ge)
+            keep = NanHigh ? !(a < b) : a >= b;
+        out[i] &= static_cast<std::uint8_t>(keep);
+    }
+}
+
+template <bool NanHigh, typename V, typename L>
+auto fused_leaf_fn(ir::CompareOp op) -> FusedLeafFn {
+    switch (op) {
+        case ir::CompareOp::Eq:
+            return &fused_leaf_and<ir::CompareOp::Eq, NanHigh, V, L>;
+        case ir::CompareOp::Ne:
+            return &fused_leaf_and<ir::CompareOp::Ne, NanHigh, V, L>;
+        case ir::CompareOp::Lt:
+            return &fused_leaf_and<ir::CompareOp::Lt, NanHigh, V, L>;
+        case ir::CompareOp::Le:
+            return &fused_leaf_and<ir::CompareOp::Le, NanHigh, V, L>;
+        case ir::CompareOp::Gt:
+            return &fused_leaf_and<ir::CompareOp::Gt, NanHigh, V, L>;
+        case ir::CompareOp::Ge:
+            return &fused_leaf_and<ir::CompareOp::Ge, NanHigh, V, L>;
+    }
+    return nullptr;
+}
+
+/// A leaf the fused kernel evaluates exactly as `compare_col_scalar` does, or
+/// nullopt: a non-numeric or nullable column, a non-numeric literal, or a NaN
+/// literal under NaN ordering.
+auto try_fused_leaf(const ir::Expr& expr, const PredicateInput& input, std::size_t begin)
+    -> std::optional<FusedLeaf> {
+    const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
+    if (cmp == nullptr) {
+        return std::nullopt;
+    }
+    const ir::ColumnRef* col_node = nullptr;
+    const ir::Literal* lit_node = nullptr;
+    ir::CompareOp op = cmp->op;
+    if (const auto* lcol = std::get_if<ir::ColumnRef>(&cmp->left->node);
+        lcol != nullptr && !lcol->lexical) {
+        lit_node = std::get_if<ir::Literal>(&cmp->right->node);
+        col_node = lit_node != nullptr ? lcol : nullptr;
+    } else if (const auto* rcol = std::get_if<ir::ColumnRef>(&cmp->right->node);
+               rcol != nullptr && !rcol->lexical) {
+        lit_node = std::get_if<ir::Literal>(&cmp->left->node);
+        col_node = lit_node != nullptr ? rcol : nullptr;
+        op = flip_cmp(op);
+    }
+    if (col_node == nullptr) {
+        return std::nullopt;
+    }
+    const auto* entry = input.find(col_node->name);
+    if (entry == nullptr || entry->validity.has_value()) {
+        return std::nullopt;
+    }
+    const auto* lit_int = std::get_if<std::int64_t>(&lit_node->value);
+    const auto* lit_dbl = std::get_if<double>(&lit_node->value);
+    if (lit_int == nullptr && lit_dbl == nullptr) {
+        return std::nullopt;
+    }
+    const bool nan_high = cmp->float_comparison == ir::FloatComparison::NaNsEqualAndGreatest;
+    if (nan_high && lit_dbl != nullptr && std::isnan(*lit_dbl)) {
+        return std::nullopt;
+    }
+    FusedLeaf leaf;
+    leaf.lit_int = lit_int != nullptr ? *lit_int : 0;
+    leaf.lit_dbl = lit_int != nullptr ? static_cast<double>(*lit_int) : *lit_dbl;
+    if (const auto* ints = std::get_if<Column<std::int64_t>>(entry->column.get())) {
+        // Integers are never NaN: NaN ordering is IEEE here.
+        if (ints->is_compact_int32()) {
+            leaf.values = ints->compact_int32_data() + begin;
+            leaf.width = sizeof(std::int32_t);
+            if (lit_int == nullptr) {
+                leaf.fn = fused_leaf_fn<false, std::int32_t, double>(op);
+            } else if (*lit_int >= std::numeric_limits<std::int32_t>::min() &&
+                       *lit_int <= std::numeric_limits<std::int32_t>::max()) {
+                // Compared at 32 bits: twice the lanes of the widened compare.
+                leaf.fn = fused_leaf_fn<false, std::int32_t, std::int32_t>(op);
+            } else {
+                leaf.fn = fused_leaf_fn<false, std::int32_t, std::int64_t>(op);
+            }
+        } else {
+            leaf.values = ints->data() + begin;
+            leaf.width = sizeof(std::int64_t);
+            leaf.pair_kernel_leaf = !nan_high;
+            leaf.fn = lit_int != nullptr ? fused_leaf_fn<false, std::int64_t, std::int64_t>(op)
+                                         : fused_leaf_fn<false, std::int64_t, double>(op);
+        }
+    } else if (const auto* doubles = std::get_if<Column<double>>(entry->column.get())) {
+        leaf.values = doubles->data() + begin;
+        leaf.width = sizeof(double);
+        leaf.pair_kernel_leaf = !nan_high;
+        leaf.fn = nan_high ? fused_leaf_fn<true, double, double>(op)
+                           : fused_leaf_fn<false, double, double>(op);
+    } else {
+        return std::nullopt;
+    }
+    return leaf;
+}
+
+/// Flattens the AND tree under `expr` into `leaves`; false if any leaf does not
+/// fuse.
+auto collect_fused_leaves(const ir::Expr& expr, const PredicateInput& input, std::size_t begin,
+                          std::vector<FusedLeaf>& leaves) -> bool {
+    if (const auto* logical = std::get_if<ir::LogicalExpr>(&expr.node)) {
+        return logical->op == ir::LogicalOp::And &&
+               collect_fused_leaves(*logical->left, input, begin, leaves) &&
+               collect_fused_leaves(*logical->right, input, begin, leaves);
+    }
+    auto leaf = try_fused_leaf(expr, input, begin);
+    if (!leaf) {
+        return false;
+    }
+    leaves.push_back(*leaf);
+    return true;
+}
+
+/// The leaves of `expr` if it is a conjunction the fused kernel evaluates and
+/// the others do not already do as well. One leaf is a single compare, and two
+/// the pair kernel takes are one pass already: on the filter suites both read
+/// 3-6% slower block by block.
+auto try_fused_conjunction(const ir::Expr& expr, const PredicateInput& input, std::size_t begin)
+    -> std::optional<std::vector<FusedLeaf>> {
+    std::vector<FusedLeaf> leaves;
+    leaves.reserve(4);
+    if (!collect_fused_leaves(expr, input, begin, leaves) || leaves.size() < 2 ||
+        (leaves.size() == 2 && leaves[0].pair_kernel_leaf && leaves[1].pair_kernel_leaf)) {
+        return std::nullopt;
+    }
+    return leaves;
+}
+
+/// The conjunction's mask bytes for rows `[first, first + n)` of the range,
+/// `n` at most `kFusedBlockRows`.
+void fused_conjunction_block(const std::vector<FusedLeaf>& leaves, std::size_t first, std::size_t n,
+                             std::uint8_t* out) {
+    std::fill_n(out, n, std::uint8_t{1});
+    for (const auto& leaf : leaves) {
+        leaf.fn(static_cast<const std::byte*>(leaf.values) + (first * leaf.width), leaf.lit_int,
+                leaf.lit_dbl, out, n);
+    }
+}
+
 }  // namespace
 
 // The vectorized predicate evaluator below dispatches the same way the
@@ -2189,6 +2386,20 @@ auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const Scala
                         return fused;
                     }
                 }
+                // Fast path: a wider conjunction of such terms, or one the pair
+                // kernel does not take (compact Int32, NaN ordering).
+                if (is_and) {
+                    if (auto leaves = try_fused_conjunction(expr, input, rows.begin)) {
+                        Mask fused;
+                        fused.value.resize(n);
+                        for (std::size_t first = 0; first < n; first += kFusedBlockRows) {
+                            fused_conjunction_block(*leaves, first,
+                                                    std::min(kFusedBlockRows, n - first),
+                                                    fused.value.data() + first);
+                        }
+                        return fused;
+                    }
+                }
 
                 // 3VL AND/OR (see truth tables): combine values, then recompute
                 // validity so a known-false (AND) / known-true (OR) on either
@@ -2346,28 +2557,14 @@ auto compute_filter_selection(const PredicateInput& input, const ir::Expr& predi
     // blocks are both dense.
     const std::size_t n = rows.count;
 
-    auto mask_result = compute_mask(predicate, input, scalars, rows);
-    if (!mask_result) {
-        return std::unexpected(mask_result.error());
-    }
-
-    // 3VL: keep row iff value[i]==1 AND (no valid vector OR valid[i]==1)
-    const uint8_t* mp = mask_result->value.data();
-    const uint8_t* vp = mask_result->valid ? mask_result->valid->data() : nullptr;
-
     // Block-wise compaction: keep bits per 64-row chunk + popcount for out size.
     // When `row_limit` is non-zero, stop scanning after we've accumulated that
     // many kept rows — any suffix words stay zero and gather skips them.
     FilterSelection sel;
     const std::size_t n_words = (n + 63) / 64;
     sel.keep_words.assign(n_words, 0);
-    for (std::size_t w = 0; w < n_words; ++w) {
-        const std::size_t base = w * 64;
-        const std::size_t lim = std::min<std::size_t>(64, n - base);
-        std::uint64_t bits = pack_nonzero_bytes(mp + base, lim);
-        if (vp != nullptr) {
-            bits &= pack_nonzero_bytes(vp + base, lim);
-        }
+    // Records word `w`'s keep bits; true once `row_limit` rows are kept.
+    const auto keep_word = [&](std::size_t w, std::uint64_t bits) -> bool {
         const auto block_kept = static_cast<std::size_t>(std::popcount(bits));
         if (row_limit != 0 && sel.kept + block_kept >= row_limit) {
             // Trim this block's high-order keep bits so we emit exactly
@@ -2382,10 +2579,51 @@ auto compute_filter_selection(const PredicateInput& input, const ir::Expr& predi
             }
             sel.keep_words[w] = trimmed;
             sel.kept = row_limit;
-            break;
+            return true;
         }
         sel.keep_words[w] = bits;
         sel.kept += block_kept;
+        return false;
+    };
+
+    const auto bound = bind_filter_constants(
+        predicate, scalars, [&](const std::string& name) { return input.find(name) != nullptr; });
+    const ir::Expr& expr = bound ? *bound : predicate;
+    // A fused conjunction packs each block's mask while it is still in L1: no
+    // mask for the whole range is written and read back.
+    if (auto leaves = try_fused_conjunction(expr, input, rows.begin)) {
+        std::array<std::uint8_t, kFusedBlockRows> block{};
+        for (std::size_t first = 0; first < n; first += kFusedBlockRows) {
+            const std::size_t count = std::min(kFusedBlockRows, n - first);
+            fused_conjunction_block(*leaves, first, count, block.data());
+            for (std::size_t base = 0; base < count; base += 64) {
+                const std::size_t lim = std::min<std::size_t>(64, count - base);
+                if (keep_word((first + base) / 64, pack_nonzero_bytes(block.data() + base, lim))) {
+                    return sel;
+                }
+            }
+        }
+        return sel;
+    }
+
+    auto mask_result = compute_mask(expr, input, scalars, rows);
+    if (!mask_result) {
+        return std::unexpected(mask_result.error());
+    }
+
+    // 3VL: keep row iff value[i]==1 AND (no valid vector OR valid[i]==1)
+    const uint8_t* mp = mask_result->value.data();
+    const uint8_t* vp = mask_result->valid ? mask_result->valid->data() : nullptr;
+    for (std::size_t w = 0; w < n_words; ++w) {
+        const std::size_t base = w * 64;
+        const std::size_t lim = std::min<std::size_t>(64, n - base);
+        std::uint64_t bits = pack_nonzero_bytes(mp + base, lim);
+        if (vp != nullptr) {
+            bits &= pack_nonzero_bytes(vp + base, lim);
+        }
+        if (keep_word(w, bits)) {
+            break;
+        }
     }
     return sel;
 }

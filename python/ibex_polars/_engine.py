@@ -14,6 +14,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import numpy as np
 
+from ibex._execute import execute_table, join_chunks
+
 from . import _categories
 from ._adapter import Adapter, check_version, flag_key
 from ._temporal import is_temporal, storage_type
@@ -278,23 +280,6 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
     return frame if frame.schema == expected else _collect(frame.lazy().cast(expected, strict=True), frame.height)
 
 
-def _join_chunks(tables):
-    """Ibex's result chunks as one Arrow table, sharing their buffers.
-
-    A column's nullability can differ between chunks (one chunk has no nulls
-    and says so), and Arrow joins only equal schemas: a field is nullable when
-    it is in any chunk, and each chunk is relabelled, not copied.
-    """
-    first = tables[0].schema
-    if all(table.schema.equals(first) for table in tables[1:]):
-        return pa.concat_tables(tables)
-    fields = [field.with_nullable(any(table.schema.field(index).nullable for table in tables))
-              for index, field in enumerate(first)]
-    schema = pa.schema(fields, metadata=first.metadata)
-    return pa.concat_tables([table if table.schema.equals(schema)
-                             else pa.Table.from_arrays(table.columns, schema=schema) for table in tables])
-
-
 # Plans a Polars optimization produces that Ibex cannot take, but whose query
 # it can: revisit with that optimization off (Ibex optimizes the result itself).
 _RETRY_WITHOUT = {
@@ -379,12 +364,12 @@ class _StreamedResult:
                     if item is not None:
                         raise item
                     if pending:
-                        yield _join_chunks(pending)
+                        yield join_chunks(pending)
                     return
                 pending.append(item)
                 rows += item.num_rows
                 if rows >= min_rows:
-                    yield _join_chunks(pending)
+                    yield join_chunks(pending)
                     pending, rows = [], 0
         finally:
             self._stop.set()
@@ -500,16 +485,12 @@ class IbexEngine(pl.Engine):
     def collect(self, lf, *, optimizations, background=False, post_opt_callback=None):
         if background or post_opt_callback is not None:
             raise NotImplementedError("IbexEngine does not support background collection or post-optimization callbacks")
-        import ibex_pyarrow
         with self._lock:
             source, bindings, scalars, expected, output, categories, left_rows = self._prepare(lf, optimizations)
             # The chunks as Ibex produces them, kept as they are: Polars frames
             # are chunked anyway, and joining 9.9M rows into one table first
             # cost 70 ms on one thread.
-            chunks = []
-            ibex_pyarrow.execute_pipeline_stream(source, chunks.append, tables=bindings, scalars=scalars)
-            result = _join_chunks(chunks) if chunks else ibex_pyarrow.execute_pipeline(
-                source, tables=bindings, scalars=scalars)
+            result = execute_table(source, tables=bindings, scalars=scalars)
         # Conversion/casting constructs the public Polars result; the query's
         # filters, arithmetic and reductions have already executed in Ibex.
         return _to_polars(result, expected, output, categories, left_rows)

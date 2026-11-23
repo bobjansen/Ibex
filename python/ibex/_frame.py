@@ -178,11 +178,11 @@ class LazyFrame:
         return lower(self)[0]
 
     def collect(self):
+        from ._execute import cast_chunks, execute_table
         from ._lower import lower
-        import ibex_pyarrow
         result_schema = {}
         source, tables, scalars = lower(self, validate=True, result_schema=result_schema)
-        result = ibex_pyarrow.execute_pipeline(source, tables=tables, scalars=scalars)
+        result = execute_table(source, tables=tables, scalars=scalars)
         # Exclude internal columns with a metadata-only Arrow projection.
         internal_columns = set(result.column_names) - set(result_schema)
         result = result.select(list(result_schema))
@@ -198,7 +198,7 @@ class LazyFrame:
         for index, name in enumerate(result.column_names):
             expected = result_schema[name]
             if result.column(index).type != expected:
-                result = result.set_column(index, name, result.column(index).cast(expected))
+                result = result.set_column(index, name, cast_chunks(result.column(index), expected))
         return DataFrame(result)
 
 

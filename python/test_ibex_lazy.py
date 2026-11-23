@@ -85,7 +85,7 @@ assert "polars" not in sys.modules
             path = Path(directory) / 'input "quoted".parquet'
             # Even file existence is deferred; construction before the file
             # exists must work, and explain must not invoke native execution.
-            with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+            with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
                 query = q06(pl.scan_parquet(path))
                 source = query.explain()
                 self.assertNotIn(str(path), source)
@@ -178,16 +178,35 @@ assert "polars" not in sys.modules
         with self.assertRaises(TypeError):
             bool(pl.col("x") > 1)
 
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_collect_keeps_native_chunks_and_casts_each(self):
+        # collect streams the native chunks and joins them without a copy;
+        # a dictionary column is cast to String chunk by chunk, and a column
+        # with nulls in only some chunks still joins (nullability differs).
+        rows = 50_000
+        symbols = [None if (i // 10_000 == 2 and i % 7 == 0) else f"s{i % 37}" for i in range(rows)]
+        data = pa.table({"symbol": pa.array(symbols).dictionary_encode(),
+                         "x": pa.array(range(rows), pa.int64())})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "chunks.parquet"
+            pq.write_table(data, path, row_group_size=10_000)
+            result = pl.scan_parquet(path).filter(pl.col("x") >= 5).collect().to_arrow()
+        self.assertGreater(result.column("x").num_chunks, 1)
+        self.assertTrue(pa.types.is_large_string(result.schema.field("symbol").type))
+        keep = list(range(5, rows))
+        self.assertEqual(result.column("x").to_pylist(), keep)
+        self.assertEqual(result.column("symbol").to_pylist(), [symbols[i] for i in keep])
+
     def test_filter_reductions_execute_in_one_native_call(self):
         query = pl.DataFrame({"x": [1, 2, 9]}).lazy().filter(pl.col("x") > pl.mean("x"))
         self.assertIn("scalar(", query.explain())
-        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
             self.assertEqual(query.collect()["x"].to_list(), [9])
             execute.assert_called_once()
 
     def test_reject_unsupported_before_execution(self):
         query = pl.DataFrame({"x": [1]}).lazy()
-        with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
             with self.assertRaises(NotImplementedError):
                 query.with_columns(a=pl.col("x"), b=pl.col("x"))
             with self.assertRaises(NotImplementedError):
@@ -247,7 +266,7 @@ parquet::write(t[select { total = sum(qty) }, by symbol][order { symbol }], path
             "x": pa.array([2, None, 7, 4, None], type=pa.int64()),
             "v": [1.0, None, 3.0, 5.0, None],
         }))
-        with patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream", wraps=ibex_pyarrow.execute_pipeline_stream) as execute:
             grouped = frame.lazy().group_by("g", "h", maintain_order=True)
             query = grouped.agg(
                 total=pl.sum("x"), average=pl.mean("x"),
@@ -294,7 +313,7 @@ parquet::write(t[select { total = sum(qty) }, by symbol][order { symbol }], path
 
     def test_group_sort_reject_unsupported_shapes(self):
         root = pl.DataFrame({"x": [1]}).lazy()
-        with patch.object(ibex_pyarrow, "execute_pipeline") as execute:
+        with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
             with self.assertRaises(NotImplementedError):
                 root.group_by("x").agg(pl.col("x").alias("y"))
             with self.assertRaises(ValueError):

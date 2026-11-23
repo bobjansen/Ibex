@@ -6,25 +6,25 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: benchmarking/clean_results.sh [--apply]
+Usage: benchmarking/clean_results.sh [--include-data] [--apply]
 
-Preview cleanup of Git-ignored outputs in Ibex benchmark result locations.
-Pass --apply to delete the listed results, archives, and profiling artifacts.
-Tracked files, input datasets, build caches, and AWS configuration are preserved.
+Preview cleanup of Git-ignored results, archives, and profiling artifacts.
+Pass --include-data to also select ignored benchmark datasets and related files.
+Pass --apply to delete the selected files. Future runs may need to regenerate
+or fetch the datasets. Tracked files and AWS configuration are preserved.
 EOF
 }
 
-if [[ $# -eq 0 ]]; then
-    mode=-n
-elif [[ $# -eq 1 && $1 == --apply ]]; then
-    mode=-f
-elif [[ $# -eq 1 && ( $1 == -h || $1 == --help ) ]]; then
-    usage
-    exit 0
-else
-    usage >&2
-    exit 2
-fi
+mode=-n
+data_paths=()
+for arg in "$@"; do
+    case "$arg" in
+        --apply) mode=-f ;;
+        --include-data) data_paths=(benchmarking/data benchmarking/window_ohlc/data) ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
 
 repo_root="$(dirname -- "${BASH_SOURCE[0]}")/.."
 git -C "$repo_root" clean "$mode" -dX -- \
@@ -45,4 +45,5 @@ git -C "$repo_root" clean "$mode" -dX -- \
     python/h2o-adapter-results \
     python/join-performance-results \
     python/pdsh-performance-results \
-    python/polars-engines-results
+    python/polars-engines-results \
+    "${data_paths[@]}"

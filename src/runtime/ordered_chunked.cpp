@@ -567,10 +567,15 @@ class ChunkedOrderedLimitOperator final : public Operator {
                  p = next_part.fetch_add(1)) {
                 const Part& part = parts[p];
                 const std::size_t rows = part.chunk->rows();
+                RankedHeap ranked{.heap = &heap,
+                                  .rank = FastRank::make(part.key_columns, *keys_,
+                                                         keep_mode_ == KeepMode::First)};
+                ranked.reload(count_);
                 for (std::size_t row = 0; row < rows; ++row) {
                     const std::size_t sequence = part.base + row;
                     if (heap.size() == count_ &&
-                        !row_preferred(part.cols, row, sequence, heap.front())) {
+                        !(ranked.loaded ? ranked.rank->preferred(row, sequence)
+                                        : row_preferred(part.cols, row, sequence, heap.front()))) {
                         continue;
                     }
                     Entry entry;
@@ -581,6 +586,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
                     entry.sequence = sequence;
                     entry.row = snapshot_row(*part.chunk, row);
                     push_entry(heap, std::move(entry));
+                    ranked.reload(count_);
                 }
             }
         });
@@ -712,6 +718,185 @@ class ChunkedOrderedLimitOperator final : public Operator {
         }
         return keep_mode_ == KeepMode::First ? row_first : !row_first;
     }
+
+    /// `row_preferred` against one heap's worst entry, for keys that are all
+    /// fixed-width with no nulls: the entry is decoded once into plain
+    /// numbers, and a row reads its keys straight from their buffers. The
+    /// generic test re-dispatches on each key's variant and reads an Int64
+    /// through `IntegerView` and a Bool through `operator[]` per row; on a
+    /// top 100 over 2M filtered rows it was 17% of the query's CPU.
+    class FastRank {
+       public:
+        /// Nullopt when a key is nullable or not fixed-width.
+        static auto make(const std::vector<const ColumnEntry*>& columns,
+                         const std::vector<ir::OrderKey>& keys, bool keep_first)
+            -> std::optional<FastRank> {
+            FastRank rank;
+            rank.keep_first_ = keep_first;
+            rank.keys_.reserve(columns.size());
+            for (std::size_t i = 0; i < columns.size(); ++i) {
+                const ColumnEntry& entry = *columns[i];
+                if (entry.validity.has_value()) {
+                    return std::nullopt;
+                }
+                Key key{.ascending = keys[i].ascending};
+                const ColumnValue& column = *entry.column;
+                if (const auto* ints = std::get_if<Column<std::int64_t>>(&column)) {
+                    key.kind = ints->is_compact_int32() ? Kind::I32 : Kind::I64;
+                    key.values = ints->is_compact_int32()
+                                     ? static_cast<const void*>(ints->compact_int32_data())
+                                     : static_cast<const void*>(ints->data());
+                } else if (const auto* doubles = std::get_if<Column<double>>(&column)) {
+                    key.kind = Kind::F64;
+                    key.values = doubles->data();
+                } else if (const auto* flags = std::get_if<Column<bool>>(&column)) {
+                    key.kind = Kind::Bool;
+                    key.values = flags->buffer_data();
+                    key.bit_offset = flags->buffer_offset();
+                } else if (const auto* dates = std::get_if<Column<Date>>(&column)) {
+                    key.kind = Kind::Date;
+                    key.values = dates->data();
+                } else if (const auto* stamps = std::get_if<Column<Timestamp>>(&column)) {
+                    key.kind = Kind::Ts;
+                    key.values = stamps->data();
+                } else {
+                    return std::nullopt;
+                }
+                rank.keys_.push_back(key);
+            }
+            rank.ints_.resize(rank.keys_.size());
+            rank.doubles_.resize(rank.keys_.size());
+            rank.nulls_.resize(rank.keys_.size());
+            return rank;
+        }
+
+        /// Take `front` as the entry rows are tested against. False when one
+        /// of its values is not of its key's type; the caller then keeps to
+        /// `row_preferred`.
+        auto load(const Entry& front) -> bool {
+            for (std::size_t i = 0; i < keys_.size(); ++i) {
+                nulls_[i] = front.key.is_null(i) ? 1U : 0U;
+                if (nulls_[i] != 0U) {
+                    continue;
+                }
+                const ScalarValue& value = front.key.values[i];
+                bool typed = false;
+                switch (keys_[i].kind) {
+                    case Kind::I64:
+                    case Kind::I32:
+                        if (const auto* v = std::get_if<std::int64_t>(&value)) {
+                            ints_[i] = *v;
+                            typed = true;
+                        }
+                        break;
+                    case Kind::F64:
+                        if (const auto* v = std::get_if<double>(&value)) {
+                            doubles_[i] = *v;
+                            typed = true;
+                        }
+                        break;
+                    case Kind::Bool:
+                        if (const auto* v = std::get_if<bool>(&value)) {
+                            ints_[i] = *v ? 1 : 0;
+                            typed = true;
+                        }
+                        break;
+                    case Kind::Date:
+                        if (const auto* v = std::get_if<Date>(&value)) {
+                            ints_[i] = v->days;
+                            typed = true;
+                        }
+                        break;
+                    case Kind::Ts:
+                        if (const auto* v = std::get_if<Timestamp>(&value)) {
+                            ints_[i] = v->nanos;
+                            typed = true;
+                        }
+                        break;
+                }
+                if (!typed) {
+                    return false;
+                }
+            }
+            sequence_ = front.sequence;
+            return true;
+        }
+
+        /// Whether `row` (numbered `sequence`) beats the loaded entry.
+        [[nodiscard]] auto preferred(std::size_t row, std::size_t sequence) const -> bool {
+            bool row_first = sequence < sequence_;
+            for (std::size_t i = 0; i < keys_.size(); ++i) {
+                if (nulls_[i] != 0U) {
+                    // A null sorts last, and this row's key is never null.
+                    row_first = true;
+                    break;
+                }
+                const Key& key = keys_[i];
+                int cmp = 0;
+                if (key.kind == Kind::F64) {
+                    cmp = order_compare_double(static_cast<const double*>(key.values)[row],
+                                               doubles_[i]);
+                } else {
+                    const std::int64_t value = int_at(key, row);
+                    cmp = value < ints_[i] ? -1 : (ints_[i] < value ? 1 : 0);
+                }
+                if (cmp != 0) {
+                    row_first = key.ascending ? (cmp < 0) : (cmp > 0);
+                    break;
+                }
+            }
+            return keep_first_ ? row_first : !row_first;
+        }
+
+       private:
+        enum class Kind : std::uint8_t { I64, I32, F64, Bool, Date, Ts };
+        struct Key {
+            Kind kind = Kind::I64;
+            const void* values = nullptr;
+            std::size_t bit_offset = 0;  ///< Bool: the bitmap's first bit
+            bool ascending = true;
+        };
+
+        [[nodiscard]] static auto int_at(const Key& key, std::size_t row) -> std::int64_t {
+            switch (key.kind) {
+                case Kind::I64:
+                    return static_cast<const std::int64_t*>(key.values)[row];
+                case Kind::I32:
+                    return static_cast<const std::int32_t*>(key.values)[row];
+                case Kind::Bool: {
+                    const std::size_t bit = key.bit_offset + row;
+                    return (static_cast<const std::uint8_t*>(key.values)[bit / 8] >> (bit % 8)) &
+                           1U;
+                }
+                case Kind::Date:
+                    return static_cast<const Date*>(key.values)[row].days;
+                case Kind::Ts:
+                    return static_cast<const Timestamp*>(key.values)[row].nanos;
+                case Kind::F64:
+                    break;
+            }
+            return 0;
+        }
+
+        std::vector<Key> keys_;
+        std::vector<std::int64_t> ints_;
+        std::vector<double> doubles_;
+        std::vector<std::uint8_t> nulls_;
+        std::size_t sequence_ = 0;
+        bool keep_first_ = true;
+    };
+
+    /// A worker's heap with its `FastRank`, if the keys allow one, kept loaded
+    /// with the heap's worst entry once the heap is full.
+    struct RankedHeap {
+        std::vector<Entry>* heap = nullptr;
+        std::optional<FastRank> rank;
+        bool loaded = false;
+
+        void reload(std::size_t count) {
+            loaded = rank.has_value() && heap->size() == count && rank->load(heap->front());
+        }
+    };
 
     [[nodiscard]] auto entry_preferred(const Entry& lhs, const Entry& rhs) const -> bool {
         return keep_mode_ == KeepMode::First ? row_comes_first(lhs, rhs)
@@ -2039,10 +2224,15 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 std::vector<Entry>& heap = local[r];
                 const std::size_t begin = std::min(rows, r * grain);
                 const std::size_t end = std::min(rows, begin + grain);
+                RankedHeap ranked{
+                    .heap = &heap,
+                    .rank = FastRank::make(key_columns, *keys_, keep_mode_ == KeepMode::First)};
                 for (std::size_t row = begin; row < end; ++row) {
                     const std::size_t sequence = base + row;
                     if (heap.size() == count_ &&
-                        !row_preferred(*order_cols, row, sequence, heap.front())) {
+                        !(ranked.loaded
+                              ? ranked.rank->preferred(row, sequence)
+                              : row_preferred(*order_cols, row, sequence, heap.front()))) {
                         continue;
                     }
                     Entry entry;
@@ -2053,6 +2243,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
                     entry.sequence = sequence;
                     entry.row = snapshot_row(chunk, row);
                     push_entry(heap, std::move(entry));
+                    ranked.reload(count_);
                 }
             });
             batch.wait();

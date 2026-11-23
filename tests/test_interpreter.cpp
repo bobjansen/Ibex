@@ -20120,6 +20120,73 @@ TEST_CASE("A dense distinct keeps first occurrences in row order",
     CHECK(out->rows() == with_null.size());
 }
 
+// A top-k ranks each row against its heap's worst entry with typed reads when
+// every key is fixed-width and non-null (`FastRank`). Its winners must be the
+// full sort's first (or last) rows, ties broken by row order, at any thread
+// count and whether the input arrives whole or in morsel chunks.
+TEST_CASE("A top-k over fixed-width keys matches the full sort",
+          "[runtime][order][topk][parallel]") {
+    constexpr std::size_t kRows = 60'000;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    std::vector<std::int64_t> ids(kRows);
+    std::vector<double> xs(kRows);
+    ibex::detail::NoInitVector<std::int32_t> narrow(kRows);
+    Column<bool> flags;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        ids[r] = static_cast<std::int64_t>(r);
+        // Few distinct values, so ties decide most of the winners; some NaNs.
+        xs[r] = (r % 97 == 0) ? nan : static_cast<double>((r * 31) % 50) * 0.5;
+        narrow[r] = static_cast<std::int32_t>((r * 7) % 13) - 6;
+        flags.push_back(false);
+    }
+    runtime::Table t;
+    t.add_column("id", Column<std::int64_t>{ids});
+    t.add_column("x", Column<double>{xs});
+    t.add_column("n", Column<std::int64_t>::from_compact_int32(std::move(narrow)));
+    t.add_column("flag", std::move(flags));
+    runtime::TableRegistry tables;
+    tables.emplace("t", t);
+
+    const auto ids_of = [](const runtime::Table& table) {
+        const auto& column = std::get<Column<std::int64_t>>(*table.find_entry("id")->column);
+        return std::vector<std::int64_t>(column.begin(), column.end());
+    };
+    const std::vector<std::string> orders = {"flag desc, x desc", "x asc", "n asc, x desc",
+                                             "flag desc, n desc, x asc"};
+    for (const auto& order : orders) {
+        for (const char* filter : {"", "[filter id % 5 != 3]"}) {
+            const std::string base = std::string("t") + filter + "[order { " + order + " }]";
+            runtime::ExecutionContext serial{.execution_profile = nullptr};
+            serial.parallel_threads = 1;
+            auto sorted = runtime::interpret(*require_ir((base + ";").c_str()), tables, nullptr,
+                                             nullptr, nullptr, serial);
+            REQUIRE(sorted.has_value());
+            const auto all = ids_of(*sorted);
+            for (const char* limit : {"head 37", "tail 25"}) {
+                const bool head = limit[0] == 'h';
+                const std::size_t k = head ? 37 : 25;
+                const std::vector<std::int64_t> want =
+                    head ? std::vector<std::int64_t>(all.begin(),
+                                                     all.begin() + static_cast<std::ptrdiff_t>(k))
+                         : std::vector<std::int64_t>(all.end() - static_cast<std::ptrdiff_t>(k),
+                                                     all.end());
+                const auto ir = require_ir((base + "[" + limit + "];").c_str());
+                for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+                    CAPTURE(order, filter, limit, threads);
+                    runtime::ExecutionContext exec{.execution_profile = nullptr};
+                    exec.parallel_threads = threads;
+                    exec.parallel_min_rows = 1024;
+                    exec.parallel_grain = 4096;
+                    auto out = runtime::interpret(*ir, tables, nullptr, nullptr, nullptr, exec);
+                    INFO((out.has_value() ? std::string{} : out.error()));
+                    REQUIRE(out.has_value());
+                    CHECK(ids_of(*out) == want);
+                }
+            }
+        }
+    }
+}
+
 // An update below a run (TPC-H q22: a computed column, then a filter on it)
 // joins the streamed run (`Plan::stream_only_bottom_updates`): one scan
 // pipeline computes, filters and projects each unit. Before, the update

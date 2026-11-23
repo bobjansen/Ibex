@@ -75,6 +75,10 @@ States:
 Environment:
   IBEX_PERFCMP_CACHE   Persistent cache root (default ~/.cache/ibex/perfcmp).
                        Delete it to force a full reconfigure/rebuild.
+  IBEX_PERFCMP_MAX_AGE_DAYS
+                       Delete cache slots no run has used for this many days
+                       (default 7; 0 keeps them). Each slot is a worktree plus
+                       a Release build, about 3.5 GB.
   IBEX_PERFCMP_TMPDIR  Per-run results/logs location (default /tmp).
   IBEX_PERFCMP_JOBS    Build parallelism for each side (default 4).
 EOF
@@ -228,6 +232,39 @@ if [[ "$USE_CACHE" -eq 1 ]]; then
         fi
     fi
 fi
+# Slots a run uses are stamped (`last-used`); one no run has used for
+# IBEX_PERFCMP_MAX_AGE_DAYS is deleted under the lock, so the cache holds the
+# slots in current use rather than every one ever made (a replica-control
+# slot, a WORKTREE slot of a role last run against a ref). A slot from before
+# stamping falls back to its last build's log. This run's own slots are never
+# pruned: deleting one would only force a full rebuild now.
+prune_stale_slots() {
+    local max_days="${IBEX_PERFCMP_MAX_AGE_DAYS:-7}"
+    if [[ ! "$max_days" =~ ^[0-9]+$ ]]; then
+        echo "warning: IBEX_PERFCMP_MAX_AGE_DAYS='$max_days' is not a day count; not pruning" >&2
+        return 0
+    fi
+    [[ "$max_days" -eq 0 ]] && return 0
+    local -a keep=("$@")
+    local slot name stamp
+    for slot in "$CACHE_ROOT"/*/; do
+        slot="${slot%/}"
+        name="$(basename "$slot")"
+        [[ -d "$slot/wt" || -d "$slot/build" ]] || continue
+        [[ " ${keep[*]} " == *" $name "* ]] && continue
+        stamp="$slot/last-used"
+        [[ -e "$stamp" ]] || stamp="$slot/build/.ninja_log"
+        [[ -e "$stamp" ]] || stamp="$slot"
+        if [[ -n "$(find "$stamp" -maxdepth 0 -mmin "+$((max_days * 1440))" 2>/dev/null)" ]]; then
+            echo "Pruning cache slot '$name' (unused for over $max_days days) ..." >&2
+            if [[ -d "$slot/wt" ]]; then
+                git -C "$REPO_ROOT" worktree remove --force "$slot/wt" >/dev/null 2>&1 || true
+            fi
+            rm -rf "$slot"
+        fi
+    done
+}
+
 slot_root() {
     if [[ "$USE_CACHE" -eq 1 ]]; then
         printf '%s/%s\n' "$CACHE_ROOT" "$1"
@@ -502,6 +539,17 @@ run_named_side_repeat() {
         *) echo "error: internal unknown benchmark side: $side" >&2; return 1 ;;
     esac
 }
+
+if [[ "$USE_CACHE" -eq 1 ]]; then
+    slot_name() { [[ "$1" == "WORKTREE" ]] && echo "$2-worktree" || echo "$2"; }
+    run_slots=("$(slot_name "$BASE_STATE" base)" "$(slot_name "$TARGET_STATE" target)")
+    [[ "$REPLICA_CONTROL" -eq 1 ]] && run_slots+=(ctrl)
+    prune_stale_slots "${run_slots[@]}"
+    for name in "${run_slots[@]}"; do
+        mkdir -p "$CACHE_ROOT/$name"
+        touch "$CACHE_ROOT/$name/last-used"
+    done
+fi
 
 BASE_DIR=""
 TARGET_DIR=""

@@ -3788,12 +3788,13 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return std::unexpected("function returned scalar where table expected");
         }
         if (extern_decls.contains(call->callee)) {
-            // A chunk sink drains a lazy source through its scan plan, as it
-            // does a bare lazy binding below: the eager reader decodes the
-            // whole file before the sink sees a row (`parquet::write(
-            // parquet::read(p), q)` ran on ~2.6 of 8 cores).
+            // A reader with a lazy form runs through its scan plan, sink or
+            // not: the eager reader decodes the whole file nearly serially.
+            // `parquet::write(parquet::read(p), q)` ran on ~2.6 of 8 cores, and
+            // a bare `parquet::read(p)` on one (409 ms, against 141 with a
+            // filter after it).
             const auto* fn = externs.find(call->callee);
-            if (explicit_sink == nullptr || fn == nullptr || !fn->lazy_table_func) {
+            if (fn == nullptr || !fn->lazy_table_func) {
                 return eval_extern_table_call(*call);
             }
         }

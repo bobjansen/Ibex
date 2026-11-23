@@ -1163,6 +1163,43 @@ extern fn capture(df: DataFrame) -> Int from "fake.hpp";
     CHECK(eager_calls == 0);
     CHECK(streamed == std::vector<std::int64_t>{1, 2, 3});
     CHECK_FALSE(decode_calls.empty());
+
+    // Without a sink as well: a bare `parquet::read(p)` handed back to the
+    // caller ran on one core through the eager reader.
+    const auto bare = session.execute("read_fake();");
+    INFO("error: " << bare.error);
+    REQUIRE(bare.ok);
+    REQUIRE(bare.table.has_value());
+    CHECK(eager_calls == 0);
+    CHECK(bare.table->rows() == 3);
+}
+
+TEST_CASE("REPL bare reader call falls back to the eager reader when the lazy form declines",
+          "[repl][lazy]") {
+    ibex::runtime::ExternRegistry registry;
+    int eager_calls = 0;
+    registry.register_table("read_fake",
+                            [&eager_calls](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ++eager_calls;
+                                ibex::runtime::Table table;
+                                table.add_column("a", ibex::Column<std::int64_t>{4, 5});
+                                return ibex::runtime::ExternValue{std::move(table)};
+                            });
+    registry.register_lazy_table(
+        "read_fake",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> { return nullptr; });
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session.execute(R"(extern fn read_fake() -> DataFrame from "fake.hpp";)").ok);
+    const auto bare = session.execute("read_fake();");
+    INFO("error: " << bare.error);
+    REQUIRE(bare.ok);
+    REQUIRE(bare.table.has_value());
+    CHECK(eager_calls >= 1);
+    const auto* a = std::get_if<ibex::Column<std::int64_t>>(bare.table->find("a"));
+    REQUIRE(a != nullptr);
+    CHECK(std::vector<std::int64_t>(a->begin(), a->end()) == std::vector<std::int64_t>{4, 5});
 }
 
 TEST_CASE("REPL lazy scan: a filtered count() decodes only the predicate column", "[repl][lazy]") {

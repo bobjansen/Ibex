@@ -219,7 +219,7 @@ assert "polars" not in sys.modules
             ibex_pyarrow.execute_pipeline("1 + 1;")
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
-    def test_native_parquet_sink_returns_count_and_keeps_grouped_text_as_string(self):
+    def test_native_parquet_sink_returns_count_and_keeps_grouped_text_categorical(self):
         symbols = pa.array(["AA", "BB", "AA"]).dictionary_encode()
         table = pa.table({"symbol": symbols, "qty": [10, 20, 30]})
         source = """
@@ -232,7 +232,10 @@ parquet::write(t[select { total = sum(qty) }, by symbol][order { symbol }], path
                                                  scalars={"path": str(path)})
             self.assertEqual(rows, 2)
             result = pq.read_table(path)
-            self.assertTrue(pa.types.is_large_string(result.schema.field("symbol").type))
+            # Text held as dictionary codes is written as a dictionary column.
+            symbol_type = result.schema.field("symbol").type
+            self.assertTrue(pa.types.is_dictionary(symbol_type))
+            self.assertTrue(pa.types.is_string(symbol_type.value_type))
             self.assertEqual(result.to_pydict(), {"symbol": ["AA", "BB"], "total": [40, 20]})
             metadata = pq.ParquetFile(path).metadata
             self.assertIn("RLE_DICTIONARY", metadata.row_group(0).column(0).encodings)

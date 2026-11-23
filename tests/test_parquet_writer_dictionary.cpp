@@ -32,6 +32,7 @@
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <vector>
 
@@ -199,12 +200,20 @@ TEST_CASE("Parquet writer dictionary-encodes text chunks Arrow reads back exactl
         CHECK(every_group_is_dictionary_encoded(file.path()));
         const auto back = read_back(file.path());
         REQUIRE(back->length() == static_cast<std::int64_t>(strings.size()));
+        // A column stored as codes is written as a dictionary column, which a
+        // reader returns as Categorical; plain text stays String.
+        REQUIRE(back->type_id() ==
+                (categorical ? arrow::Type::DICTIONARY : arrow::Type::LARGE_STRING));
         for (std::size_t i = 0; i < strings.size(); ++i) {
-            const auto got = back->type_id() == arrow::Type::LARGE_STRING
-                                 ? static_cast<const arrow::LargeStringArray&>(*back).GetView(
-                                       static_cast<std::int64_t>(i))
-                                 : static_cast<const arrow::StringArray&>(*back).GetView(
-                                       static_cast<std::int64_t>(i));
+            const auto row = static_cast<std::int64_t>(i);
+            std::string_view got;
+            if (categorical) {
+                const auto& dict = static_cast<const arrow::DictionaryArray&>(*back);
+                got = static_cast<const arrow::StringArray&>(*dict.dictionary())
+                          .GetView(dict.GetValueIndex(row));
+            } else {
+                got = static_cast<const arrow::LargeStringArray&>(*back).GetView(row);
+            }
             if (got != strings[i]) {
                 FAIL("row " << i << ": '" << got << "' != '" << strings[i] << "'");
             }

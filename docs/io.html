@@ -475,8 +475,10 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
       <article class="card" style="margin-top:1rem;">
         <h3>Write Parquet</h3>
         <p>
-          <code>parquet::write</code> returns the number of rows written. String
-          and categorical columns are stored as UTF-8. Dates and timestamps are
+          <code>parquet::write</code> returns the number of rows written. Text
+          held as dictionary codes, as Parquet readers usually return it, is
+          written as an Arrow dictionary column, which Polars and pyarrow read
+          back as Categorical; other text is written as String. Dates and timestamps are
           preserved as typed Parquet columns, and <code>Decimal(p,&nbsp;s)</code>
           columns are written as Parquet <code>DECIMAL</code> with their precision
           and scale, so the values read back exactly. Reading accepts every

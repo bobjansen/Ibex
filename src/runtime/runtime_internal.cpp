@@ -109,7 +109,9 @@ auto TableProperties::derive(const TableProperties& input, const KeyColumnFate& 
                     preserved = false;
                     break;
                 }
-                kept.push_back({.name = result.name(), .ascending = key.ascending});
+                kept.push_back({.name = result.name(),
+                                .ascending = key.ascending,
+                                .nulls_first = key.nulls_first});
             }
         }
         if (preserved) {

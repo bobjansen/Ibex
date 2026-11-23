@@ -277,7 +277,10 @@ parquet::write(t[select { total = sum(qty) }, by symbol][order { symbol }], path
         self.assertEqual(result["g"].to_list(), [None, None, "b", "a", "a"])
         self.assertEqual(result["h"].to_list(), [1, 2, 0, 1, 2])
         self.assertEqual(result.columns, frame.columns)
-        self.assertNotIn(b"ibex.ordering", result.to_arrow().schema.metadata or {})
+        # Nulls first is native (`desc_nulls_first`), so the ordering claim names
+        # only public columns and is true of the result.
+        self.assertEqual((result.to_arrow().schema.metadata or {}).get(b"ibex.ordering"),
+                         b"g:desc_nulls_first,h:asc")
         tied = pl.DataFrame({"g": [1, 1, 1], "id": [3, 2, 1]}).lazy().sort("g", maintain_order=True).collect()
         self.assertEqual(tied["id"].to_list(), [3, 2, 1])
 

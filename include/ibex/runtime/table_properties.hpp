@@ -233,7 +233,8 @@ class TableProperties {
         }
         for (std::size_t i = 0; i < requested.size(); ++i) {
             if ((*ordering_)[i].name != requested[i].name ||
-                (*ordering_)[i].ascending != requested[i].ascending) {
+                (*ordering_)[i].ascending != requested[i].ascending ||
+                (*ordering_)[i].nulls_first != requested[i].nulls_first) {
                 return false;
             }
         }

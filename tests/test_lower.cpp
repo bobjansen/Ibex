@@ -42,6 +42,29 @@ const T* as_node(const ir::Node* node) {
 
 }  // namespace
 
+TEST_CASE("Order keys spell nulls-first as asc_nulls_first / desc_nulls_first", "[parser][lower]") {
+    auto program = require_parse(
+        "t[order { a desc_nulls_first, b asc_nulls_first, c desc, asc_nulls_first asc }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+    const auto* order = as_node<ir::OrderNode>(result->get());
+    REQUIRE(order != nullptr);
+    const auto& keys = order->keys();
+    REQUIRE(keys.size() == 4);
+    CHECK((!keys[0].ascending && keys[0].nulls_first));
+    CHECK((keys[1].ascending && keys[1].nulls_first));
+    CHECK((!keys[2].ascending && !keys[2].nulls_first));
+    // Contextual words, not keywords: a column may carry either name.
+    CHECK(keys[3].name == "asc_nulls_first");
+    CHECK((keys[3].ascending && !keys[3].nulls_first));
+
+    // A rank places nulls with na_option, once for all its keys.
+    auto ranked = require_parse("t[update { r = rank(order { a desc_nulls_first }) }];");
+    auto lowered = parser::lower(ranked);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK(lowered.error().message.find("na_option") != std::string::npos);
+}
+
 TEST_CASE("Identical aggregates inside select expressions share one aggregate", "[parser][lower]") {
     // `volume`-and-`vwap` shapes repeat `sum(qty)`: one pass computes it. A
     // different function of the same column, or a count, stays its own.

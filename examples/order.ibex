@@ -10,6 +10,11 @@ iris[order `Species`];
 print("order by Species asc, then Sepal.Length desc:");
 iris[order { `Species` asc, `Sepal.Length` desc }];
 
+// Nulls sort last under asc and desc alike; `*_nulls_first` puts them first.
+let gappy = iris[update { len = case { `Sepal.Length` > 5.5 => `Sepal.Length`, else => NULL } }];
+print("order by len desc_nulls_first (nulls, then longest):");
+gappy[order { len desc_nulls_first }, head 5];
+
 // Order by all columns (schema order).
 print("order by all columns, left to right:");
 iris[order];

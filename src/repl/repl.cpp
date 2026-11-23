@@ -2327,6 +2327,9 @@ void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
                 }
                 keys += key.name;
                 keys += key.ascending ? " asc" : " desc";
+                if (key.nulls_first) {
+                    keys += "_nulls_first";
+                }
             }
             ibex::formatting::print("  ordered by: {}", keys);
         }

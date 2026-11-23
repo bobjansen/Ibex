@@ -141,6 +141,10 @@ struct CallExpr {
 struct OrderKey {
     std::string name;
     bool ascending = true;
+    /// Nulls sort before every value (`asc_nulls_first` / `desc_nulls_first`);
+    /// by default they sort after every value, under `asc` and `desc` alike.
+    /// Two keys order the same rows the same way only when both fields agree.
+    bool nulls_first = false;
 };
 
 enum class RankMethod : std::uint8_t {

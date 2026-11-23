@@ -683,7 +683,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     *out_ << ", ";
                 first = false;
                 *out_ << "ibex::ir::OrderKey{\"" << escape_string(key.name) << "\", "
-                      << (key.ascending ? "true" : "false") << "}";
+                      << (key.ascending ? "true" : "false") << (key.nulls_first ? ", true}" : "}");
             }
             *out_ << "});\n";
             return var;
@@ -734,7 +734,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     *out_ << ", ";
                 first = false;
                 *out_ << "ibex::ir::OrderKey{\"" << escape_string(key.name) << "\", "
-                      << (key.ascending ? "true" : "false") << "}";
+                      << (key.ascending ? "true" : "false") << (key.nulls_first ? ", true}" : "}");
             }
             *out_ << "}, " << topk.count() << ", {";
             first = true;

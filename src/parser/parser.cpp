@@ -2449,12 +2449,20 @@ class Parser {
             return std::nullopt;
         }
         bool ascending = true;
+        bool nulls_first = false;
         if (match(TokenKind::KeywordAsc)) {
             ascending = true;
         } else if (match(TokenKind::KeywordDesc)) {
             ascending = false;
+        } else if (check(TokenKind::Identifier) &&
+                   (peek().lexeme == "asc_nulls_first" || peek().lexeme == "desc_nulls_first")) {
+            // Contextual, as `nulls` in a join is: a column may still be
+            // named either word.
+            ascending = advance().lexeme == "asc_nulls_first";
+            nulls_first = true;
         }
-        return OrderKey{.name = std::move(*name), .ascending = ascending};
+        return OrderKey{
+            .name = std::move(*name), .ascending = ascending, .nulls_first = nulls_first};
     }
 
     auto parse_rank_call() -> ExprPtr {

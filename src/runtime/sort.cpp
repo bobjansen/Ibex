@@ -748,6 +748,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         std::vector<double> f64;
         std::vector<std::string_view> str;  // views into original column storage
         bool ascending = true;
+        bool nulls_first = false;                  // `asc_nulls_first` / `desc_nulls_first`
         const ValidityBitmap* validity = nullptr;  // null when the key has no nulls
         /// Number of distinct values when this key was built as a DENSE RANK in
         /// [0, cardinality), or 0 when the key is an arbitrary integer. Only a
@@ -761,8 +762,8 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     };
 
     // A null key sorts last, and stays last under `desc` — the null position does
-    // not flip with the direction. That cannot be folded into the flat key (a
-    // sentinel max value would migrate to the front on a descending sort), so a
+    // not flip with the direction (first instead under `*_nulls_first`). That cannot be folded into
+    // the flat key (a sentinel max value would migrate to the front on a descending sort), so a
     // null-bearing key skips every radix/pre-sorted fast path below and takes the
     // comparator, which ranks null-ness ahead of value.
     bool has_null_keys = false;
@@ -785,6 +786,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         const auto* entry = input.find_entry(key.name);
         FlatKey fk;
         fk.ascending = key.ascending;
+        fk.nulls_first = key.nulls_first;
         fk.validity = entry != nullptr && entry->validity.has_value() ? &*entry->validity : nullptr;
         if (const auto* decimal_col = std::get_if<Column<Decimal>>(column)) {
             const Decimal* values = decimal_col->data();
@@ -805,6 +807,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                 FlatKey high;
                 high.kind = FlatKind::I64;
                 high.ascending = key.ascending;
+                high.nulls_first = key.nulls_first;
                 high.validity = fk.validity;
                 high.u64.reserve(rows);
                 fk.u64.reserve(rows);
@@ -911,7 +914,8 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     // Fold null-ness into the keys, so a null-bearing key takes the radix
     // paths below instead of a serial comparison sort that reads the bitmap
     // per comparison. Each nullable key gets a 0/1 "is null" key just ahead
-    // of it: always ascending, so nulls land last whatever the direction, and
+    // of it: always ascending, so nulls land last whatever the direction (or
+    // first, for a `*_nulls_first` key, whose flag is inverted), and
     // the null rows' own values are set equal, so the stable radix keeps them
     // in input order. A lone string key is the exception: the comparator is
     // its fallback anyway (high cardinality), and the multi-key radix would
@@ -932,8 +936,10 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             flag.kind = FlatKind::I64;
             flag.u64.resize(rows);
             for (std::size_t r = 0; r < rows; ++r) {
-                // Sign-flipped like every I64 key: 0 for a value, 1 for a null.
-                flag.u64[r] = static_cast<std::uint64_t>(1U - valid_bytes[r]) ^ kSignFlip;
+                // Sign-flipped like every I64 key: 0 for a value, 1 for a null
+                // -- or the other way round when nulls come first.
+                const auto is_null = static_cast<std::uint64_t>(1U - valid_bytes[r]);
+                flag.u64[r] = (fk.nulls_first ? 1U - is_null : is_null) ^ kSignFlip;
             }
             for (std::size_t r = 0; r < rows; ++r) {
                 if (valid_bytes[r] != 0) {
@@ -1157,12 +1163,13 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     // order total (no real ties), so the result matches a stable sort.
     const auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
         for (const auto& fk : flat_keys) {
-            // Null-ness outranks value and ignores `ascending`: a non-null always
-            // precedes a null, so nulls land last on asc and desc alike.
+            // Null-ness outranks value and ignores `ascending`: a non-null
+            // precedes a null, so nulls land last on asc and desc alike --
+            // first, for a `*_nulls_first` key.
             const bool lhs_null = fk.is_null(lhs);
             const bool rhs_null = fk.is_null(rhs);
             if (lhs_null != rhs_null) {
-                return rhs_null;
+                return fk.nulls_first ? lhs_null : rhs_null;
             }
             if (lhs_null) {
                 continue;  // both null on this key — tie, fall through to the next

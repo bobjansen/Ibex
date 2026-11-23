@@ -837,7 +837,9 @@ holds:
   NaN is not null: a NaN group and a null group are different. Joins
   compare keys with IEEE `==`, so a NaN join key matches nothing.
 - **`order`**: nulls sort last under both `asc` and `desc`. Their position does
-  not flip with the direction.
+  not flip with the direction. `asc_nulls_first` and `desc_nulls_first` put them
+  first instead, under either direction (Polars' default). This holds for
+  `order` and `order ..., head`/`tail`; `rank` places nulls with `na_option`.
 - **NaN in a Float64 sort key**: every NaN, whatever its payload or sign, ties
   with every other NaN and sorts above `+inf`, so it comes last under `asc` and
   first under `desc`; nulls still come after it. `-0.0` ties with `0.0`. This holds
@@ -1850,11 +1852,15 @@ Interaction with `select` and `update`:
 **`order [keys]`**
 
 Sorts rows by one or more keys in ascending order by default. Keys are column
-names, optionally followed by `asc` or `desc`. Examples:
+names, optionally followed by `asc` or `desc`, or by `asc_nulls_first` or
+`desc_nulls_first` to sort that key's nulls before its values rather than after
+(Section 3.5, Null Keys). The two are contextual words, not keywords: a column
+may still be named either. Examples:
 
 ```
 trades[order symbol]
 trades[order { symbol desc, price asc }]
+trades[order { price desc_nulls_first, symbol asc }]
 ```
 
 If no keys are provided (`order` or `order {}`), all columns in schema order

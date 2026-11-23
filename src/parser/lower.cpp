@@ -709,10 +709,11 @@ auto same_subquery_clause(const Clause& lhs, const Clause& rhs) -> bool {
             } else if constexpr (std::is_same_v<T, ByClause>) {
                 return same_subquery_fields(a.keys, b->keys);
             } else if constexpr (std::is_same_v<T, OrderClause>) {
-                return std::ranges::equal(a.keys, b->keys,
-                                          [](const OrderKey& x, const OrderKey& y) {
-                                              return x.name == y.name && x.ascending == y.ascending;
-                                          });
+                return std::ranges::equal(
+                    a.keys, b->keys, [](const OrderKey& x, const OrderKey& y) {
+                        return x.name == y.name && x.ascending == y.ascending &&
+                               x.nulls_first == y.nulls_first;
+                    });
             } else if constexpr (std::is_same_v<T, HeadClause> || std::is_same_v<T, TailClause>) {
                 return same_subquery_expr(a.count.get(), b->count.get());
             } else {
@@ -4108,7 +4109,8 @@ class Lowerer {
         std::vector<ir::OrderKey> keys;
         keys.reserve(clause.keys.size());
         for (const auto& key : clause.keys) {
-            keys.push_back(ir::OrderKey{.name = key.name, .ascending = key.ascending});
+            keys.push_back(ir::OrderKey{
+                .name = key.name, .ascending = key.ascending, .nulls_first = key.nulls_first});
         }
         return keys;
     }
@@ -5531,6 +5533,12 @@ class Lowerer {
             ir::RankExpr lowered_rank;
             lowered_rank.order_keys.reserve(rank->order_keys.size());
             for (const auto& key : rank->order_keys) {
+                if (key.nulls_first) {
+                    // A rank places its nulls with `na_option`, once for all keys.
+                    return std::unexpected(LowerError{
+                        .message = "rank(order {...}): place nulls with na_option = top, not "
+                                   "asc_nulls_first / desc_nulls_first"});
+                }
                 lowered_rank.order_keys.push_back(
                     ir::OrderKey{.name = key.name, .ascending = key.ascending});
             }

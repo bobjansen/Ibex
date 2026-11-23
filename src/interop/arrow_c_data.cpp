@@ -187,6 +187,9 @@ auto ordering_metadata(const std::optional<std::vector<ir::OrderKey>>& ordering)
         out.append((*ordering)[i].name);
         out.push_back(':');
         out.append((*ordering)[i].ascending ? "asc" : "desc");
+        if ((*ordering)[i].nulls_first) {
+            out.append("_nulls_first");
+        }
     }
     return out;
 }
@@ -269,14 +272,14 @@ auto decode_metadata(const char* metadata)
 /// Is row `a` of `entry` ordered at-or-before row `b`, treating a null as
 /// greater than every value (Ibex sorts nulls last)?
 auto row_at_or_before(const runtime::ColumnEntry& entry, std::size_t a, std::size_t b,
-                      bool ascending) -> bool {
+                      bool ascending, bool nulls_first) -> bool {
     const auto is_null = [&](std::size_t row) {
         return entry.validity.has_value() && !(*entry.validity)[row];
     };
     if (is_null(a) || is_null(b)) {
         // Nulls sort last whichever way the values run, so `desc` does not flip
-        // them — the same rule `order` follows.
-        return is_null(b);
+        // them — the same rule `order` follows -- or first for `*_nulls_first`.
+        return nulls_first ? is_null(a) : is_null(b);
     }
     return std::visit(
         [&](const auto& col) -> bool {
@@ -361,14 +364,14 @@ auto validate_imported_claims(const runtime::Table& table,
     for (std::size_t row = 1; row < table.rows(); ++row) {
         for (std::size_t k = 0; k < entries.size(); ++k) {
             const auto& key = (*ordering)[k];
-            if (!row_at_or_before(*entries[k], row - 1, row, key.ascending)) {
+            if (!row_at_or_before(*entries[k], row - 1, row, key.ascending, key.nulls_first)) {
                 return std::unexpected("ibex.ordering claims '" + key.name +
                                        "' is sorted, but row " + std::to_string(row) +
                                        " breaks it");
             }
             // Equal on this key: the next key decides. Otherwise this key
             // already settled the pair and the rest do not apply.
-            if (!row_at_or_before(*entries[k], row, row - 1, key.ascending)) {
+            if (!row_at_or_before(*entries[k], row, row - 1, key.ascending, key.nulls_first)) {
                 break;
             }
         }
@@ -402,12 +405,18 @@ auto parse_ordering(std::string_view text)
         if (colon == std::string_view::npos || colon == 0 || colon + 1 >= item.size()) {
             return std::unexpected("invalid ibex.ordering metadata");
         }
-        const std::string_view direction = item.substr(colon + 1);
+        std::string_view direction = item.substr(colon + 1);
+        constexpr std::string_view kNullsFirst = "_nulls_first";
+        const bool nulls_first = direction.ends_with(kNullsFirst);
+        if (nulls_first) {
+            direction.remove_suffix(kNullsFirst.size());
+        }
         if (direction != "asc" && direction != "desc") {
             return std::unexpected("invalid ibex.ordering direction");
         }
-        ordering.push_back(
-            {.name = std::string(item.substr(0, colon)), .ascending = direction == "asc"});
+        ordering.push_back({.name = std::string(item.substr(0, colon)),
+                            .ascending = direction == "asc",
+                            .nulls_first = nulls_first});
         if (next == std::string_view::npos) {
             break;
         }

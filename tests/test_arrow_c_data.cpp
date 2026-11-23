@@ -1478,6 +1478,28 @@ TEST_CASE("Arrow import puts nulls last when checking a claimed ordering",
     CHECK_FALSE(import_with_claim(build(true)).has_value());
 }
 
+TEST_CASE("Arrow import puts nulls first for a nulls-first ordering claim",
+          "[interop][arrow][claims]") {
+    // The twin of the test above: under `desc_nulls_first` a leading null keeps
+    // the claim and a trailing one breaks it, and the metadata says which.
+    auto build = [](bool null_first) {
+        ibex::runtime::Table table;
+        ibex::runtime::ValidityBitmap kv(3, true);
+        kv.set(null_first ? 0 : 2, false);
+        table.add_column("k", ibex::Column<std::int64_t>{5, 3, 0}, kv);
+        table.set_properties(ibex::runtime::TableProperties::recovered(
+            std::vector<ibex::ir::OrderKey>{{.name = "k", .ascending = false, .nulls_first = true}},
+            std::nullopt, {}));
+        return table;
+    };
+    auto kept = import_with_claim(build(true));
+    REQUIRE(kept.has_value());
+    REQUIRE(kept->ordering().has_value());
+    CHECK((*kept->ordering())[0].nulls_first);
+    CHECK_FALSE((*kept->ordering())[0].ascending);
+    CHECK_FALSE(import_with_claim(build(false)).has_value());
+}
+
 // ── Schema-only import ──────────────────────────────────────────────────────
 //
 // A stream can report a schema and then end without a single batch (an empty

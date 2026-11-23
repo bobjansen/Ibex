@@ -641,11 +641,12 @@ class ChunkedOrderedLimitOperator final : public Operator {
     [[nodiscard]] auto row_comes_first(const Entry& lhs, const Entry& rhs) const -> bool {
         for (std::size_t i = 0; i < lhs.key.values.size(); ++i) {
             // A null sorts after every value under asc and desc alike, as
-            // `order` puts it; two nulls tie. A null slot's value is undefined.
+            // `order` puts it (before, under `*_nulls_first`); two nulls tie. A
+            // null slot's value is undefined.
             const bool lhs_null = lhs.key.is_null(i);
             const bool rhs_null = rhs.key.is_null(i);
             if (lhs_null != rhs_null) {
-                return rhs_null;
+                return (*keys_)[i].nulls_first ? lhs_null : rhs_null;
             }
             if (lhs_null) {
                 continue;
@@ -708,11 +709,12 @@ class ChunkedOrderedLimitOperator final : public Operator {
                                      std::size_t sequence, const Entry& rhs) const -> bool {
         bool row_first = sequence < rhs.sequence;
         for (std::size_t i = 0; i < cols.size(); ++i) {
-            // As row_comes_first: a null sorts last under asc and desc alike.
+            // As row_comes_first: a null sorts last under asc and desc alike
+            // (first under `*_nulls_first`).
             const bool row_null = cols[i].is_null(row);
             const bool rhs_null = rhs.key.is_null(i);
             if (row_null != rhs_null) {
-                row_first = rhs_null;
+                row_first = (*keys_)[i].nulls_first ? row_null : rhs_null;
                 break;
             }
             if (row_null) {
@@ -747,7 +749,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 if (entry.validity.has_value()) {
                     return std::nullopt;
                 }
-                Key key{.ascending = keys[i].ascending};
+                Key key{.ascending = keys[i].ascending, .nulls_first = keys[i].nulls_first};
                 const ColumnValue& column = *entry.column;
                 if (const auto* ints = std::get_if<Column<std::int64_t>>(&column)) {
                     key.kind = ints->is_compact_int32() ? Kind::I32 : Kind::I64;
@@ -834,12 +836,13 @@ class ChunkedOrderedLimitOperator final : public Operator {
         [[nodiscard]] auto preferred(std::size_t row, std::size_t sequence) const -> bool {
             bool row_first = sequence < sequence_;
             for (std::size_t i = 0; i < keys_.size(); ++i) {
+                const Key& key = keys_[i];
                 if (nulls_[i] != 0U) {
-                    // A null sorts last, and this row's key is never null.
-                    row_first = true;
+                    // This row's key is never null; the entry's null sorts last
+                    // (first under `*_nulls_first`).
+                    row_first = !key.nulls_first;
                     break;
                 }
-                const Key& key = keys_[i];
                 int cmp = 0;
                 if (key.kind == Kind::F64) {
                     cmp = order_compare_double(static_cast<const double*>(key.values)[row],
@@ -863,6 +866,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
             const void* values = nullptr;
             std::size_t bit_offset = 0;  ///< Bool: the bitmap's first bit
             bool ascending = true;
+            bool nulls_first = false;
         };
 
         [[nodiscard]] static auto int_at(const Key& key, std::size_t row) -> std::int64_t {
@@ -927,6 +931,9 @@ class ChunkedOrderedLimitOperator final : public Operator {
     template <typename T>
     [[nodiscard]] auto single_key_better(const T& lhs, std::size_t lhs_sequence, const Entry& rhs,
                                          bool ascending) const -> bool {
+        // Neither side is null: a chunk with a null key takes the boxed path,
+        // and so does every chunk after it (`saw_null_key_`), whose heap may
+        // then hold the null entries this test does not rank.
         const auto* rhs_key = std::get_if<T>(&rhs.key.values.front());
         if (rhs_key == nullptr) {
             invariant_violation("ChunkedOrderedLimitOperator: single-key type mismatch");
@@ -1071,7 +1078,12 @@ class ChunkedOrderedLimitOperator final : public Operator {
                     ascending, group_key_cols, rows, key_validity);
             }
         }
-        if (key_validity != nullptr) {
+        // A null key ranks by its null-ness, which only the boxed path's
+        // Entry comparisons do; once one has entered the heaps, a later chunk
+        // without nulls could meet it at the heap's front, so it stays boxed
+        // too. Testing for it per row instead cost a top 100 by price 5%.
+        if (key_validity != nullptr || saw_null_key_) {
+            saw_null_key_ = true;
             return process_boxed_chunk(chunk, key_columns, group_key_cols);
         }
         // Grouped by one Categorical key with no nulls, across workers: each
@@ -1275,7 +1287,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 return keep_mode_ == KeepMode::First ? (lhs_sequence < rhs_sequence)
                                                      : (rhs_sequence < lhs_sequence);
             }
-            lhs_first = rhs_null;
+            lhs_first = (*keys_)[0].nulls_first ? lhs_null : rhs_null;
         } else {
             const int cmp = key_compare(lhs.key, rhs.key);
             if (cmp == 0) {
@@ -2040,12 +2052,14 @@ class ChunkedOrderedLimitOperator final : public Operator {
         }
         pass(key_bits);
         if (any_null.load(std::memory_order_relaxed)) {
-            // Most significant of all: null keys last, the passes above kept
-            // them in (key, arrival) order and a null's key is a placeholder.
+            // Most significant of all: null keys last (first under
+            // `*_nulls_first`), the passes above kept them in (key, arrival)
+            // order and a null's key is a placeholder.
+            const bool nulls_first = (*keys_)[0].nulls_first;
             std::vector<std::uint64_t> nulls(n);
             for_row_ranges(&exec_, n, [&](std::size_t begin, std::size_t end) {
                 for (std::size_t i = begin; i < end; ++i) {
-                    nulls[i] = null_key[i];
+                    nulls[i] = nulls_first ? 1U - null_key[i] : null_key[i];
                 }
             });
             pass(nulls);
@@ -2366,6 +2380,9 @@ class ChunkedOrderedLimitOperator final : public Operator {
     /// by the order key's storage.
     bool pod_active_ = false;
     bool pod_ascending_ = true;
+    /// A chunk with a null single key went to the boxed path: see
+    /// `process_single_key_values`.
+    bool saw_null_key_ = false;
     bool pod_int_key_ = false;
     /// One partition and one integer key whose values fill a small range: a
     /// group is found at `pod_dense_gid_[key - pod_dense_lo_]` rather than

@@ -1949,8 +1949,9 @@ struct JoinProbe {
                 if (!emitted.has_value()) {
                     return {};  // a key the output cannot name
                 }
-                out.push_back(
-                    ir::OrderKey{.name = std::move(*emitted), .ascending = key.ascending});
+                out.push_back(ir::OrderKey{.name = std::move(*emitted),
+                                           .ascending = key.ascending,
+                                           .nulls_first = key.nulls_first});
             }
             return out;
         }();
@@ -3672,8 +3673,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (idx == left_table.columns.size() || idx >= probe_.left_emit_names_.size()) {
                 return false;
             }
-            carried.push_back(
-                ir::OrderKey{.name = probe_.left_emit_names_[idx], .ascending = key.ascending});
+            carried.push_back(ir::OrderKey{.name = probe_.left_emit_names_[idx],
+                                           .ascending = key.ascending,
+                                           .nulls_first = key.nulls_first});
         }
         return TableProperties::sorted_by(std::move(carried)).satisfies(*pending_order_);
     }

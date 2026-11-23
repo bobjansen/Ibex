@@ -220,6 +220,8 @@ struct MapField {
 struct OrderKey {
     std::string name;
     bool ascending = true;
+    /// `asc_nulls_first` / `desc_nulls_first`: nulls before every value.
+    bool nulls_first = false;
 };
 
 struct FilterClause {

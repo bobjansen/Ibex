@@ -111,7 +111,8 @@ auto same_ordering(const std::optional<std::vector<ir::OrderKey>>& expected,
         return false;
     for (std::size_t i = 0; i < expected->size(); ++i) {
         if ((*expected)[i].name != (*actual)[i].name ||
-            (*expected)[i].ascending != (*actual)[i].ascending)
+            (*expected)[i].ascending != (*actual)[i].ascending ||
+            (*expected)[i].nulls_first != (*actual)[i].nulls_first)
             return false;
     }
     return true;

@@ -528,21 +528,13 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
         elif operation == "sort":
             names, descending, nulls_last = expressions
             order = []
-            updates = []
-            occupied = set(schemas[index]) if validate else set(names)
-            for key_index, (name, reverse, last) in enumerate(zip(names, descending, nulls_last)):
-                if not last:
-                    temporary = f"_ibex_sort_null_{index}_{key_index}"
-                    while temporary in occupied:
-                        temporary += "_"
-                    occupied.add(temporary)
-                    updates.append(f"{_identifier(temporary)} = is_null({_identifier(name)})")
-                    order.append(f"{_identifier(temporary)} desc")
-                # NaN needs no flag: native order puts every NaN above +inf,
-                # as Polars does (SPEC 3.5, Null Keys).
-                order.append(f"{_identifier(name)} {'desc' if reverse else 'asc'}")
-            if updates:
-                source += f"[update {{ {', '.join(updates)} }}]"
+            for name, reverse, last in zip(names, descending, nulls_last):
+                # Polars puts nulls first unless told otherwise, under either
+                # direction: native `*_nulls_first`. NaN needs nothing: native
+                # order puts every NaN above +inf, as Polars does (SPEC 3.5,
+                # Null Keys).
+                direction = "desc" if reverse else "asc"
+                order.append(f"{_identifier(name)} {direction if last else direction + '_nulls_first'}")
             source += f"[order {{ {', '.join(order)} }}]"
         elif operation == "hstack":
             if any(expr._args[0]._op == "broadcast_length" for expr in expressions):

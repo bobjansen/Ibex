@@ -799,8 +799,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 carried_ordering.clear();
                 break;
             }
-            carried_ordering.push_back(
-                ir::OrderKey{.name = it->second, .ascending = key.ascending});
+            carried_ordering.push_back(ir::OrderKey{
+                .name = it->second, .ascending = key.ascending, .nulls_first = key.nulls_first});
         }
     }
 

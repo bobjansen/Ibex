@@ -20268,6 +20268,182 @@ TEST_CASE("A late-materialized top-k returns the full sort's rows and columns",
     }
 }
 
+// `asc_nulls_first` / `desc_nulls_first` put a key's nulls before its values,
+// under either direction, through every ordering path: the full sort (flagged
+// radix keys, the lone-string comparator), and the top-k's boxed, typed, small
+// POD and parallel heaps. Checked against a brute-force stable sort, with
+// NaNs, ties, and inputs arriving whole or as filtered morsel chunks.
+TEST_CASE("Nulls-first order keys sort nulls first on every path",
+          "[runtime][order][topk][nulls]") {
+    constexpr std::size_t kRows = 30'000;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    std::vector<std::int64_t> ids(kRows);
+    std::vector<double> ds(kRows);
+    std::vector<std::int64_t> is(kRows);
+    std::vector<std::string> ss(kRows);
+    runtime::ValidityBitmap d_valid(kRows, true);
+    runtime::ValidityBitmap i_valid(kRows, true);
+    runtime::ValidityBitmap s_valid(kRows, true);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        ids[r] = static_cast<std::int64_t>(r);
+        ds[r] = (r % 89 == 0) ? nan : static_cast<double>((r * 37) % 61) * 0.25;
+        is[r] = static_cast<std::int64_t>((r * 11) % 17) - 8;
+        ss[r] = "v" + std::to_string((r * 7) % 41);
+        d_valid.set(r, r % 13 != 5);
+        i_valid.set(r, r % 9 != 4);
+        s_valid.set(r, r % 23 != 7);
+    }
+    runtime::Table t;
+    t.add_column("id", Column<std::int64_t>{ids});
+    t.add_column("d", Column<double>{ds}, d_valid);
+    t.add_column("i", Column<std::int64_t>{is}, i_valid);
+    t.add_column("s", Column<std::string>{ss}, s_valid);
+    std::vector<std::int64_t> groups(kRows);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        groups[r] = static_cast<std::int64_t>(r % 5);
+    }
+    t.add_column("g", Column<std::int64_t>{groups});
+    // Nulls only in the first rows: the chunks after the first carry none,
+    // and meet the null entries the first one left in the heaps.
+    std::vector<double> es(kRows);
+    runtime::ValidityBitmap e_valid(kRows, true);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        es[r] = static_cast<double>((r * 53) % 97);
+        e_valid.set(r, r >= 50);
+    }
+    t.add_column("e", Column<double>{es}, e_valid);
+    runtime::TableRegistry tables;
+    tables.emplace("t", t);
+
+    struct Key {
+        std::string column;
+        bool ascending;
+        bool nulls_first;
+    };
+    const auto spell = [](const Key& key) {
+        return key.column + " " + (key.ascending ? "asc" : "desc") +
+               (key.nulls_first ? "_nulls_first" : "");
+    };
+    // -1 / 0 / 1 for a before / tie / after b on one key, nulls placed.
+    const auto compare = [&](const Key& key, std::size_t a, std::size_t b) -> int {
+        const runtime::ValidityBitmap& valid = key.column == "d"   ? d_valid
+                                               : key.column == "i" ? i_valid
+                                               : key.column == "e" ? e_valid
+                                                                   : s_valid;
+        const bool an = key.column != "id" && !valid[a];
+        const bool bn = key.column != "id" && !valid[b];
+        if (an != bn) {
+            return (an == key.nulls_first) ? -1 : 1;
+        }
+        if (an) {
+            return 0;
+        }
+        int cmp = 0;
+        if (key.column == "id") {
+            cmp = ids[a] < ids[b] ? -1 : (ids[a] > ids[b] ? 1 : 0);
+        } else if (key.column == "d") {
+            const bool x = std::isnan(ds[a]);
+            const bool y = std::isnan(ds[b]);
+            cmp = (x || y) ? (x == y ? 0 : (x ? 1 : -1))
+                           : (ds[a] < ds[b] ? -1 : (ds[a] > ds[b] ? 1 : 0));
+        } else if (key.column == "i") {
+            cmp = is[a] < is[b] ? -1 : (is[a] > is[b] ? 1 : 0);
+        } else if (key.column == "e") {
+            cmp = es[a] < es[b] ? -1 : (es[a] > es[b] ? 1 : 0);
+        } else {
+            cmp = ss[a] < ss[b] ? -1 : (ss[a] > ss[b] ? 1 : 0);
+        }
+        return key.ascending ? cmp : -cmp;
+    };
+
+    const auto run_check = [&](const std::string& query, const std::vector<std::int64_t>& expected,
+                               std::size_t threads) {
+        CAPTURE(query, threads);
+        runtime::ExecutionContext exec{.execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 1024;
+        exec.parallel_grain = 4096;
+        auto out =
+            runtime::interpret(*require_ir(query.c_str()), tables, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        const auto& got = std::get<Column<std::int64_t>>(*out->find("id"));
+        CHECK(std::vector<std::int64_t>(got.begin(), got.end()) == expected);
+    };
+    const std::vector<std::vector<Key>> key_sets = {
+        {{"d", false, true}},
+        {{"d", true, true}, {"id", false, false}},
+        {{"i", false, true}, {"s", true, false}},
+        {{"s", true, true}},
+        {{"s", false, true}, {"i", true, true}},
+        {{"i", true, false}, {"d", false, true}},
+        {{"e", true, true}},
+        {{"e", false, false}},
+    };
+    for (const auto& keys : key_sets) {
+        std::string order;
+        for (const auto& key : keys) {
+            order += (order.empty() ? "" : ", ") + spell(key);
+        }
+        for (const bool filtered : {false, true}) {
+            std::vector<std::size_t> rows;
+            for (std::size_t r = 0; r < kRows; ++r) {
+                if (!filtered || r % 7 != 2) {
+                    rows.push_back(r);
+                }
+            }
+            std::ranges::stable_sort(rows, [&](std::size_t a, std::size_t b) {
+                for (const auto& key : keys) {
+                    if (const int c = compare(key, a, b); c != 0) {
+                        return c < 0;
+                    }
+                }
+                return false;
+            });
+            std::vector<std::int64_t> want;
+            want.reserve(rows.size());
+            for (const std::size_t r : rows) {
+                want.push_back(ids[r]);
+            }
+            const std::string base = std::string("t") + (filtered ? "[filter id % 7 != 2]" : "") +
+                                     "[order { " + order + " }]";
+            for (const char* limit : {"", "[head 3]", "[head 40]", "[tail 7]"}) {
+                const std::string query = base + limit + ";";
+                std::vector<std::int64_t> expected = want;
+                if (std::string_view(limit) == "[head 3]") {
+                    expected.resize(3);
+                } else if (std::string_view(limit) == "[head 40]") {
+                    expected.resize(40);
+                } else if (std::string_view(limit) == "[tail 7]") {
+                    expected.erase(expected.begin(), expected.end() - 7);
+                }
+                for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+                    run_check(query, expected, threads);
+                }
+            }
+            // Grouped: one sort key takes the small POD heaps, whose winners
+            // come out in key order. Each group's first three of the sort.
+            if (keys.size() == 1) {
+                std::vector<std::int64_t> expected;
+                std::array<int, 5> taken{};
+                for (const std::int64_t id : want) {
+                    auto& n = taken[static_cast<std::size_t>(groups[static_cast<std::size_t>(id)])];
+                    if (n < 3) {
+                        ++n;
+                        expected.push_back(id);
+                    }
+                }
+                const std::string query = std::string("t") +
+                                          (filtered ? "[filter id % 7 != 2]" : "") + "[order { " +
+                                          order + " }, head 3, by g];";
+                for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+                    run_check(query, expected, threads);
+                }
+            }
+        }
+    }
+}
+
 // An update below a run (TPC-H q22: a computed column, then a filter on it)
 // joins the streamed run (`Plan::stream_only_bottom_updates`): one scan
 // pipeline computes, filters and projects each unit. Before, the update

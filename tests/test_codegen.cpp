@@ -313,6 +313,14 @@ TEST_CASE("emitter: order node", "[codegen]") {
     auto out = emit_to_string(*order);
     CHECK(contains(out, "ibex::ops::order("));
     CHECK(contains(out, "OrderKey{\"symbol\", false}"));
+
+    // Nulls-first keys carry the third field; others keep the two-field form.
+    auto nulls_first = b.order({ir::OrderKey{.name = "px", .ascending = true, .nulls_first = true},
+                                ir::OrderKey{.name = "symbol", .ascending = false}});
+    nulls_first->add_child(make_source(b, "trades.csv"));
+    const auto out_nulls = emit_to_string(*nulls_first);
+    CHECK(contains(out_nulls, "OrderKey{\"px\", true, true}"));
+    CHECK(contains(out_nulls, "OrderKey{\"symbol\", false}"));
 }
 
 // --- Aggregate ---------------------------------------------------------------

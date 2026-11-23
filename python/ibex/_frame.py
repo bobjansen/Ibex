@@ -183,13 +183,13 @@ class LazyFrame:
         result_schema = {}
         source, tables, scalars = lower(self, validate=True, result_schema=result_schema)
         result = ibex_pyarrow.execute_pipeline(source, tables=tables, scalars=scalars)
-        # Exclude internal sort flags with a metadata-only Arrow projection.
+        # Exclude internal columns with a metadata-only Arrow projection.
         internal_columns = set(result.column_names) - set(result_schema)
         result = result.select(list(result_schema))
         if internal_columns and result.schema.metadata:
             metadata = dict(result.schema.metadata)
-            # Native null-first emulation orders by flags absent from the
-            # public result. Do not export a stale ordering claim on reimport.
+            # An ordering may name an internal column absent from the public
+            # result. Do not export a stale ordering claim on reimport.
             metadata.pop(b"ibex.ordering", None)
             result = result.replace_schema_metadata(metadata or None)
         # Native count is Int64 and categorical keys may export dictionaries.

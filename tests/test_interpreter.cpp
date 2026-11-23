@@ -19867,6 +19867,85 @@ TEST_CASE("A filter run over a table computes its update on the workers for an a
     CHECK(y[y.size() - 1] == 7998);
 }
 
+// A dense grouping walks each morsel a block at a time: the block's cells,
+// then every aggregate over them. Rows reach each group in row order, so
+// first/last and the sums are those of a plain pass. Large enough for several
+// morsels of several blocks each; Int and Bool keys take the pair-dense path.
+TEST_CASE("A dense grouped aggregate over many blocks keeps row order per group",
+          "[runtime][aggregate][parallel]") {
+    constexpr std::size_t kRows = 300'000;
+    std::vector<std::int64_t> keys(kRows);
+    Column<bool> flags;
+    std::vector<std::int64_t> qtys(kRows);
+    std::vector<double> prices(kRows);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        keys[r] = static_cast<std::int64_t>((r * 7) % 5);
+        flags.push_back((r % 3) == 0);
+        qtys[r] = static_cast<std::int64_t>((r % 997) + 1);
+        prices[r] = static_cast<double>(r % 101) * 0.25;
+    }
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{keys});
+    t.add_column("flag", std::move(flags));
+    t.add_column("qty", Column<std::int64_t>{qtys});
+    t.add_column("price", Column<double>{prices});
+    runtime::TableRegistry tables;
+    tables.emplace("t", t);
+
+    struct Want {
+        std::int64_t volume = 0;
+        double notional = 0.0;
+        double first_price = 0.0;
+        std::int64_t last_qty = 0;
+        std::int64_t n = 0;
+    };
+    std::map<std::pair<std::int64_t, bool>, Want> want;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        auto& w = want[{keys[r], (r % 3) == 0}];
+        if (w.n == 0) {
+            w.first_price = prices[r];
+        }
+        w.volume += qtys[r];
+        w.notional += prices[r] * static_cast<double>(qtys[r]);
+        w.last_qty = qtys[r];
+        ++w.n;
+    }
+
+    auto ir = require_ir(
+        "t[select { volume = sum(qty), vwap = sum(price * Float64(qty)) / Float64(sum(qty)), "
+        "first_price = first(price), last_qty = last(qty), n = count() }, by { k, flag }]"
+        "[order { k, flag }];");
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        CAPTURE(threads);
+        runtime::ExecutionContext exec{.execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+        auto out = runtime::interpret(*ir, tables, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        REQUIRE(out->rows() == want.size());
+        const auto& k = std::get<Column<std::int64_t>>(*out->find("k"));
+        const auto& flag = std::get<Column<bool>>(*out->find("flag"));
+        const auto& volume = std::get<Column<std::int64_t>>(*out->find("volume"));
+        const auto& vwap = std::get<Column<double>>(*out->find("vwap"));
+        const auto& first_price = std::get<Column<double>>(*out->find("first_price"));
+        const auto& last_qty = std::get<Column<std::int64_t>>(*out->find("last_qty"));
+        const auto& n = std::get<Column<std::int64_t>>(*out->find("n"));
+        std::size_t row = 0;
+        for (const auto& [key, w] : want) {
+            CAPTURE(row);
+            CHECK(k[row] == key.first);
+            CHECK(flag[row] == key.second);
+            CHECK(volume[row] == w.volume);
+            CHECK(vwap[row] == Catch::Approx(w.notional / static_cast<double>(w.volume)));
+            CHECK(first_price[row] == w.first_price);
+            CHECK(last_qty[row] == w.last_qty);
+            CHECK(n[row] == w.n);
+            ++row;
+        }
+    }
+}
+
 // `Float64(int_column)` in a product is read in place by the direct numeric
 // update -- compact Int32 storage and nulls included -- not materialized as a
 // cast column first.

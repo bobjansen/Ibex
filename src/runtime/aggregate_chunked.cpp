@@ -8685,22 +8685,32 @@ class HashAggregateState final {
         if (begin >= end) {
             return;
         }
-        prepare_range(begin, end);
         std::ranges::fill(local_seen, std::uint8_t{0});
         auto& order = partials.seen[m];
-        for (std::size_t row = begin; row < end; ++row) {
-            const auto cell = static_cast<std::size_t>(index_of_row[row]);
-            if (local_seen[cell] == 0) {
-                local_seen[cell] = 1;
-                order.push_back(static_cast<std::uint32_t>(cell));
-                if (first_rows != nullptr) {
-                    first_rows->push_back(static_cast<std::uint32_t>(row));
+        AggSlotCore* slots = &partials.slots[m * partials.n_cells * n_aggs_];
+        double* scratch = partials.scratch.data() + (m * partials.n_cells * scratch_stride_);
+        // A block at a time: its cells are computed, then every aggregate
+        // reads them while they are still in L1. Over the whole morsel at once
+        // (1.25M rows on 8 cores over 10M), each aggregate re-read the morsel's
+        // 5 MB of cells from memory. Rows still reach each slot in row order,
+        // so the partials are the same bits.
+        constexpr std::size_t kBlockRows = 4096;
+        for (std::size_t block = begin; block < end; block += kBlockRows) {
+            const std::size_t block_end = std::min(end, block + kBlockRows);
+            prepare_range(block, block_end);
+            for (std::size_t row = block; row < block_end; ++row) {
+                const auto cell = static_cast<std::size_t>(index_of_row[row]);
+                if (local_seen[cell] == 0) {
+                    local_seen[cell] = 1;
+                    order.push_back(static_cast<std::uint32_t>(cell));
+                    if (first_rows != nullptr) {
+                        first_rows->push_back(static_cast<std::uint32_t>(row));
+                    }
                 }
             }
+            accumulate_columns_into(index_of_row, agg_entries, block, block_end, slots, scratch,
+                                    nullptr, true);
         }
-        accumulate_columns_into(
-            index_of_row, agg_entries, begin, end, &partials.slots[m * partials.n_cells * n_aggs_],
-            partials.scratch.data() + (m * partials.n_cells * scratch_stride_), nullptr, true);
     }
 
     /// Fold one chunk's morsel partials into `flat_slots_`, morsels in

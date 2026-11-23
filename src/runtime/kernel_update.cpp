@@ -94,6 +94,9 @@ struct NumericOperand {
     /// Set exactly when !is_column.
     std::optional<ScalarValue> scalar;
     ExprType kind = ExprType::Int;
+    /// An Int operand under an explicit `Float64(...)`: read as Int and widened
+    /// to Double per row, which makes its binary expression a Double one.
+    bool widened = false;
 };
 
 auto resolve_numeric_operand(const ir::Expr& expr, const PredicateInput& input,
@@ -143,8 +146,33 @@ auto numeric_binary_operands(const ir::Expr& expr, const PredicateInput& input,
     if (binary == nullptr) {
         return std::nullopt;
     }
-    auto left = resolve_numeric_operand(*binary->left, input, scalars);
-    auto right = resolve_numeric_operand(*binary->right, input, scalars);
+    // `Float64(x)` over a numeric operand is that operand read as Double: the
+    // Double kernel below widens an Int column per row, so the cast need not
+    // become a column of its own. The adapter writes `price * Float64(qty)`
+    // for every mixed product; materializing the cast was 14% of a 10M-row
+    // grouped aggregate's CPU.
+    const auto resolve = [&](const ir::Expr& side) -> std::optional<NumericOperand> {
+        const auto* call = std::get_if<ir::CallExpr>(&side.node);
+        if (call == nullptr || call->callee != "Float64" || call->args.size() != 1 ||
+            !call->named_args.empty()) {
+            return resolve_numeric_operand(side, input, scalars);
+        }
+        auto inner = resolve_numeric_operand(*call->args.front(), input, scalars);
+        if (!inner.has_value() || inner->kind == ExprType::Double) {
+            return inner;
+        }
+        if (!inner->is_column) {
+            return NumericOperand{
+                .is_column = false,
+                .column = nullptr,
+                .scalar = ScalarValue{static_cast<double>(std::get<std::int64_t>(*inner->scalar))},
+                .kind = ExprType::Double};
+        }
+        inner->widened = true;
+        return inner;
+    };
+    auto left = resolve(*binary->left);
+    auto right = resolve(*binary->right);
     if (!left.has_value() || !right.has_value()) {
         return std::nullopt;
     }
@@ -1685,7 +1713,8 @@ auto fixed_width_numeric_binary_kind(const ir::Expr& expr, const PredicateInput&
         return std::nullopt;
     }
     return binary->op == ir::ArithmeticOp::Div || operands->first.kind == ExprType::Double ||
-                   operands->second.kind == ExprType::Double
+                   operands->second.kind == ExprType::Double || operands->first.widened ||
+                   operands->second.widened
                ? FixedWidthNumericKind::Double
                : FixedWidthNumericKind::Int;
 }
@@ -2620,9 +2649,14 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
                 return body([value](std::size_t) { return value; });
             }
             if (operand.kind == ExprType::Int) {
-                const auto p =
-                    std::get<Column<std::int64_t>>(*operand.column).integer_view() + begin;
-                return body([p](std::size_t i) { return static_cast<double>(p[i]); });
+                // A raw pointer per physical width: `IntegerView` tests the
+                // width on every element, which kept this loop scalar -- 22% of
+                // a 10M-row grouped aggregate's CPU for `price * Float64(qty)`.
+                return with_physical_values(
+                    std::get<Column<std::int64_t>>(*operand.column), [&](const auto* values) {
+                        const auto* p = values + begin;
+                        return body([p](std::size_t i) { return static_cast<double>(p[i]); });
+                    });
             }
             const double* p = std::get<Column<double>>(*operand.column).data() + begin;
             return body([p](std::size_t i) { return p[i]; });

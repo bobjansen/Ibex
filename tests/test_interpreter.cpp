@@ -19867,6 +19867,59 @@ TEST_CASE("A filter run over a table computes its update on the workers for an a
     CHECK(y[y.size() - 1] == 7998);
 }
 
+// `Float64(int_column)` in a product is read in place by the direct numeric
+// update -- compact Int32 storage and nulls included -- not materialized as a
+// cast column first.
+TEST_CASE("A Float64 cast operand takes the direct numeric update", "[runtime][update][parallel]") {
+    constexpr std::size_t kRows = 40'000;
+    ibex::detail::NoInitVector<std::int32_t> narrow(kRows);
+    std::vector<double> prices(kRows);
+    runtime::ValidityBitmap valid(kRows, true);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        narrow[r] = static_cast<std::int32_t>(r % 1000) - 500;
+        prices[r] = static_cast<double>(r) * 0.5;
+        valid.set(r, r % 13 != 0);
+    }
+    runtime::Table t;
+    t.add_column("q", Column<std::int64_t>::from_compact_int32(std::move(narrow)));
+    t.add_column("p", Column<double>{prices});
+    runtime::Table nullable = t;
+    nullable.columns[0].validity = valid;
+    for (const bool with_nulls : {false, true}) {
+        CAPTURE(with_nulls);
+        runtime::TableRegistry tables;
+        tables.emplace("t", with_nulls ? nullable : t);
+        runtime::ParallelPipelineStats stats;
+        runtime::ExecutionContext exec{.execution_profile = nullptr};
+        exec.parallel_threads = 4;
+        exec.parallel_min_rows = 0;
+        exec.parallel_grain = 4'096;
+        exec.parallel_stats = &stats;
+        auto ir = require_ir("t[update { y = p * Float64(q), z = Float64(q) + 2 }];");
+        auto out = runtime::interpret(*ir, tables, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        CHECK(stats.parallel_direct_numeric_fields.load() >= 1);
+        const auto* y_entry = out->find_entry("y");
+        const auto* z_entry = out->find_entry("z");
+        REQUIRE(y_entry != nullptr);
+        REQUIRE(z_entry != nullptr);
+        const auto& y = std::get<Column<double>>(*y_entry->column);
+        const auto& z = std::get<Column<double>>(*z_entry->column);
+        for (std::size_t r = 0; r < kRows; r += 7) {
+            CAPTURE(r);
+            const bool is_null = with_nulls && r % 13 == 0;
+            CHECK((y_entry->validity.has_value() && !(*y_entry->validity)[r]) == is_null);
+            CHECK((z_entry->validity.has_value() && !(*z_entry->validity)[r]) == is_null);
+            if (!is_null) {
+                const auto q = static_cast<double>(static_cast<std::int64_t>(r % 1000) - 500);
+                CHECK(y[r] == prices[r] * q);
+                CHECK(z[r] == q + 2.0);
+            }
+        }
+    }
+}
+
 // An update below a run (TPC-H q22: a computed column, then a filter on it)
 // joins the streamed run (`Plan::stream_only_bottom_updates`): one scan
 // pipeline computes, filters and projects each unit. Before, the update

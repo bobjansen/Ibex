@@ -736,7 +736,9 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     // I64 keys are sign-flipped to uint64 at extraction time so that unsigned
     // comparison is equivalent to signed comparison — this lets radix_sort_u64_asc
     // consume the vector directly without an extra copy.
-    constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63;
+    // Static: the key-filling lambdas below name it without capturing it,
+    // which GCC 13 refuses for an automatic constexpr.
+    static constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63;
     // Workers for the radix passes; 1 means serial. Sized on rows, so the
     // permutation, which is stable, cannot depend on it.
     const std::size_t sort_workers =
@@ -774,6 +776,20 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             break;
         }
     }
+
+    // A key's flat values, row by row across the pool: a pure map, so the
+    // permutation cannot depend on the split. Serial, building the keys was
+    // most of the wall time of a 1.2M-row two-key sort whose radix passes
+    // already fan out (12.5 ms at 0.15 occupancy).
+    const auto fill_keys = [&](std::vector<std::uint64_t>& out, const auto& value) {
+        out.resize(rows);
+        std::uint64_t* const dst = out.data();
+        for_row_ranges(&exec, rows, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t i = begin; i < end; ++i) {
+                dst[i] = value(i);
+            }
+        });
+    };
 
     std::vector<FlatKey> flat_keys;
     flat_keys.reserve(resolved_keys.size());
@@ -831,22 +847,32 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                 using ColT = std::decay_t<decltype(col)>;
                 if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
                     fk.kind = FlatKind::I64;
-                    fk.u64.reserve(rows);
-                    for (const auto v : col)
-                        fk.u64.push_back(static_cast<std::uint64_t>(v) ^ kSignFlip);
+                    // A raw pointer per physical width, not IntegerView's
+                    // per-element width test.
+                    with_physical_values(col, [&](const auto* values) {
+                        fill_keys(fk.u64, [values](std::size_t i) {
+                            return static_cast<std::uint64_t>(
+                                       static_cast<std::int64_t>(values[i])) ^
+                                   kSignFlip;
+                        });
+                    });
                 } else if constexpr (std::is_same_v<ColT, Column<double>>) {
                     fk.kind = FlatKind::F64;
                     fk.f64.assign(col.begin(), col.end());
                 } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
                     fk.kind = FlatKind::I64;
-                    fk.u64.reserve(rows);
-                    for (const auto& d : col)
-                        fk.u64.push_back(static_cast<std::uint64_t>(d.days) ^ kSignFlip);
+                    const Date* dates = col.data();
+                    fill_keys(fk.u64, [dates](std::size_t i) {
+                        return static_cast<std::uint64_t>(
+                                   static_cast<std::int64_t>(dates[i].days)) ^
+                               kSignFlip;
+                    });
                 } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
                     fk.kind = FlatKind::I64;
-                    fk.u64.reserve(rows);
-                    for (const auto& ts : col)
-                        fk.u64.push_back(static_cast<std::uint64_t>(ts.nanos) ^ kSignFlip);
+                    const Timestamp* stamps = col.data();
+                    fill_keys(fk.u64, [stamps](std::size_t i) {
+                        return static_cast<std::uint64_t>(stamps[i].nanos) ^ kSignFlip;
+                    });
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     fk.kind = FlatKind::I64;
                     fk.u64.reserve(rows);
@@ -893,18 +919,19 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                     }
                     fk.kind = FlatKind::I64;
                     fk.cardinality = dict.empty() ? 0 : static_cast<std::size_t>(next) + 1;
-                    fk.u64.reserve(rows);
-                    for (std::size_t i = 0; i < rows; ++i) {
-                        const auto code = col.code_at(i);
-                        // A null row's code carries no meaning: nulls are ranked
-                        // by `is_null` in the comparator, and a null-bearing key
-                        // never reaches a radix path at all.
+                    const auto* codes = col.codes_data();
+                    const std::uint64_t* ranks = rank.data();
+                    const std::size_t ranked = rank.size();
+                    fill_keys(fk.u64, [codes, ranks, ranked](std::size_t i) {
+                        const auto code = codes[i];
+                        // A null row's code carries no meaning: nulls are
+                        // ranked by their own flag key, so its value is moot.
                         const std::uint64_t value =
-                            (code >= 0 && static_cast<std::size_t>(code) < rank.size())
-                                ? rank[static_cast<std::size_t>(code)]
+                            (code >= 0 && static_cast<std::size_t>(code) < ranked)
+                                ? ranks[static_cast<std::size_t>(code)]
                                 : 0;
-                        fk.u64.push_back(value ^ kSignFlip);
-                    }
+                        return value ^ kSignFlip;
+                    });
                 }
             },
             *column);

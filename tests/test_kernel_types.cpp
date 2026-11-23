@@ -1192,6 +1192,56 @@ TEST_CASE("Bool gather kernel: word-block selection matches per-bit truth",
     REQUIRE((out_words[0] >> 4) == 0);
 }
 
+TEST_CASE("Bool gather kernel: an adopted Arrow bitmap at any bit offset",
+          "[kernel][gather][bool]") {
+    // An external column reads 64 source bits with one unaligned load, a shift
+    // and the straddled ninth byte; at the column's end it must not read past
+    // the buffer, and bits beyond the column must not leak into the output.
+    constexpr std::size_t kRows = 203;  // ends mid-byte, mid-word
+    std::vector<bool> truth(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        truth[i] = ((i * 7) % 5) < 2 || i == kRows - 1;
+    }
+    for (std::size_t offset = 0; offset < 8; ++offset) {
+        CAPTURE(offset);
+        // Exactly the bytes the column spans, with every bit outside it set,
+        // so a read past the column would show.
+        auto bytes = std::make_shared<std::vector<std::uint8_t>>((offset + kRows + 7) / 8, 0xFFU);
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const std::size_t bit = offset + i;
+            if (!truth[i]) {
+                (*bytes)[bit / 8] =
+                    static_cast<std::uint8_t>((*bytes)[bit / 8] & ~(1U << (bit % 8)));
+            }
+        }
+        const auto src = Column<bool>::from_external(bytes, bytes->data(), offset, kRows);
+        REQUIRE(src.is_external());
+        // Every third row from row 5 on, through the last word's partial end.
+        const std::size_t base = 5;
+        std::vector<std::uint64_t> sel_words((kRows - base + 63) / 64, 0);
+        std::vector<std::size_t> kept;
+        for (std::size_t r = base; r < kRows; r += 3) {
+            sel_words[(r - base) / 64] |= std::uint64_t{1} << ((r - base) % 64);
+            kept.push_back(r);
+        }
+        const ibex::runtime::kernel::RowWordBlocks blocks{
+            .words = sel_words.data(), .word_count = sel_words.size(), .row_base = base};
+        std::vector<std::uint64_t> out_words((kept.size() + 63) / 64, 0);
+        ibex::runtime::kernel::gather_selected_bool(
+            ibex::runtime::kernel::BoolView(src), ibex::runtime::kernel::Selection{blocks},
+            ibex::runtime::kernel::BoolOutputSpan{
+                .words = out_words.data(), .begin = 0, .count = kept.size()});
+        for (std::size_t i = 0; i < kept.size(); ++i) {
+            CAPTURE(i);
+            CHECK(((out_words[i / 64] >> (i % 64)) & 1U) == (truth[kept[i]] ? 1U : 0U));
+        }
+        const std::size_t tail = kept.size() % 64;
+        if (tail != 0) {
+            CHECK((out_words.back() >> tail) == 0);
+        }
+    }
+}
+
 TEST_CASE("Bool gather kernel: disjoint windows OR without clobbering", "[kernel][gather][bool]") {
     Column<bool> src;
     for (int i = 0; i < 100; ++i) {

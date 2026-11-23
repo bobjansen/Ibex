@@ -17,10 +17,13 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <robin_hood.h>
@@ -42,6 +45,31 @@
 namespace ibex::runtime {
 
 namespace {
+/// Lowers `slot` to `row` if `row` is smaller, against concurrent writers.
+void atomic_min(std::uint32_t& slot, std::uint32_t row) noexcept {
+#ifdef __cpp_lib_atomic_ref
+    const std::atomic_ref<std::uint32_t> cell(slot);
+#else
+    // Apple's and Emscripten's libc++ do not ship std::atomic_ref yet.
+    // std::atomic<uint32_t> is a lock-free integral specialization and so
+    // layout-compatible with a plain uint32_t, as the gather kernels rely on.
+    auto& cell = *reinterpret_cast<std::atomic<std::uint32_t>*>(&slot);
+#endif
+    std::uint32_t seen = cell.load(std::memory_order_relaxed);
+    while (row < seen && !cell.compare_exchange_weak(seen, row, std::memory_order_relaxed)) {
+    }
+}
+
+/// ORs `bits` into `word`, against concurrent writers.
+void atomic_or(std::uint64_t& word, std::uint64_t bits) noexcept {
+#ifdef __cpp_lib_atomic_ref
+    std::atomic_ref<std::uint64_t>(word).fetch_or(bits, std::memory_order_relaxed);
+#else
+    // See `atomic_min`.
+    reinterpret_cast<std::atomic<std::uint64_t>*>(&word)->fetch_or(bits, std::memory_order_relaxed);
+#endif
+}
+
 /// Encodes a fixed-width multi-column key into one flat integer.
 ///
 /// Shared by `ChunkedDistinctOperator` and the hash aggregate state: both
@@ -62,7 +90,7 @@ class ChunkedDistinctOperator final : public Operator {
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
-            auto chunk_res = child_->next();
+            auto chunk_res = pull();
             if (!chunk_res.has_value()) {
                 return std::unexpected(std::move(chunk_res.error()));
             }
@@ -109,6 +137,22 @@ class ChunkedDistinctOperator final : public Operator {
             key_entries_.reserve(t.columns.size());
             for (const auto& entry : t.columns) {
                 key_entries_.push_back(&entry);
+            }
+            // The whole input in one chunk, over keys with small domains: no
+            // set at all (`try_dense_whole_input`). Only before any store has
+            // seen a row, and only when the input is known to end here, so
+            // no later chunk has to dedupe against what this path kept.
+            if (!fast_dedup_seen_ && !generic_dedup_seen_) {
+                auto whole = input_ends_after_this_chunk();
+                if (!whole.has_value()) {
+                    return std::unexpected(std::move(whole.error()));
+                }
+                if (*whole) {
+                    if (auto out = try_dense_whole_input(t)) {
+                        fast_dedup_seen_ = true;
+                        return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+                    }
+                }
             }
             if (!generic_dedup_seen_) {
                 if (auto plan = encoder_.build_packed_key(key_entries_); plan.has_value()) {
@@ -221,6 +265,280 @@ class ChunkedDistinctOperator final : public Operator {
     }
 
    private:
+    /// The child's next chunk: the one `input_ends_after_this_chunk` pulled
+    /// ahead, if any, else a fresh one.
+    auto pull() -> std::expected<std::optional<Chunk>, std::string> {
+        if (pending_.has_value()) {
+            return std::exchange(pending_, std::nullopt);
+        }
+        if (child_done_) {
+            return std::optional<Chunk>{};
+        }
+        auto chunk = child_->next();
+        if (chunk.has_value() && !chunk->has_value()) {
+            child_done_ = true;
+        }
+        return chunk;
+    }
+
+    /// Whether the chunk being processed is the input's last, by pulling the
+    /// next one ahead (kept for `pull`). Asked once, for the first chunk.
+    auto input_ends_after_this_chunk() -> std::expected<bool, std::string> {
+        if (child_done_ || pending_.has_value()) {
+            return child_done_ && !pending_.has_value();
+        }
+        auto ahead = child_->next();
+        if (!ahead.has_value()) {
+            return std::unexpected(std::move(ahead.error()));
+        }
+        if (!ahead->has_value()) {
+            child_done_ = true;
+            return true;
+        }
+        pending_ = std::move(*ahead);
+        return false;
+    }
+
+    /// One key column of the dense path: its values become a cell digit in
+    /// `[0, span)`.
+    struct DenseKey {
+        enum class Kind : std::uint8_t { Cat, Bool, Int64, Int32, Date } kind{Kind::Int64};
+        const void* values = nullptr;  ///< codes, int64/int32 values, or dates
+        const Column<bool>* bools = nullptr;
+        std::int64_t min = 0;
+        std::uint64_t span = 0;
+    };
+
+    /// `distinct` of a whole input over small key domains, without a set.
+    ///
+    /// Every key is a Categorical code, a Bool, or an Int64/Date whose range in
+    /// this chunk is small, so a row's keys name a CELL of a dense grid, and a
+    /// row is kept exactly when it is its cell's first row. Workers record
+    /// each cell's first row with an atomic min over a flat array, then mark
+    /// those rows in a keep bitmap, which the filter gather turns into the
+    /// output: first occurrences, in row order, as the serial path keeps them
+    /// -- the same rows whichever worker got there first.
+    ///
+    /// The packed path it replaces built a 16-byte key per row and probed a
+    /// hash set with it; on the demo's `unique(symbol, day)` (5M rows, 1.2M
+    /// distinct, 5000 x 250 cells) the probes were half the query's CPU.
+    ///
+    /// Nullopt when a key does not qualify (nulls, another type, a wide range)
+    /// or the grid would be much larger than the input.
+    auto try_dense_whole_input(const Table& t) -> std::optional<Table> {
+        const std::size_t rows = t.rows();
+        if (t.columns.size() < 2 || rows == 0 ||
+            rows >= std::numeric_limits<std::uint32_t>::max()) {
+            return std::nullopt;
+        }
+        // A grid at most about twice the input: the first-row array then costs
+        // at most 8 bytes per input row, and the keep pass stays cheap.
+        // Cells are numbered in 32 bits, as rows are.
+        const std::uint64_t cell_limit = std::min<std::uint64_t>(
+            std::max<std::uint64_t>(2 * rows, 1U << 16), std::numeric_limits<std::uint32_t>::max());
+        auto& pool = process_worker_pool();
+        const std::size_t count = dedup_partition_count(rows);
+        const std::size_t workers = count == 0 ? 1 : count;
+        const auto run = [&](std::size_t tasks, const auto& body) {
+            if (workers < 2 || tasks < 2) {
+                for (std::size_t task = 0; task < tasks; ++task) {
+                    body(task);
+                }
+                return;
+            }
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(std::min(workers, tasks), [&](std::size_t) {
+                for (std::size_t task = cursor.fetch_add(1, std::memory_order_relaxed);
+                     task < tasks; task = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                    body(task);
+                }
+            });
+            batch.wait();
+        };
+        const std::size_t ranges =
+            std::max<std::size_t>(1, std::min<std::size_t>(64, rows / 65536));
+        const std::size_t grain = (rows + ranges - 1) / ranges;
+
+        std::vector<DenseKey> keys;
+        keys.reserve(t.columns.size());
+        std::uint64_t cells = 1;
+        for (const auto& entry : t.columns) {
+            if (entry.validity.has_value()) {
+                return std::nullopt;
+            }
+            DenseKey key;
+            const ColumnValue& column = *entry.column;
+            if (const auto* cat = std::get_if<Column<Categorical>>(&column)) {
+                key.kind = DenseKey::Kind::Cat;
+                key.values = cat->codes_data();
+                key.span = std::max<std::size_t>(cat->dictionary_size(), 1);
+            } else if (const auto* flags = std::get_if<Column<bool>>(&column)) {
+                key.kind = DenseKey::Kind::Bool;
+                key.bools = flags;
+                key.span = 2;
+            } else if (const auto* ints = std::get_if<Column<std::int64_t>>(&column)) {
+                const bool compact = ints->is_compact_int32();
+                key.kind = compact ? DenseKey::Kind::Int32 : DenseKey::Kind::Int64;
+                key.values = compact ? static_cast<const void*>(ints->compact_int32_data())
+                                     : static_cast<const void*>(ints->data());
+            } else if (const auto* dates = std::get_if<Column<Date>>(&column)) {
+                key.kind = DenseKey::Kind::Date;
+                key.values = dates->data();
+            } else {
+                return std::nullopt;
+            }
+            keys.push_back(key);
+        }
+        // Integer ranges, measured in parallel; a range past the grid's limit
+        // declines before anything is allocated for it.
+        for (auto& key : keys) {
+            if (key.span != 0) {
+                continue;
+            }
+            std::vector<std::pair<std::int64_t, std::int64_t>> bounds(ranges);
+            run(ranges, [&](std::size_t r) {
+                const std::size_t begin = r * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                std::int64_t lo = std::numeric_limits<std::int64_t>::max();
+                std::int64_t hi = std::numeric_limits<std::int64_t>::min();
+                for (std::size_t row = begin; row < end; ++row) {
+                    const std::int64_t v = dense_int_value(key, row);
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+                bounds[r] = {lo, hi};
+            });
+            std::int64_t lo = std::numeric_limits<std::int64_t>::max();
+            std::int64_t hi = std::numeric_limits<std::int64_t>::min();
+            for (const auto& [range_lo, range_hi] : bounds) {
+                lo = std::min(lo, range_lo);
+                hi = std::max(hi, range_hi);
+            }
+            const auto span = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo) + 1;
+            if (span == 0 || span > cell_limit) {
+                return std::nullopt;
+            }
+            key.min = lo;
+            key.span = span;
+        }
+        for (const auto& key : keys) {
+            if (key.span > cell_limit / cells) {
+                return std::nullopt;
+            }
+            cells *= key.span;
+        }
+
+        constexpr std::uint32_t kUnseen = std::numeric_limits<std::uint32_t>::max();
+        dense_first_.resize(static_cast<std::size_t>(cells));
+        const std::size_t cell_grain = (static_cast<std::size_t>(cells) + ranges - 1) / ranges;
+        run(ranges, [&](std::size_t r) {
+            const std::size_t begin = std::min(static_cast<std::size_t>(cells), r * cell_grain);
+            const std::size_t end = std::min(static_cast<std::size_t>(cells), begin + cell_grain);
+            std::fill(dense_first_.begin() + static_cast<std::ptrdiff_t>(begin),
+                      dense_first_.begin() + static_cast<std::ptrdiff_t>(end), kUnseen);
+        });
+        // Each cell's first row. Ranges run ascending on each worker, so a
+        // repeat of a cell this worker already set compares and moves on; the
+        // atomic min settles cells that ranges on two workers both reach.
+        run(ranges, [&](std::size_t r) {
+            const std::size_t begin = r * grain;
+            const std::size_t end = std::min(rows, begin + grain);
+            std::array<std::uint32_t, 4096> block{};
+            for (std::size_t first = begin; first < end; first += block.size()) {
+                const std::size_t n = std::min(block.size(), end - first);
+                dense_cells(keys, first, n, block.data());
+                for (std::size_t i = 0; i < n; ++i) {
+                    atomic_min(dense_first_[block[i]], static_cast<std::uint32_t>(first + i));
+                }
+            }
+        });
+        // Mark each cell's first row; two cells can share a keep word.
+        FilterSelection selection;
+        selection.keep_words.assign((rows + 63) / 64, 0);
+        std::vector<std::size_t> kept(ranges, 0);
+        run(ranges, [&](std::size_t r) {
+            const std::size_t begin = std::min(static_cast<std::size_t>(cells), r * cell_grain);
+            const std::size_t end = std::min(static_cast<std::size_t>(cells), begin + cell_grain);
+            std::size_t local = 0;
+            for (std::size_t cell = begin; cell < end; ++cell) {
+                const std::uint32_t row = dense_first_[cell];
+                if (row == kUnseen) {
+                    continue;
+                }
+                atomic_or(selection.keep_words[row / 64], std::uint64_t{1} << (row % 64));
+                ++local;
+            }
+            kept[r] = local;
+        });
+        for (const std::size_t k : kept) {
+            selection.kept += k;
+        }
+        // `distinct` keeps the first occurrence of each row in input order: a
+        // `RowTransform::Subset`, under which every claim the input made still
+        // holds, which `filter_table_selection` derives.
+        auto out = filter_table_selection(t, selection, nullptr, RowRange::whole(rows));
+        if (!out.has_value()) {
+            return std::nullopt;
+        }
+        return std::move(*out);
+    }
+
+    [[nodiscard]] static auto dense_int_value(const DenseKey& key, std::size_t row)
+        -> std::int64_t {
+        switch (key.kind) {
+            case DenseKey::Kind::Int64:
+                return static_cast<const std::int64_t*>(key.values)[row];
+            case DenseKey::Kind::Int32:
+                return static_cast<const std::int32_t*>(key.values)[row];
+            case DenseKey::Kind::Date:
+                return static_cast<const Date*>(key.values)[row].days;
+            default:
+                return 0;
+        }
+    }
+
+    /// The cells of rows `[first, first + n)`, one key column at a time
+    /// (mixed-radix, the first key most significant).
+    static void dense_cells(const std::vector<DenseKey>& keys, std::size_t first, std::size_t n,
+                            std::uint32_t* out) {
+        std::fill_n(out, n, std::uint32_t{0});
+        for (const auto& key : keys) {
+            const auto span = static_cast<std::uint32_t>(key.span);
+            switch (key.kind) {
+                case DenseKey::Kind::Cat: {
+                    const auto* codes =
+                        static_cast<const Column<Categorical>::code_type*>(key.values) + first;
+                    for (std::size_t i = 0; i < n; ++i) {
+                        out[i] = (out[i] * span) + static_cast<std::uint32_t>(codes[i]);
+                    }
+                    break;
+                }
+                case DenseKey::Kind::Bool:
+                    for (std::size_t i = 0; i < n; ++i) {
+                        out[i] = (out[i] * span) + ((*key.bools)[first + i] ? 1U : 0U);
+                    }
+                    break;
+                case DenseKey::Kind::Int32: {
+                    const auto* values = static_cast<const std::int32_t*>(key.values) + first;
+                    const auto lo = static_cast<std::uint32_t>(key.min);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        out[i] = (out[i] * span) + (static_cast<std::uint32_t>(values[i]) - lo);
+                    }
+                    break;
+                }
+                case DenseKey::Kind::Int64:
+                case DenseKey::Kind::Date:
+                    for (std::size_t i = 0; i < n; ++i) {
+                        const auto offset =
+                            static_cast<std::uint64_t>(dense_int_value(key, first + i)) -
+                            static_cast<std::uint64_t>(key.min);
+                        out[i] = (out[i] * span) + static_cast<std::uint32_t>(offset);
+                    }
+                    break;
+            }
+        }
+    }
+
     /// The dedup fan-out policy, resolved from `dedup_plan_` (which the plan
     /// owns -- src/runtime/PARALLELISM.md). Returns 0 to stay serial, otherwise
     /// the partition count. Both dedup paths call this; the two conditions that
@@ -889,6 +1207,12 @@ class ChunkedDistinctOperator final : public Operator {
     }
 
     OperatorPtr child_;
+    /// A chunk pulled ahead by `input_ends_after_this_chunk`, and whether the
+    /// child has reported its end.
+    std::optional<Chunk> pending_;
+    bool child_done_ = false;
+    /// Each grid cell's first row, for `try_dense_whole_input`.
+    std::vector<std::uint32_t> dense_first_;
     // Multi-column dedup: `key_index_` hashes and compares each row in place and
     // holds one owned Key per distinct value in `group_order_` (the group-by hot
     // loop's mechanism). `seen_` is the fallback for a column type make_key_col

@@ -19999,6 +19999,127 @@ TEST_CASE("A Float64 cast operand takes the direct numeric update", "[runtime][u
     }
 }
 
+// A whole-input distinct over small key domains -- Categorical codes, Bool,
+// narrow Int64 / compact Int32 / Date ranges -- marks each grid cell's first
+// row instead of probing a hash set. The output must be exactly the serial
+// one: each combination's first occurrence, in row order, at any thread count.
+TEST_CASE("A dense distinct keeps first occurrences in row order",
+          "[runtime][distinct][parallel]") {
+    constexpr std::size_t kRows = 200'000;
+    std::vector<std::string> names;
+    for (int i = 0; i < 300; ++i) {
+        names.push_back("s" + std::to_string(i));
+    }
+    Column<Categorical>::codes_storage codes(kRows);
+    std::vector<std::int64_t> wide(kRows);
+    ibex::detail::NoInitVector<std::int32_t> narrow(kRows);
+    Column<bool> flags;
+    std::vector<Date> dates(kRows);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        // A different stride per key, so combinations first appear late and
+        // out of order.
+        codes[r] = static_cast<std::int32_t>((r * 7919) % 300);
+        wide[r] = static_cast<std::int64_t>((r * 31) % 40) - 1'000'000;
+        narrow[r] = static_cast<std::int32_t>((r * 13) % 9) - 4;
+        flags.push_back((r * 17) % 5 < 2);
+        dates[r] = Date{.days = static_cast<std::int32_t>(19'000 + ((r * 3) % 11))};
+    }
+    runtime::Table t;
+    t.add_column("c", Column<Categorical>{names, std::move(codes)});
+    t.add_column("w", Column<std::int64_t>{wide});
+    t.add_column("n", Column<std::int64_t>::from_compact_int32(std::move(narrow)));
+    t.add_column("f", std::move(flags));
+    t.add_column("d", Column<Date>{dates});
+    const auto& cat = std::get<Column<Categorical>>(*t.find_entry("c")->column);
+    const auto& n = std::get<Column<std::int64_t>>(*t.find_entry("n")->column);
+    const auto& f = std::get<Column<bool>>(*t.find_entry("f")->column);
+
+    // Expected first occurrences, by brute force over the key tuple.
+    const auto expected = [&](const std::vector<std::string>& keys) {
+        std::set<std::vector<std::int64_t>> seen;
+        std::vector<std::size_t> rows;
+        for (std::size_t r = 0; r < kRows; ++r) {
+            std::vector<std::int64_t> tuple;
+            for (const auto& key : keys) {
+                if (key == "c") {
+                    tuple.push_back(cat.codes_data()[r]);
+                } else if (key == "w") {
+                    tuple.push_back(wide[r]);
+                } else if (key == "n") {
+                    tuple.push_back(n[r]);
+                } else if (key == "f") {
+                    tuple.push_back(f[r] ? 1 : 0);
+                } else {
+                    tuple.push_back(dates[r].days);
+                }
+            }
+            if (seen.insert(tuple).second) {
+                rows.push_back(r);
+            }
+        }
+        return rows;
+    };
+
+    runtime::TableRegistry tables;
+    tables.emplace("t", t);
+    const std::vector<std::vector<std::string>> key_sets = {
+        {"c", "w"}, {"c", "f", "n"}, {"d", "w", "f"}, {"n", "c", "d", "f"}};
+    for (const auto& keys : key_sets) {
+        std::string list;
+        for (const auto& key : keys) {
+            list += (list.empty() ? "" : ", ") + key;
+        }
+        const auto want = expected(keys);
+        auto plain = require_ir(("t[distinct { " + list + " }];").c_str());
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+            CAPTURE(list, threads);
+            runtime::ExecutionContext exec{.execution_profile = nullptr};
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            auto out = runtime::interpret(*plain, tables, nullptr, nullptr, nullptr, exec);
+            INFO((out.has_value() ? std::string{} : out.error()));
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == want.size());
+            for (std::size_t i = 0; i < want.size(); i += 97) {
+                CAPTURE(i);
+                const std::size_t r = want[i];
+                for (const auto& key : keys) {
+                    const auto* entry = out->find_entry(key);
+                    REQUIRE(entry != nullptr);
+                    if (key == "c") {
+                        CHECK(std::get<Column<Categorical>>(*entry->column)[i] == cat[r]);
+                    } else if (key == "w") {
+                        CHECK(std::get<Column<std::int64_t>>(*entry->column)[i] == wide[r]);
+                    } else if (key == "n") {
+                        CHECK(std::get<Column<std::int64_t>>(*entry->column)[i] == n[r]);
+                    } else if (key == "f") {
+                        CHECK(std::get<Column<bool>>(*entry->column)[i] == f[r]);
+                    } else {
+                        CHECK(std::get<Column<Date>>(*entry->column)[i].days == dates[r].days);
+                    }
+                }
+            }
+        }
+    }
+
+    // A nullable key declines the dense path; the generic one still keeps
+    // first occurrences.
+    runtime::Table nullable = t;
+    runtime::ValidityBitmap valid(kRows, true);
+    valid.set(5, false);
+    nullable.columns[1].validity = valid;
+    runtime::TableRegistry nullable_tables;
+    nullable_tables.emplace("t", nullable);
+    auto two = require_ir("t[distinct { c, w }];");
+    auto out = runtime::interpret(*two, nullable_tables);
+    REQUIRE(out.has_value());
+    std::set<std::pair<std::int64_t, std::optional<std::int64_t>>> with_null;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        with_null.emplace(cat.codes_data()[r], r == 5 ? std::nullopt : std::optional{wide[r]});
+    }
+    CHECK(out->rows() == with_null.size());
+}
+
 // An update below a run (TPC-H q22: a computed column, then a filter on it)
 // joins the streamed run (`Plan::stream_only_bottom_updates`): one scan
 // pipeline computes, filters and projects each unit. Before, the update

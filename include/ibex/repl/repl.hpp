@@ -57,6 +57,8 @@ struct ExecutionResult {
     /// Every table rendered by this execution, in statement order.
     std::vector<runtime::Table> tables;
     std::optional<runtime::ScalarValue> scalar;
+    /// The last value came from a standalone call to a streaming table consumer.
+    bool table_sink_result = false;
     /// Everything the execution wrote to stdout: `print(...)` output, warnings,
     /// and (when rendering) the formatted results -- but not the error, which
     /// is in `error`.

@@ -85,7 +85,7 @@ def _strings_from_dictionary(column, name):
     # set it re-entered IbexEngine while a sink held the engine's lock.
     return pl.DataFrame([codes]).lazy().select(
         pl.lit(labels.cast(pl.String)).gather(pl.col(name)).alias(name)).collect(
-            engine="in-memory").to_series()
+            engine="streaming").to_series()
 
 
 def _known_codes(column, dtype, name, categories):

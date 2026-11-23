@@ -218,6 +218,25 @@ assert "polars" not in sys.modules
         with self.assertRaises(RuntimeError):
             ibex_pyarrow.execute_pipeline("1 + 1;")
 
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_native_parquet_sink_returns_count_and_keeps_grouped_text_as_string(self):
+        symbols = pa.array(["AA", "BB", "AA"]).dictionary_encode()
+        table = pa.table({"symbol": symbols, "qty": [10, 20, 30]})
+        source = """
+extern fn parquet::write(df: DataFrame, path: String) -> Int from "parquet.hpp";
+parquet::write(t[select { total = sum(qty) }, by symbol][order { symbol }], path);
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grouped.parquet"
+            rows = ibex_pyarrow.execute_pipeline(source, tables={"t": table},
+                                                 scalars={"path": str(path)})
+            self.assertEqual(rows, 2)
+            result = pq.read_table(path)
+            self.assertTrue(pa.types.is_large_string(result.schema.field("symbol").type))
+            self.assertEqual(result.to_pydict(), {"symbol": ["AA", "BB"], "total": [40, 20]})
+            metadata = pq.ParquetFile(path).metadata
+            self.assertIn("RLE_DICTIONARY", metadata.row_group(0).column(0).encodings)
+
     def test_grouped_aggregates_null_keys_and_output_types(self):
         frame = pl.DataFrame(pa.table({
             "g": ["b", None, "a", "b", None],

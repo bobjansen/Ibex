@@ -1431,6 +1431,11 @@ PyObject* py_execute_pipeline(PyObject* /*self*/, PyObject* args, PyObject* kwar
         if (!result.ok) {
             return set_python_error_from_message(PyExc_RuntimeError, result.error);
         }
+        if (result.table_sink_result && result.scalar) {
+            if (const auto* rows = std::get_if<std::int64_t>(&*result.scalar)) {
+                return PyLong_FromLongLong(*rows);
+            }
+        }
         if (!result.table.has_value()) {
             return set_python_error_from_message(PyExc_RuntimeError,
                                                  "pipeline did not produce a table");
@@ -1732,7 +1737,7 @@ PyMethodDef kModuleMethods[] = {
     {"bind_table", py_bind_table, METH_O,
      PyDoc_STR("Prepare and retain an immutable native input once for repeated pipelines.")},
     {"execute_pipeline", _PyCFunction_CAST(py_execute_pipeline), METH_VARARGS | METH_KEYWORDS,
-     PyDoc_STR("Execute a complete pipeline through the shared Ibex planner, returning Arrow.")},
+     PyDoc_STR("Execute a pipeline, returning an Arrow table or a standalone sink row count.")},
 #if defined(IBEX_HAS_PARQUET_BACKEND)
     {"execute_pipeline_parquet", _PyCFunction_CAST(py_execute_pipeline_parquet),
      METH_VARARGS | METH_KEYWORDS, "Execute a pipeline and stream its result to Parquet."},

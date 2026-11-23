@@ -68,7 +68,9 @@ using metadata and executes through `ibex_pyarrow.execute_pipeline`. Literal
 values and file paths cross as typed bindings, never interpolated source.
 Each collection reads its source again; results are not cached. Parquet input
 decoding uses Ibex's lazy reader, not a Polars/PyArrow data read. The native
-endpoint currently holds the GIL during evaluation.
+endpoint currently holds the GIL during evaluation. A standalone
+`parquet::write(...)` as the pipeline result returns the number of rows written
+as a Python integer.
 
 Python table expressions use the script executor's source planning, including
 streaming Parquet units and deferred join probes. Typed scalar bindings remain

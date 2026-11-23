@@ -5443,9 +5443,9 @@ inline auto column_to_arrow_field(const ibex::runtime::ColumnEntry& entry)
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Decimal>>) {
                 const ibex::DecimalType t = ibex::runtime::decimal_type_of(col);
                 return arrow::field(entry.name, arrow::decimal128(t.precision, t.scale));
-            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Categorical>>) {
-                return arrow::field(entry.name, arrow::dictionary(arrow::int32(), arrow::utf8()));
             } else {
+                // Runtime text dictionaries also back logical String columns.
+                // A caller with a declared Categorical field supplies its Arrow schema.
                 return arrow::field(entry.name, arrow::large_utf8());
             }
         },

@@ -4006,7 +4006,8 @@ It defaults to Zstandard compression at level 3, 122,880 rows per row group,
 and column statistics. Override these with the named arguments
 `compression`, `compression_level`, `row_group_size`, and `statistics`.
 The supported codecs are `"zstd"`, `"snappy"`, and `"uncompressed"`.
-A top-level write can stream a lazy query into the file.
+A top-level write can stream a lazy query into the file. Dictionary-backed
+text is written as String with dictionary encoding where useful.
 
 **`args::parse`** turns a spec string and an argument vector into a table with a
 **fixed schema** — one row per argument:

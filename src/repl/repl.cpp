@@ -806,11 +806,12 @@ void print_table(const runtime::Table& table, std::size_t max_rows) {
 // the top-level statement printer and the `print(...)` builtin; `requested` is
 // the builtin, whose output is the point and is formatted even when the
 // session does not render results.
-void render_eval_value(const EvalValue& value, bool requested = false) {
+void render_eval_value(const EvalValue& value, bool requested = false, bool table_sink = false) {
     // `table` and `scalar` describe the LAST value only, so recording one
     // clears the other: after `t; 1 + 1;` a caller reading them sees the
     // scalar, not a table from an earlier statement. `tables` keeps them all.
     if (auto* result = active_execution_result(); result != nullptr) {
+        result->table_sink_result = table_sink;
         if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
             result->scalar = *scalar;
             result->table.reset();
@@ -6049,10 +6050,18 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             }
             // A top-level `print(...)` already rendered its argument; rendering
             // the passed-through return value here too would print it twice.
-            const auto* call = std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
+            const auto* expression = expr_stmt.expr.get();
+            while (const auto* group = std::get_if<parser::GroupExpr>(&expression->node)) {
+                expression = group->expr.get();
+            }
+            const auto* call = std::get_if<parser::CallExpr>(&expression->node);
             const bool already_printed = call != nullptr && call->callee == "print";
             if (!already_printed) {
-                render_eval_value(value.value());
+                const auto* function = call != nullptr && !functions.contains(call->callee)
+                                           ? externs.find(call->callee)
+                                           : nullptr;
+                render_eval_value(*value, false,
+                                  function != nullptr && function->chunk_consumer_func);
             }
         }
     }

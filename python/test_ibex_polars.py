@@ -1438,6 +1438,12 @@ class EngineTests(unittest.TestCase):
                     with pl.Config() as config:
                         config.set_engine_affinity(engine)
                         query.sink_parquet(target)
+                        # A file object uses the Polars writer and exercises the
+                        # dictionary-to-String gather under the same affinity.
+                        buffer = io.BytesIO()
+                        query.sink_parquet(buffer)
+                        buffer.seek(0)
+                        assert_frame_equal(pl.read_parquet(buffer), pl.read_parquet(target))
                         # Another collect on the same engine while nothing
                         # holds its lock.
                         errors.append(query.select("id").collect().height)

@@ -6,6 +6,8 @@ extern fn read(path: String) -> DataFrame from "parquet.hpp";
 
 // Write a DataFrame to a Parquet file.
 // Returns the number of rows written.
-extern fn write(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn write(df: DataFrame, path: String, compression: String = "zstd",
+                compression_level: Int = 3, row_group_size: Int = 122880,
+                statistics: Bool = true) -> Int from "parquet.hpp";
 
 }

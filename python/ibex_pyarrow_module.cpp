@@ -130,8 +130,10 @@ auto expand_first_party_imports(ibex::parser::Program program)
         if (import->name == "parquet") {
             auto declarations = ibex::parser::parse(
                 "extern fn parquet::read(path: String) -> DataFrame from \"parquet.hpp\";"
-                "extern fn parquet::write(df: DataFrame, path: String) -> Int from "
-                "\"parquet.hpp\";");
+                "extern fn parquet::write(df: DataFrame, path: String, compression: String = "
+                "\"zstd\", "
+                "compression_level: Int = 3, row_group_size: Int = 122880, "
+                "statistics: Bool = true) -> Int from \"parquet.hpp\";");
             if (!declarations.has_value()) {
                 return std::unexpected(declarations.error().format());
             }
@@ -1537,6 +1539,94 @@ PyObject* py_execute_pipeline_stream(PyObject* /*self*/, PyObject* args, PyObjec
     Py_RETURN_NONE;
 }
 
+#if defined(IBEX_HAS_PARQUET_BACKEND)
+PyObject* py_execute_pipeline_parquet(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
+    static const char* kwlist[] = {"source",
+                                   "path",
+                                   "schema",
+                                   "tables",
+                                   "scalars",
+                                   "compression",
+                                   "compression_level",
+                                   "row_group_size",
+                                   "statistics",
+                                   "data_page_size",
+                                   "mkdir",
+                                   nullptr};
+    const char* source = nullptr;
+    const char* path = nullptr;
+    PyObject* schema_capsule = nullptr;
+    PyObject* tables_obj = Py_None;
+    PyObject* scalars_obj = Py_None;
+    const char* compression = "zstd";
+    long long level = 3;
+    long long row_group_size = 122880;
+    int statistics = 1;
+    long long page_size = 1024 * 1024;
+    int mkdir = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "ssO|OOsLLpLp", const_cast<char**>(kwlist),
+                                     &source, &path, &schema_capsule, &tables_obj, &scalars_obj,
+                                     &compression, &level, &row_group_size, &statistics, &page_size,
+                                     &mkdir)) {
+        return nullptr;
+    }
+    auto* schema = static_cast<ArrowSchema*>(PyCapsule_GetPointer(schema_capsule, "arrow_schema"));
+    if (schema == nullptr) {
+        return nullptr;
+    }
+    auto tables = build_table_registry_from_python(tables_obj);
+    if (!tables) {
+        return set_python_error_from_message(PyExc_RuntimeError, tables.error());
+    }
+    auto scalars = build_scalar_registry_from_python(scalars_obj);
+    if (!scalars) {
+        return set_python_error_from_message(PyExc_RuntimeError, scalars.error());
+    }
+    try {
+        auto writer = ibex::parquet::open_writer(path, compression, level, row_group_size,
+                                                 statistics != 0, page_size, mkdir != 0, schema);
+        ibex::runtime::ExternRegistry externs;
+        register_first_party_backends(externs);
+        ibex::repl::ReplConfig config;
+        config.persistent_history = false;
+        ibex::repl::ReplSession session(config, externs);
+        ibex::repl::ReplSession::ExecuteOptions options;
+        options.tables = std::move(*tables);
+        options.scalars = std::move(*scalars);
+        options.render = false;
+        options.plan_table_expressions = true;
+        options.chunk_sink = [&](ibex::runtime::Table chunk) -> std::expected<void, std::string> {
+            writer->push(std::move(chunk));
+            return {};
+        };
+        std::exception_ptr error;
+        ibex::repl::ExecutionResult result;
+        Py_BEGIN_ALLOW_THREADS;
+        try {
+            result = session.execute(source, std::move(options));
+            if (result.ok) {
+                if (result.scalar) {
+                    throw std::invalid_argument("parquet sink expects a table result");
+                }
+                writer->finish();
+            }
+        } catch (...) {
+            error = std::current_exception();
+        }
+        Py_END_ALLOW_THREADS;
+        if (error) {
+            std::rethrow_exception(error);
+        }
+        if (!result.ok) {
+            return set_python_error_from_message(PyExc_RuntimeError, result.error);
+        }
+    } catch (const std::exception& error) {
+        return set_python_error_from_message(PyExc_RuntimeError, error.what());
+    }
+    Py_RETURN_NONE;
+}
+#endif
+
 /// Sets one bit per row number in a zeroed bitmap of `height` rows. Returns
 /// false when the numbers are not strictly increasing within [0, height).
 /// Workers own disjoint index ranges; the numbers they name may share a
@@ -1643,6 +1733,10 @@ PyMethodDef kModuleMethods[] = {
      PyDoc_STR("Prepare and retain an immutable native input once for repeated pipelines.")},
     {"execute_pipeline", _PyCFunction_CAST(py_execute_pipeline), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Execute a complete pipeline through the shared Ibex planner, returning Arrow.")},
+#if defined(IBEX_HAS_PARQUET_BACKEND)
+    {"execute_pipeline_parquet", _PyCFunction_CAST(py_execute_pipeline_parquet),
+     METH_VARARGS | METH_KEYWORDS, "Execute a pipeline and stream its result to Parquet."},
+#endif
     {"execute_pipeline_stream", _PyCFunction_CAST(py_execute_pipeline_stream),
      METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Execute a complete pipeline, passing each result chunk to on_batch as a "

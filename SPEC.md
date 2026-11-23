@@ -4001,6 +4001,13 @@ bundled I/O backends are:
 | `fs` | `fs::list(dir[, pattern[, recursive]])` | — | Directory listing as a DataFrame (see below) |
 | `adbc` | `adbc::read(driver, uri, sql[, options])`, `adbc::query(db, sql[, params])` | `adbc::write(db, df, table[, mode])` | Databases through ADBC drivers (see 12.1.1) |
 
+`parquet::write(df, path)` writes a local file and returns its row count.
+It defaults to Zstandard compression at level 3, 122,880 rows per row group,
+and column statistics. Override these with the named arguments
+`compression`, `compression_level`, `row_group_size`, and `statistics`.
+The supported codecs are `"zstd"`, `"snappy"`, and `"uncompressed"`.
+A top-level write can stream a lazy query into the file.
+
 **`args::parse`** turns a spec string and an argument vector into a table with a
 **fixed schema** — one row per argument:
 

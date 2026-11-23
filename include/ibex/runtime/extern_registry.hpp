@@ -223,6 +223,9 @@ using ExternFn = std::function<std::expected<ExternValue, std::string>(const Ext
 /// Used by write operations (e.g. csv::write, parquet::write).
 using ExternTableConsumerFn =
     std::function<std::expected<ExternValue, std::string>(const Table&, const ExternArgs&)>;
+using ExternTableProducer = std::function<std::expected<void, std::string>(const TableChunkSink&)>;
+using ExternChunkConsumerFn = std::function<std::expected<ExternValue, std::string>(
+    const ExternTableProducer&, const ExternArgs&)>;
 
 /// Function signature for extern functions that produce a chunked table
 /// source. Used by streaming readers (e.g. csv::read on the chunked path)
@@ -284,6 +287,7 @@ struct ExternFunction {
     ExternFn func;
     /// Set when the function's first argument is a DataFrame (e.g. write functions).
     ExternTableConsumerFn table_consumer_func;
+    ExternChunkConsumerFn chunk_consumer_func;
     /// Set when the function produces a chunked table source that the
     /// interpreter can drain chunk by chunk. When both `func` and
     /// `chunked_table_func` are set, the interpreter prefers the chunked
@@ -340,6 +344,7 @@ class ExternRegistry {
         registry_.insert_or_assign(std::move(name), ExternFunction{
                                                         .func = std::move(func),
                                                         .table_consumer_func = {},
+                                                        .chunk_consumer_func = {},
                                                         .chunked_table_func = {},
                                                         .lazy_table_func = {},
                                                         .kind = ExternReturnKind::Scalar,
@@ -352,6 +357,7 @@ class ExternRegistry {
         use_host_runtime_state();
         registry_.insert_or_assign(std::move(name), ExternFunction{.func = std::move(func),
                                                                    .table_consumer_func = {},
+                                                                   .chunk_consumer_func = {},
                                                                    .chunked_table_func = {},
                                                                    .lazy_table_func = {},
                                                                    .kind = ExternReturnKind::Table,
@@ -366,6 +372,7 @@ class ExternRegistry {
         registry_.insert_or_assign(std::move(name),
                                    ExternFunction{.func = std::move(func),
                                                   .table_consumer_func = {},
+                                                  .chunk_consumer_func = {},
                                                   .chunked_table_func = {},
                                                   .lazy_table_func = {},
                                                   .kind = ExternReturnKind::Resource,
@@ -417,10 +424,12 @@ class ExternRegistry {
     /// remaining scalar arguments.  Used for write operations such as csv::write and
     /// parquet::write.
     void register_scalar_table_consumer(std::string name, ScalarKind kind,
-                                        ExternTableConsumerFn func) {
+                                        ExternTableConsumerFn func,
+                                        ExternChunkConsumerFn chunk_func = {}) {
         use_host_runtime_state();
         ExternFunction ef;
         ef.table_consumer_func = std::move(func);
+        ef.chunk_consumer_func = std::move(chunk_func);
         ef.kind = ExternReturnKind::Scalar;
         ef.scalar_kind = kind;
         ef.first_arg_is_table = true;

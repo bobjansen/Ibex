@@ -2,12 +2,14 @@
 # Copyright (C) 2026 Bob Jansen
 """Engine conformance, strict failures, caching and ownership tests."""
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 import gc
 import io
 import math
 import os
 from pathlib import Path
+import random
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -1219,33 +1221,23 @@ class EngineTests(unittest.TestCase):
             self._sink_frame(200_000).write_parquet(many, row_group_size=25_000)
             streamed = (pl.scan_parquet(many).filter(pl.col("day") > 20)
                         .with_columns(value=pl.col("price") * pl.col("day")))
-            batches = []
-
-            def stream(source, on_batch, **kwargs):
-                def counted(batch):
-                    batches.append(batch.num_rows)
-                    on_batch(batch)
-                return execute_stream(source, counted, **kwargs)
-
-            execute_stream = ibex_pyarrow.execute_pipeline_stream
-            with patch.object(ibex_pyarrow, "execute_pipeline_stream", side_effect=stream) as run, \
-                    patch.object(ibex_pyarrow, "execute_pipeline", wraps=ibex_pyarrow.execute_pipeline) as whole:
+            with patch.object(ibex_pyarrow, "execute_pipeline_parquet",
+                              wraps=ibex_pyarrow.execute_pipeline_parquet) as native, \
+                    patch.object(ibex_pyarrow, "execute_pipeline_stream") as python_stream, \
+                    patch.object(ibex_pyarrow, "execute_pipeline") as whole:
                 self.assertIsNone(streamed.sink_parquet(ibex_path, engine=self.engine))
-            # The query ran in Ibex, once, and its result reached Polars' writer
-            # in several batches as it ran; Polars only wrote it.
-            self.assertEqual(run.call_count, 1)
-            self.assertEqual(whole.call_count, 0)
-            self.assertGreater(len(batches), 1)
+            self.assertEqual(native.call_count, 1)
+            python_stream.assert_not_called()
+            whole.assert_not_called()
             streamed.sink_parquet(polars_path, engine="streaming")
             assert_frame_equal(pl.read_parquet(ibex_path), pl.read_parquet(polars_path))
             self.assertTrue(pq.read_schema(ibex_path).equals(pq.read_schema(polars_path),
-                                                             check_metadata=True))
+                                                             check_metadata=False))
             self.assertIsNone(query.sink_parquet(ibex_path, engine=self.engine))
             query.sink_parquet(polars_path, engine="streaming")
             assert_frame_equal(pl.read_parquet(ibex_path), pl.read_parquet(polars_path))
-            # The same file schema, Polars' own metadata included.
             self.assertTrue(pq.read_schema(ibex_path).equals(pq.read_schema(polars_path),
-                                                             check_metadata=True))
+                                                             check_metadata=False))
             # An in-memory source with a Datetime column (temporal Parquet
             # scans are not supported yet).
             frame = self._sink_frame().with_columns(
@@ -1255,7 +1247,7 @@ class EngineTests(unittest.TestCase):
             timed.sink_parquet(polars_path, engine="streaming")
             assert_frame_equal(pl.read_parquet(ibex_path), pl.read_parquet(polars_path))
             self.assertTrue(pq.read_schema(ibex_path).equals(pq.read_schema(polars_path),
-                                                             check_metadata=True))
+                                                             check_metadata=False))
             # A group by written the same way.
             grouped = query.group_by("venue", "symbol").agg(pl.sum("value"), pl.len()).sort("venue", "symbol")
             grouped.sink_parquet(ibex_path, engine=self.engine)
@@ -1313,6 +1305,99 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(codes.to_list(), [2, 0, 1, None, 3, 4, 6])
         self.assertEqual(labels.gather(codes).to_list(), ["c", "a", "b", None, "c", "a", "b"])
 
+    @unittest.skipUnless(hasattr(ibex_pyarrow, "execute_pipeline_parquet"),
+                         "native Parquet writer is unavailable")
+    def test_sink_parquet_native_types_and_row_group_boundaries(self):
+        rng = random.Random(913)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "native.parquet"
+            for size in (0, 1, 257, 258, 1_555):
+                with self.subTest(rows=size):
+                    def array(dtype, value):
+                        return pa.array([None if i % 13 == 12 else value(i)
+                                         for i in range(size)], type=dtype)
+
+                    ints = array(pa.int32(), lambda i: i * 3 - 10)
+                    category = array(pa.string(), lambda i: f"label{i % 5}").dictionary_encode()
+                    table = pa.table({
+                        "required": pa.array(range(size), type=pa.int64()),
+                        "ints": ints,
+                        "random": array(pa.float64(), lambda _: rng.random()),
+                        "flag": array(pa.bool_(), lambda i: i % 3 == 0),
+                        "long_text": array(pa.large_string(), lambda i: "x" * 32_768 if i == 256 else str(i)),
+                        "all_null": pa.nulls(size, type=pa.large_string()),
+                        "category": category,
+                        "date": array(pa.date32(), lambda i: date(2020, 1, 1) + timedelta(days=i)),
+                        "stamp": array(pa.timestamp("ns", "Europe/Amsterdam"),
+                                       lambda i: datetime(2020, 1, 1, tzinfo=timezone.utc) +
+                                       timedelta(microseconds=i)),
+                        "small_decimal": array(pa.decimal128(7, 2), lambda i: Decimal(i).scaleb(-2)),
+                        "medium_decimal": array(pa.decimal128(15, 3), lambda i: Decimal(i).scaleb(-3)),
+                        "large_decimal": array(pa.decimal128(23, 3), lambda i: Decimal(i).scaleb(-3)),
+                    })
+                    schema = table.schema.set(0, table.schema.field(0).with_nullable(False))
+                    batch = pa.record_batch([
+                        column.combine_chunks().cast(pa.string())
+                        if pa.types.is_large_string(column.type) else column.combine_chunks()
+                        for column in table.columns
+                    ], names=table.column_names)
+                    ibex_pyarrow.execute_pipeline_parquet(
+                        "t;", str(target), schema.__arrow_c_schema__(), tables={"t": batch},
+                        row_group_size=257, data_page_size=4096,
+                    )
+                    file = pq.ParquetFile(target)
+                    self.assertTrue(schema.equals(file.schema_arrow))
+                    self.assertEqual(file.read().to_pydict(), table.to_pydict())
+                    self.assertEqual(file.metadata.num_row_groups, (size + 256) // 257)
+                    self.assertIn(b"ARROW:schema", file.metadata.metadata)
+                    if size:
+                        group = file.metadata.row_group(0)
+                        self.assertEqual(group.column(0).statistics.min, 0)
+                        self.assertEqual(group.column(1).statistics.null_count, min(size, 257) // 13)
+                        self.assertEqual(group.column(0).compression, "ZSTD")
+                        self.assertEqual(group.column(1).physical_type, "INT32")
+                        self.assertEqual(group.column(9).physical_type, "INT32")
+                        self.assertEqual(group.column(10).physical_type, "INT64")
+                        self.assertEqual(group.column(11).physical_type, "FIXED_LEN_BYTE_ARRAY")
+                        self.assertIn("RLE_DICTIONARY", group.column(6).encodings)
+                        if size >= 257:
+                            self.assertNotIn("RLE_DICTIONARY", group.column(2).encodings)
+
+            preserved = target.read_bytes()
+            bad = pa.record_batch([pa.array([0, None])], names=["required"])
+            required = pa.schema([pa.field("required", pa.int64(), nullable=False)])
+            with self.assertRaisesRegex(RuntimeError, "null in a required column"):
+                ibex_pyarrow.execute_pipeline_parquet(
+                    "t;", str(target), required.__arrow_c_schema__(), tables={"t": bad},
+                    row_group_size=1,
+                )
+            self.assertEqual(target.read_bytes(), preserved)
+            self.assertEqual(list(Path(directory).iterdir()), [target])
+
+            ticks = pa.record_batch([pa.array([-1501, -999, 999, 1501])], names=["stamp"])
+            micros = pa.schema([pa.field("stamp", pa.timestamp("us", "UTC"))])
+            ibex_pyarrow.execute_pipeline_parquet(
+                "t;", str(target), micros.__arrow_c_schema__(), tables={"t": ticks},
+            )
+            self.assertEqual(pq.read_table(target)["stamp"].cast(pa.int64()).to_pylist(),
+                             [-2, -1, 0, 1])
+
+    @unittest.skipUnless(hasattr(ibex_pyarrow, "execute_pipeline_parquet"),
+                         "native Parquet writer is unavailable")
+    def test_sink_parquet_is_byte_identical_across_scan_batches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            frame = self._sink_frame(60_321)
+            output = []
+            for length in (60_321, 7_001):
+                source = directory / f"input-{length}.parquet"
+                target = directory / f"output-{length}.parquet"
+                frame.write_parquet(source, row_group_size=length)
+                query = pl.scan_parquet(source).filter(pl.col("day") > 20)
+                query.sink_parquet(target, engine=self.engine, row_group_size=11_003)
+                output.append(target.read_bytes())
+            self.assertEqual(*output)
+
     def test_sink_parquet_passes_writer_options_and_targets_through(self):
         with tempfile.TemporaryDirectory() as directory:
             query = self._sink_source(directory)
@@ -1327,7 +1412,11 @@ class EngineTests(unittest.TestCase):
             buffer = io.BytesIO()
             query.sink_parquet(buffer, engine=self.engine)
             buffer.seek(0)
-            assert_frame_equal(pl.read_parquet(buffer), query.collect(engine="streaming"))
+            expected = query.collect(engine="streaming")
+            assert_frame_equal(pl.read_parquet(buffer), expected)
+            query.sink_parquet(path, engine=self.engine, compression="lz4")
+            self.assertEqual(pq.ParquetFile(path).metadata.row_group(0).column(0).compression, "LZ4")
+            assert_frame_equal(pl.read_parquet(path), expected)
 
     def test_sink_parquet_under_ibex_engine_affinity(self):
         # With IbexEngine as the engine affinity, a bare internal collect is
@@ -1375,7 +1464,7 @@ class EngineTests(unittest.TestCase):
             empty.sink_parquet(polars_path, engine="streaming")
             assert_frame_equal(pl.read_parquet(ibex_path), pl.read_parquet(polars_path))
             self.assertTrue(pq.read_schema(ibex_path).equals(pq.read_schema(polars_path),
-                                                             check_metadata=True))
+                                                             check_metadata=False))
             # The writer fails while Ibex is still producing: the error is
             # Polars', the query stops, and the engine runs the next one.
             with self.assertRaises(Exception):

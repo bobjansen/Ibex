@@ -37,6 +37,7 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <array>
 #include <arrow/api.h>
 #include <arrow/filesystem/filesystem.h>
 #include <arrow/util/config.h>
@@ -44,6 +45,8 @@
 #include <arrow/filesystem/s3fs.h>
 #endif
 #include <arrow/io/api.h>
+#include <arrow/ipc/writer.h>
+#include <arrow/util/base64.h>
 #include <arrow/util/bitmap_ops.h>
 #include <arrow/util/formatting.h>
 #include <atomic>
@@ -54,6 +57,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #if !defined(IBEX_PARQUET_LOCAL_ONLY)
 #include <curl/curl.h>
 #endif
@@ -61,6 +65,7 @@
 #include <dlfcn.h>
 #endif
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <list>
 #include <map>
@@ -73,7 +78,9 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/column_page.h>
 #include <parquet/column_reader.h>
+#include <parquet/column_writer.h>
 #include <parquet/file_reader.h>
+#include <parquet/file_writer.h>
 #include <parquet/page_index.h>
 #include <parquet/statistics.h>
 #include <random>
@@ -5400,16 +5407,7 @@ class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
 
 namespace {
 
-/// Largest amount of character data to put in one Arrow string chunk.
-///
-/// arrow::StringBuilder uses int32 offsets, so a single StringArray cannot hold
-/// more than 2^31-1 bytes of characters. Building a whole column as one array
-/// therefore failed outright on any string column above 2 GB -- for TPC-H that
-/// is lineitem.l_comment at about SF-14. The column is split into chunks under
-/// this budget instead, which keeps the Parquet logical type plain UTF8 (a
-/// LargeStringBuilder would write large_string and change the documented type
-/// mapping). Well under the hard limit so a single long value cannot straddle
-/// it.
+/// Bound the amount of text passed to the page encoder at one time.
 inline auto string_chunk_budget() -> std::size_t {
     // Overridable only so tests can force many chunk boundaries without
     // building a multi-gigabyte column; read once, never in the append loop.
@@ -5422,205 +5420,6 @@ inline auto string_chunk_budget() -> std::size_t {
         return static_cast<std::size_t>(1024ULL * 1024 * 1024);
     }();
     return budget;
-}
-
-/// Wrap one finished array as a single-chunk ChunkedArray.
-inline auto single_chunk(std::shared_ptr<arrow::Array> arr)
-    -> std::shared_ptr<arrow::ChunkedArray> {
-    auto type = arr->type();
-    return std::make_shared<arrow::ChunkedArray>(arrow::ArrayVector{std::move(arr)},
-                                                 std::move(type));
-}
-
-/// Build a chunked UTF8 array from `n` values, splitting chunks so no single
-/// StringArray exceeds the int32 offset limit. `get` returns the i'th value;
-/// `is_null_at` says whether it is null.
-template <typename GetFn, typename IsNullFn>
-inline auto build_string_chunks(std::size_t n, GetFn get, IsNullFn is_null_at, const char* what)
-    -> std::shared_ptr<arrow::ChunkedArray> {
-    arrow::ArrayVector chunks;
-    arrow::StringBuilder builder;
-    std::size_t pending = 0;
-
-    auto flush = [&]() {
-        std::shared_ptr<arrow::Array> arr;
-        auto st = builder.Finish(&arr);
-        if (!st.ok())
-            throw std::runtime_error(std::string("parquet::write: finish ") + what + " failed");
-        chunks.push_back(std::move(arr));
-        pending = 0;
-    };
-
-    for (std::size_t i = 0; i < n; ++i) {
-        arrow::Status st;
-        if (is_null_at(i)) {
-            st = builder.AppendNull();
-        } else {
-            auto sv = get(i);
-            // Close the chunk BEFORE the append that would overflow it, so a
-            // value is never split across two chunks.
-            if (pending != 0 && pending + sv.size() > string_chunk_budget())
-                flush();
-            st = builder.Append(sv.data(), static_cast<int32_t>(sv.size()));
-            pending += sv.size();
-        }
-        if (!st.ok())
-            throw std::runtime_error(std::string("parquet::write: append ") + what + " failed");
-    }
-    // Always flush: an all-null or empty column still needs one chunk so the
-    // ChunkedArray has a length and the table's columns stay aligned.
-    flush();
-
-    return std::make_shared<arrow::ChunkedArray>(std::move(chunks), arrow::utf8());
-}
-
-/// Build an Arrow column from an ibex ColumnEntry, preserving null values.
-///
-/// Returns a ChunkedArray because string columns above the int32 offset limit
-/// must span several arrays; fixed-width types are returned as a single chunk.
-inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
-    -> std::shared_ptr<arrow::ChunkedArray> {
-    return std::visit(
-        [&](const auto& col) -> std::shared_ptr<arrow::ChunkedArray> {
-            using ColT = std::decay_t<decltype(col)>;
-            const std::size_t n = col.size();
-
-            if constexpr (std::is_same_v<ColT, ibex::Column<std::int64_t>>) {
-                arrow::Int64Builder builder;
-                auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: reserve failed");
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (ibex::runtime::is_null(entry, i)) {
-                        st = builder.AppendNull();
-                    } else {
-                        st = builder.Append(col[i]);
-                    }
-                    if (!st.ok())
-                        throw std::runtime_error("parquet::write: append int64 failed");
-                }
-                std::shared_ptr<arrow::Array> arr;
-                st = builder.Finish(&arr);
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: finish int64 failed");
-                return single_chunk(std::move(arr));
-            } else if constexpr (std::is_same_v<ColT, ibex::Column<double>>) {
-                arrow::DoubleBuilder builder;
-                auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: reserve failed");
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (ibex::runtime::is_null(entry, i)) {
-                        st = builder.AppendNull();
-                    } else {
-                        st = builder.Append(col[i]);
-                    }
-                    if (!st.ok())
-                        throw std::runtime_error("parquet::write: append double failed");
-                }
-                std::shared_ptr<arrow::Array> arr;
-                st = builder.Finish(&arr);
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: finish double failed");
-                return single_chunk(std::move(arr));
-            } else if constexpr (std::is_same_v<ColT, ibex::Column<std::string>>) {
-                return build_string_chunks(
-                    n, [&](std::size_t i) { return col[i]; },
-                    [&](std::size_t i) { return ibex::runtime::is_null(entry, i); }, "string");
-            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Categorical>>) {
-                // string_view from the dictionary
-                return build_string_chunks(
-                    n, [&](std::size_t i) { return col[i]; },
-                    [&](std::size_t i) { return ibex::runtime::is_null(entry, i); }, "categorical");
-            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Date>>) {
-                arrow::Date32Builder builder;
-                auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: reserve failed");
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (ibex::runtime::is_null(entry, i)) {
-                        st = builder.AppendNull();
-                    } else {
-                        st = builder.Append(col[i].days);
-                    }
-                    if (!st.ok())
-                        throw std::runtime_error("parquet::write: append date failed");
-                }
-                std::shared_ptr<arrow::Array> arr;
-                st = builder.Finish(&arr);
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: finish date failed");
-                return single_chunk(std::move(arr));
-            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>) {
-                arrow::TimestampBuilder builder(arrow::timestamp(arrow::TimeUnit::NANO),
-                                                arrow::default_memory_pool());
-                auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: reserve failed");
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (ibex::runtime::is_null(entry, i)) {
-                        st = builder.AppendNull();
-                    } else {
-                        st = builder.Append(col[i].nanos);
-                    }
-                    if (!st.ok())
-                        throw std::runtime_error("parquet::write: append timestamp failed");
-                }
-                std::shared_ptr<arrow::Array> arr;
-                st = builder.Finish(&arr);
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: finish timestamp failed");
-                return single_chunk(std::move(arr));
-            } else if constexpr (std::is_same_v<ColT, ibex::Column<bool>>) {
-                arrow::BooleanBuilder builder;
-                auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: reserve failed");
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (ibex::runtime::is_null(entry, i)) {
-                        st = builder.AppendNull();
-                    } else {
-                        st = builder.Append(col[i]);
-                    }
-                    if (!st.ok())
-                        throw std::runtime_error("parquet::write: append bool failed");
-                }
-                std::shared_ptr<arrow::Array> arr;
-                st = builder.Finish(&arr);
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: finish bool failed");
-                return single_chunk(std::move(arr));
-            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Decimal>>) {
-                // decimal128 with the column's own precision and scale; the
-                // units are written as-is, so the values round-trip exactly.
-                const ibex::DecimalType t = ibex::runtime::decimal_type_of(col);
-                arrow::Decimal128Builder builder(arrow::decimal128(t.precision, t.scale),
-                                                 arrow::default_memory_pool());
-                auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: reserve failed");
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (ibex::runtime::is_null(entry, i)) {
-                        st = builder.AppendNull();
-                    } else {
-                        const ibex::Int128 units = col[i].units;
-                        st = builder.Append(arrow::Decimal128(static_cast<int64_t>(units >> 64),
-                                                              static_cast<uint64_t>(units)));
-                    }
-                    if (!st.ok())
-                        throw std::runtime_error("parquet::write: append decimal failed");
-                }
-                std::shared_ptr<arrow::Array> arr;
-                st = builder.Finish(&arr);
-                if (!st.ok())
-                    throw std::runtime_error("parquet::write: finish decimal failed");
-                return single_chunk(std::move(arr));
-            } else {
-                static_assert(std::is_same_v<ColT, void>,
-                              "unhandled column type in parquet::write");
-            }
-        },
-        *entry.column);
 }
 
 /// Derive an Arrow field type from an ibex ColumnEntry.
@@ -5636,15 +5435,18 @@ inline auto column_to_arrow_field(const ibex::runtime::ColumnEntry& entry)
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Date>>) {
                 return arrow::field(entry.name, arrow::date32());
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>) {
-                return arrow::field(entry.name, arrow::timestamp(arrow::TimeUnit::NANO));
+                const auto zone = col.meta().zone;
+                return arrow::field(entry.name, arrow::timestamp(arrow::TimeUnit::NANO,
+                                                                 zone ? zone_name(*zone) : "UTC"));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<bool>>) {
                 return arrow::field(entry.name, arrow::boolean());
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Decimal>>) {
                 const ibex::DecimalType t = ibex::runtime::decimal_type_of(col);
                 return arrow::field(entry.name, arrow::decimal128(t.precision, t.scale));
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Categorical>>) {
+                return arrow::field(entry.name, arrow::dictionary(arrow::int32(), arrow::utf8()));
             } else {
-                // string, categorical → UTF-8
-                return arrow::field(entry.name, arrow::utf8());
+                return arrow::field(entry.name, arrow::large_utf8());
             }
         },
         *entry.column);
@@ -5656,63 +5458,844 @@ inline auto column_to_arrow_field(const ibex::runtime::ColumnEntry& entry)
 // `::parquet`.
 namespace ibex::ext::parquet {
 
-/// Write `table` to a Parquet file at `path`.
-///
-/// Column type mappings:
-///   Int64       → Parquet INT64
-///   Double      → Parquet DOUBLE
-///   String      → Parquet UTF8
-///   Categorical → Parquet UTF8 (dictionary decoded)
-///   Date        → Parquet DATE32
-///   Timestamp   → Parquet TIMESTAMP (nanoseconds, UTC)
-///   Bool        → Parquet BOOLEAN
-///   Decimal     → Parquet DECIMAL (Arrow decimal128, precision and scale kept)
-///
-/// Returns the number of rows written.
-inline auto write(const ibex::runtime::Table& table, std::string_view path) -> std::int64_t {
-    const auto& cols = table.columns;
+/// Encode independent column chunks and commit a bounded window in file order.
+class Writer {
+    class Output {
+       public:
+        ~Output() {
+            if (!directory_.empty()) {
+                std::error_code error;
+                std::filesystem::remove(directory_ / "data", error);
+                std::filesystem::remove(directory_, error);
+            }
+        }
 
-    // Build Arrow schema
-    std::vector<std::shared_ptr<arrow::Field>> fields;
-    fields.reserve(cols.size());
-    for (const auto& entry : cols) {
-        fields.push_back(column_to_arrow_field(entry));
+        auto open(std::string_view path, bool create_parents)
+            -> std::shared_ptr<arrow::io::FileOutputStream> {
+            target_ = std::filesystem::path(path);
+            const auto parent =
+                target_.has_parent_path() ? target_.parent_path() : std::filesystem::path(".");
+            if (create_parents) {
+                std::filesystem::create_directories(parent);
+            }
+            if (std::filesystem::is_directory(target_)) {
+                throw std::invalid_argument("parquet::write: output path is a directory");
+            }
+            // Stage beside the destination so the file becomes visible with a
+            // complete footer, even if the input plan reads the same path.
+            static std::atomic<std::uint64_t> next{0};
+            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            for (;;) {
+                auto candidate =
+                    parent / (".ibex-parquet-" + std::to_string(now) + "-" +
+                              std::to_string(next.fetch_add(1, std::memory_order_relaxed)));
+                if (std::filesystem::create_directory(candidate)) {
+                    directory_ = std::move(candidate);
+                    break;
+                }
+            }
+            return value(arrow::io::FileOutputStream::Open((directory_ / "data").string()));
+        }
+
+        void publish() { std::filesystem::rename(directory_ / "data", target_); }
+
+       private:
+        std::filesystem::path directory_;
+        std::filesystem::path target_;
+    };
+
+   public:
+    Writer(std::string_view path, std::string_view compression, int level, int64_t group_rows,
+           bool statistics, int64_t page_size = 1024 * 1024, bool create_parents = true)
+        : group_rows_(static_cast<std::size_t>(group_rows)),
+          workers_(runtime::on_worker_pool_thread() ? 1 : runtime::compute_thread_count()) {
+        if (group_rows <= 0 || page_size <= 0) {
+            throw std::invalid_argument(
+                "parquet::write: row group and page sizes must be positive");
+        }
+        auto codec = arrow::Compression::UNCOMPRESSED;
+        if (compression == "zstd") {
+            codec = arrow::Compression::ZSTD;
+        } else if (compression == "snappy") {
+            codec = arrow::Compression::SNAPPY;
+        } else if (compression != "uncompressed") {
+            throw std::invalid_argument("parquet::write: unsupported compression " +
+                                        std::string(compression));
+        }
+        ::parquet::WriterProperties::Builder builder;
+        builder.compression(codec)
+            ->data_pagesize(page_size)
+            ->disable_write_page_index()
+            ->enable_store_decimal_as_integer()
+            ->version(::parquet::ParquetVersion::PARQUET_2_6);
+        if (codec == arrow::Compression::ZSTD) {
+            builder.compression_level(level);
+            value(arrow::util::Codec::Create(codec, level));
+        }
+        if (!statistics) {
+            builder.disable_statistics();
+        }
+        props_ = builder.build();
+        plain_props_ = builder.disable_dictionary()->build();
+        dictionary_props_ = builder.enable_dictionary()->disable_statistics()->build();
+        arrow_props_ = ::parquet::default_arrow_writer_properties();
+
+        sink_ = output_.open(path, create_parents);
+        check(sink_->Write("PAR1", 4));
     }
-    auto schema = arrow::schema(std::move(fields));
 
-    // Build Arrow columns. Chunked, because a string column over 2 GB cannot be
-    // one array (int32 offsets); Table::Make takes ChunkedArrays directly.
-    std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays;
-    arrays.reserve(cols.size());
-    for (const auto& entry : cols) {
-        arrays.push_back(build_arrow_array(entry));
+    void set_schema(std::shared_ptr<arrow::Schema> schema) {
+        schema_ = std::move(schema);
+        check(
+            ::parquet::arrow::ToParquetSchema(schema_.get(), *props_, *arrow_props_, &descriptor_));
+        if (descriptor_->num_columns() != schema_->num_fields()) {
+            throw std::invalid_argument("parquet::write: expected a flat schema");
+        }
+        footer_ = ::parquet::FileMetaDataBuilder::Make(descriptor_.get(), props_);
     }
 
-    auto arrow_table = arrow::Table::Make(schema, arrays, static_cast<int64_t>(table.rows()));
-
-    // Open output file, creating the parent directory if it does not exist yet
-    // (so `fs::csv_dir_to_parquet` can write into a fresh output directory).
-    if (const std::filesystem::path parent = std::filesystem::path(path).parent_path();
-        !parent.empty()) {
-        std::error_code mkdir_ec;
-        std::filesystem::create_directories(parent, mkdir_ec);
+    void push(runtime::Table table) {
+        if (!schema_) {
+            std::vector<std::shared_ptr<arrow::Field>> fields;
+            fields.reserve(table.columns.size());
+            for (const auto& column : table.columns) {
+                fields.push_back(column_to_arrow_field(column));
+            }
+            set_schema(arrow::schema(std::move(fields)));
+        }
+        if (schema_->num_fields() == 0 && table.rows() != 0) {
+            throw std::invalid_argument("parquet::write: cannot store rows without columns");
+        }
+        std::vector<const runtime::ColumnEntry*> columns;
+        columns.reserve(static_cast<std::size_t>(schema_->num_fields()));
+        const auto input = std::make_shared<const runtime::Table>(std::move(table));
+        for (const auto& field : schema_->fields()) {
+            const auto found = input->index.find(field->name());
+            if (found == input->index.end()) {
+                throw std::invalid_argument("parquet::write: missing column " + field->name());
+            }
+            columns.push_back(&input->columns[found->second]);
+        }
+        for (std::size_t start = 0; start < input->rows();) {
+            const auto count = std::min(input->rows() - start, group_rows_ - pending_.rows);
+            pending_.pieces.push_back({input, columns, start, count});
+            pending_.rows += count;
+            start += count;
+            if (pending_.rows == group_rows_) {
+                seal_group();
+            }
+        }
     }
-    auto sink_result = arrow::io::FileOutputStream::Open(std::string(path));
-    if (!sink_result.ok()) {
-        throw std::runtime_error("parquet::write: cannot open for writing: " + std::string(path) +
-                                 " (" + sink_result.status().ToString() + ")");
+
+    auto finish() -> int64_t {
+        if (!schema_) {
+            push({});
+        }
+        if (pending_.rows != 0) {
+            seal_group();
+        }
+        while (!groups_.empty()) {
+            commit_next_group();
+        }
+        if (tasks_) {
+            tasks_->wait();
+        }
+        const auto serialized = value(arrow::ipc::SerializeSchema(*schema_));
+        const auto metadata = arrow::key_value_metadata(
+            {"ARROW:schema"}, {arrow::util::base64_encode(serialized->ToString())});
+        ::parquet::WriteFileMetaData(*footer_->Finish(metadata), sink_.get());
+        check(sink_->Close());
+        output_.publish();
+        return rows_;
     }
 
-    // Write Parquet file
-    auto st = ::parquet::arrow::WriteTable(*arrow_table, arrow::default_memory_pool(),
-                                           sink_result.ValueOrDie(),
-                                           /*chunk_size=*/static_cast<int64_t>(64) * 1024 * 1024);
-    if (!st.ok()) {
-        throw std::runtime_error("parquet::write: failed to write: " + std::string(path) + " (" +
-                                 st.ToString() + ")");
+   private:
+    struct Piece {
+        std::shared_ptr<const runtime::Table> table;
+        std::vector<const runtime::ColumnEntry*> columns;
+        std::size_t start;
+        std::size_t count;
+    };
+
+    struct Group {
+        std::vector<Piece> pieces;
+        std::size_t rows = 0;
+    };
+
+    struct Chunk {
+        std::shared_ptr<arrow::Buffer> bytes;
+        std::unique_ptr<::parquet::ColumnChunkMetaDataBuilder> builder;
+    };
+
+    struct EncodingGroup {
+        Group input;
+        std::vector<std::future<Chunk>> output;
+    };
+
+    static void check(const arrow::Status& status) {
+        if (!status.ok()) {
+            throw std::runtime_error("parquet::write: " + status.ToString());
+        }
     }
 
-    return static_cast<std::int64_t>(table.rows());
+    template <typename T>
+    static auto value(arrow::Result<T> result) -> T {
+        check(result.status());
+        return std::move(result).ValueOrDie();
+    }
+
+    void seal_group() {
+        const auto columns = static_cast<std::size_t>(descriptor_->num_columns());
+        if (workers_ == 1) {
+            auto input = std::exchange(pending_, {});
+            commit_group(input.rows, columns, [&](std::size_t i) { return encode(input, i); });
+            return;
+        }
+        if (!tasks_) {
+            tasks_.emplace(runtime::process_worker_pool().task_group(workers_));
+        }
+        auto& group =
+            groups_.emplace_back(std::exchange(pending_, {}), std::vector<std::future<Chunk>>{});
+        group.output.reserve(columns);
+        for (std::size_t i = 0; i < columns; ++i) {
+            auto ready = std::make_shared<std::promise<Chunk>>();
+            group.output.push_back(ready->get_future());
+            tasks_->submit([this, &input = group.input, ready, i] {
+                try {
+                    ready->set_value(encode(input, i));
+                } catch (...) {
+                    ready->set_exception(std::current_exception());
+                }
+            });
+        }
+        if (groups_.size() == workers_ * 2) {
+            commit_next_group();
+        }
+        const auto ready = [](const std::future<Chunk>& column) {
+            return column.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        };
+        while (!groups_.empty() && std::ranges::all_of(groups_.front().output, ready)) {
+            commit_next_group();
+        }
+    }
+
+    template <typename T, typename Builder, typename Convert>
+    static auto build_values(const Group& group, std::size_t index, Builder& builder,
+                             Convert convert) -> std::shared_ptr<arrow::Array> {
+        if constexpr (std::is_same_v<Convert, std::identity> && !std::is_same_v<T, bool>) {
+            if (group.pieces.size() == 1) {
+                const auto& piece = group.pieces.front();
+                const auto& entry = *piece.columns[index];
+                if (const auto* input = std::get_if<ibex::Column<T>>(entry.column.get());
+                    input && !entry.validity && !input->is_compact_int32()) {
+                    const auto length = static_cast<int64_t>(piece.count);
+                    auto values = arrow::Buffer::Wrap(input->data() + piece.start, length);
+                    return arrow::MakeArray(
+                        arrow::ArrayData::Make(builder.type(), length, {nullptr, values}, 0));
+                }
+            }
+        }
+        check(builder.Reserve(static_cast<int64_t>(group.rows)));
+        for (const auto& piece : group.pieces) {
+            const auto& entry = *piece.columns[index];
+            const auto* input = std::get_if<ibex::Column<T>>(entry.column.get());
+            if (!input) {
+                throw std::invalid_argument("parquet::write: incompatible column " + entry.name);
+            }
+            if constexpr (std::is_same_v<Convert, std::identity> && !std::is_same_v<T, bool>) {
+                if (!entry.validity && !input->is_compact_int32()) {
+                    check(builder.AppendValues(input->data() + piece.start,
+                                               static_cast<int64_t>(piece.count)));
+                    continue;
+                }
+            }
+            for (std::size_t row = piece.start; row < piece.start + piece.count; ++row) {
+                if (runtime::is_null(entry, row)) {
+                    builder.UnsafeAppendNull();
+                } else {
+                    builder.UnsafeAppend(convert((*input)[row]));
+                }
+            }
+        }
+        std::shared_ptr<arrow::Array> result;
+        check(builder.Finish(&result));
+        return result;
+    }
+
+    template <typename Builder>
+    static auto build_integer(const Group& group, std::size_t index)
+        -> std::shared_ptr<arrow::Array> {
+        Builder builder;
+        using Value = typename Builder::value_type;
+        if constexpr (std::is_same_v<Value, int64_t>) {
+            return build_values<int64_t>(group, index, builder, std::identity{});
+        } else {
+            if constexpr (std::is_same_v<Value, int32_t>) {
+                if (group.pieces.size() == 1) {
+                    const auto& piece = group.pieces.front();
+                    const auto& entry = *piece.columns[index];
+                    if (const auto* input = std::get_if<ibex::Column<int64_t>>(entry.column.get());
+                        input && !entry.validity && input->is_compact_int32()) {
+                        const auto length = static_cast<int64_t>(piece.count);
+                        auto values =
+                            arrow::Buffer::Wrap(input->compact_int32_data() + piece.start, length);
+                        return std::make_shared<arrow::Int32Array>(length, values);
+                    }
+                }
+            }
+            return build_values<int64_t>(group, index, builder, [](int64_t val) {
+                if (!std::in_range<Value>(val)) {
+                    throw std::overflow_error("parquet::write: integer value out of range");
+                }
+                return static_cast<Value>(val);
+            });
+        }
+    }
+
+    static auto text_at(const runtime::ColumnEntry& entry, std::size_t row) -> std::string_view {
+        if (const auto* strings = std::get_if<ibex::Column<std::string>>(entry.column.get())) {
+            return (*strings)[row];
+        }
+        if (const auto* cats = std::get_if<ibex::Column<Categorical>>(entry.column.get())) {
+            return (*cats)[row];
+        }
+        throw std::invalid_argument("parquet::write: incompatible text column " + entry.name);
+    }
+
+    static auto text_dictionary_pays(const Group& group, std::size_t index) -> bool {
+        const auto count = std::min<std::size_t>(1024, group.rows);
+        const auto stride = group.rows / count;
+        robin_hood::unordered_flat_set<std::string_view> unique;
+        std::size_t piece_start = 0;
+        std::size_t sample = 0;
+        std::size_t valid = 0;
+        for (const auto& piece : group.pieces) {
+            const auto& entry = *piece.columns[index];
+            const auto end = piece_start + piece.count;
+            for (; sample < count && sample * stride < end; ++sample) {
+                const auto row = piece.start + (sample * stride - piece_start);
+                if (!runtime::is_null(entry, row)) {
+                    unique.insert(text_at(entry, row));
+                    ++valid;
+                }
+            }
+            piece_start = end;
+        }
+        return valid < 32 || unique.size() <= valid * 98 / 100;
+    }
+
+    auto build_text_dictionary(const Group& group, std::size_t index, bool categorical) const
+        -> std::shared_ptr<arrow::Array> {
+        if (!categorical && !text_dictionary_pays(group, index)) {
+            return {};
+        }
+        arrow::Int32Builder indices;
+        arrow::StringBuilder dictionary;
+        check(indices.Reserve(static_cast<int64_t>(group.rows)));
+        robin_hood::unordered_flat_map<std::string_view, int32_t> seen;
+        const auto intern = [&](std::string_view label) {
+            const auto [it, inserted] =
+                seen.try_emplace(label, static_cast<int32_t>(dictionary.length()));
+            if (inserted) {
+                check(dictionary.Append(label));
+            }
+            return it->second;
+        };
+        for (const auto& piece : group.pieces) {
+            const auto& entry = *piece.columns[index];
+            // Translate each local code at most once. First occurrence in the
+            // row group determines the file dictionary order across chunks.
+            const auto* cats = std::get_if<ibex::Column<Categorical>>(entry.column.get());
+            std::vector<int32_t> translated(cats ? cats->dictionary_size() : 0, -1);
+            for (std::size_t row = piece.start; row < piece.start + piece.count; ++row) {
+                if (runtime::is_null(entry, row)) {
+                    indices.UnsafeAppendNull();
+                    continue;
+                }
+                int32_t target = -1;
+                if (cats) {
+                    auto& cached = translated[static_cast<std::size_t>(cats->code_at(row))];
+                    if (cached < 0) {
+                        cached = intern((*cats)[row]);
+                    }
+                    target = cached;
+                } else {
+                    target = intern(text_at(entry, row));
+                }
+                if (!categorical && dictionary.value_data_length() + dictionary.length() * 4 >
+                                        props_->dictionary_pagesize_limit()) {
+                    return {};
+                }
+                indices.UnsafeAppend(target);
+            }
+        }
+        std::shared_ptr<arrow::Array> codes;
+        std::shared_ptr<arrow::Array> labels;
+        check(indices.Finish(&codes));
+        check(dictionary.Finish(&labels));
+        return std::make_shared<arrow::DictionaryArray>(
+            arrow::dictionary(arrow::int32(), arrow::utf8()), codes, labels);
+    }
+
+    static auto build_booleans(const Group& group, std::size_t index)
+        -> std::shared_ptr<arrow::BooleanArray> {
+        const auto rows = static_cast<int64_t>(group.rows);
+        const auto bits = value(arrow::AllocateEmptyBitmap(rows));
+        std::shared_ptr<arrow::Buffer> validity;
+        int64_t output = 0;
+        for (const auto& piece : group.pieces) {
+            const auto& entry = *piece.columns[index];
+            const auto* input = std::get_if<ibex::Column<bool>>(entry.column.get());
+            if (!input) {
+                throw std::invalid_argument("parquet::write: incompatible boolean column " +
+                                            entry.name);
+            }
+            const auto count = static_cast<int64_t>(piece.count);
+            arrow::internal::CopyBitmap(input->buffer_data(),
+                                        static_cast<int64_t>(input->buffer_offset() + piece.start),
+                                        count, bits->mutable_data(), output);
+            if (entry.validity) {
+                if (!validity) {
+                    validity = value(arrow::AllocateEmptyBitmap(rows));
+                    arrow::bit_util::SetBitsTo(validity->mutable_data(), 0, output, true);
+                }
+                arrow::internal::CopyBitmap(
+                    entry.validity->buffer_data(),
+                    static_cast<int64_t>(entry.validity->buffer_offset() + piece.start), count,
+                    validity->mutable_data(), output);
+            } else if (validity) {
+                arrow::bit_util::SetBitsTo(validity->mutable_data(), output, count, true);
+            }
+            output += count;
+        }
+        return std::make_shared<arrow::BooleanArray>(rows, bits, validity,
+                                                     validity ? arrow::kUnknownNullCount : 0);
+    }
+
+    static auto build_strings(const Group& group, std::size_t index) -> arrow::ArrayVector {
+        arrow::ArrayVector arrays;
+        arrow::LargeStringBuilder builder;
+        std::size_t bytes = 0;
+        const auto finish = [&] {
+            std::shared_ptr<arrow::Array> arr;
+            check(builder.Finish(&arr));
+            arrays.push_back(std::move(arr));
+            bytes = 0;
+        };
+        for (const auto& piece : group.pieces) {
+            const auto& entry = *piece.columns[index];
+            const auto append = [&](const auto& col) {
+                for (std::size_t row = piece.start; row < piece.start + piece.count; ++row) {
+                    if (runtime::is_null(entry, row)) {
+                        check(builder.AppendNull());
+                    } else {
+                        const auto label = col[row];
+                        if (label.size() >
+                            static_cast<std::size_t>(std::numeric_limits<int32_t>::max())) {
+                            throw std::overflow_error(
+                                "parquet::write: string exceeds Parquet limit");
+                        }
+                        if (bytes != 0 && bytes + label.size() > string_chunk_budget()) {
+                            finish();
+                        }
+                        check(builder.Append(label));
+                        bytes += label.size();
+                    }
+                }
+            };
+            if (const auto* strings = std::get_if<ibex::Column<std::string>>(entry.column.get())) {
+                append(*strings);
+            } else if (const auto* cats =
+                           std::get_if<ibex::Column<ibex::Categorical>>(entry.column.get())) {
+                append(*cats);
+            } else {
+                throw std::invalid_argument("parquet::write: incompatible text column " +
+                                            entry.name);
+            }
+        }
+        finish();
+        return arrays;
+    }
+
+    auto build_arrays(const Group& group, std::size_t index) const -> arrow::ArrayVector {
+        const auto& type = schema_->field(static_cast<int>(index))->type();
+        switch (type->id()) {
+            case arrow::Type::INT8:
+                return {build_integer<arrow::Int8Builder>(group, index)};
+            case arrow::Type::INT16:
+                return {build_integer<arrow::Int16Builder>(group, index)};
+            case arrow::Type::INT32:
+                return {build_integer<arrow::Int32Builder>(group, index)};
+            case arrow::Type::INT64:
+                return {build_integer<arrow::Int64Builder>(group, index)};
+            case arrow::Type::UINT8:
+                return {build_integer<arrow::UInt8Builder>(group, index)};
+            case arrow::Type::UINT16:
+                return {build_integer<arrow::UInt16Builder>(group, index)};
+            case arrow::Type::UINT32:
+                return {build_integer<arrow::UInt32Builder>(group, index)};
+            case arrow::Type::UINT64:
+                return {build_integer<arrow::UInt64Builder>(group, index)};
+            case arrow::Type::DOUBLE: {
+                arrow::DoubleBuilder builder;
+                return {build_values<double>(group, index, builder, std::identity{})};
+            }
+            case arrow::Type::FLOAT: {
+                arrow::FloatBuilder builder;
+                return {build_values<double>(group, index, builder,
+                                             [](double val) { return static_cast<float>(val); })};
+            }
+            case arrow::Type::BOOL:
+                return {build_booleans(group, index)};
+            case arrow::Type::DATE32: {
+                arrow::Date32Builder builder;
+                return {
+                    build_values<Date>(group, index, builder, [](Date val) { return val.days; })};
+            }
+            case arrow::Type::TIMESTAMP: {
+                const auto unit = static_cast<const arrow::TimestampType&>(*type).unit();
+                const int64_t divisor = unit == arrow::TimeUnit::NANO    ? 1
+                                        : unit == arrow::TimeUnit::MICRO ? 1000
+                                        : unit == arrow::TimeUnit::MILLI ? 1000000
+                                                                         : 1000000000;
+                const auto ticks = [divisor](int64_t nanos) {
+                    const auto truncated = nanos / divisor;
+                    return truncated - static_cast<int64_t>(nanos % divisor < 0);
+                };
+                arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
+                if (std::holds_alternative<ibex::Column<Timestamp>>(
+                        *group.pieces.front().columns[index]->column)) {
+                    return {build_values<Timestamp>(
+                        group, index, builder, [&](Timestamp val) { return ticks(val.nanos); })};
+                }
+                return {build_values<int64_t>(group, index, builder, ticks)};
+            }
+            case arrow::Type::DECIMAL128: {
+                arrow::Decimal128Builder builder(type);
+                return {build_values<Decimal>(group, index, builder, [](Decimal val) {
+                    return arrow::Decimal128(static_cast<int64_t>(val.units >> 64),
+                                             static_cast<uint64_t>(val.units));
+                })};
+            }
+            case arrow::Type::DICTIONARY:
+            case arrow::Type::STRING:
+            case arrow::Type::LARGE_STRING:
+                if (auto dict = build_text_dictionary(group, index,
+                                                      type->id() == arrow::Type::DICTIONARY)) {
+                    return {std::move(dict)};
+                }
+                return build_strings(group, index);
+            default:
+                throw std::invalid_argument("parquet::write: unsupported column type " +
+                                            type->ToString());
+        }
+    }
+
+    template <typename Array, typename Key>
+    static auto dictionary_pays(const Array& array, Key key) -> bool {
+        const auto count = std::min<int64_t>(1024, array.length());
+        if (count < 32) {
+            return true;
+        }
+        robin_hood::unordered_flat_set<decltype(key(array, 0))> unique;
+        // Sampling can encounter most values only once even in a useful
+        // dictionary (for example, 5,000 symbols across 120,000 rows).
+        // Skip hashing the full chunk only for nearly unique samples.
+        const auto stride = array.length() / count;
+        std::size_t valid = 0;
+        for (int64_t i = 0; i < count; ++i) {
+            const auto row = i * stride;
+            if (array.IsValid(row)) {
+                unique.insert(key(array, row));
+                ++valid;
+            }
+        }
+        return valid < 32 || unique.size() <= valid * 98 / 100;
+    }
+
+    static auto dictionary_pays(const arrow::Array& array) -> bool {
+        const auto number = [](const auto& values, int64_t row) { return values.Value(row); };
+        switch (array.type_id()) {
+            case arrow::Type::INT64:
+                return dictionary_pays(static_cast<const arrow::Int64Array&>(array), number);
+            case arrow::Type::INT32:
+                return dictionary_pays(static_cast<const arrow::Int32Array&>(array), number);
+            case arrow::Type::DOUBLE:
+                return dictionary_pays(static_cast<const arrow::DoubleArray&>(array),
+                                       [](const auto& values, int64_t row) {
+                                           return std::bit_cast<uint64_t>(values.Value(row));
+                                       });
+            case arrow::Type::LARGE_STRING:
+                return false;
+            default:
+                return true;
+        }
+    }
+
+    static auto dictionary_statistics(const arrow::DictionaryArray& values, std::size_t max_size)
+        -> ::parquet::EncodedStatistics {
+        const auto& dictionary = static_cast<const arrow::StringArray&>(*values.dictionary());
+        ::parquet::EncodedStatistics stats;
+        stats.set_null_count(values.null_count());
+        if (dictionary.length() != 0) {
+            auto min = dictionary.GetView(0);
+            auto max = min;
+            for (int64_t i = 1; i < dictionary.length(); ++i) {
+                const auto label = dictionary.GetView(i);
+                min = std::min(min, label);
+                max = std::max(max, label);
+            }
+            stats.set_min(std::string(min)).set_max(std::string(max));
+            stats.ApplyStatSizeLimits(max_size);
+        } else {
+            stats.all_null_value = true;
+        }
+        return stats;
+    }
+
+    /// A present flat column can reach PageWriter in its PLAIN representation.
+    /// The only levels needed are one RLE run for each optional data page.
+    template <typename Stats>
+    void write_plain_pages(int64_t rows, const uint8_t* values, int64_t bit_width,
+                           ::parquet::PageWriter& pages,
+                           ::parquet::ColumnChunkMetaDataBuilder& metadata, Stats stats_at) const {
+        const auto* column = metadata.descr();
+        const bool statistics = props_->statistics_enabled(column->path());
+        const bool optional = column->max_definition_level() != 0;
+        // Keep page starts byte-aligned, including for packed Boolean values.
+        const auto limit =
+            std::min<int64_t>(props_->data_pagesize(), std::numeric_limits<int32_t>::max() / 8);
+        const auto page_rows =
+            bit_width == 1 ? limit * 8 : std::max<int64_t>(1, limit / (bit_width / 8));
+        std::shared_ptr<arrow::ResizableBuffer> payload;
+        std::shared_ptr<arrow::ResizableBuffer> compressed;
+        if (optional) {
+            payload = value(arrow::AllocateResizableBuffer(0));
+        }
+        if (pages.has_compressor()) {
+            compressed = value(arrow::AllocateResizableBuffer(0));
+        }
+        for (int64_t row = 0; row < rows; row += page_rows) {
+            const auto count = std::min(rows - row, page_rows);
+            const auto length = (count * bit_width + 7) / 8;
+            const auto* data = values + row * bit_width / 8;
+            int64_t size = length;
+            std::shared_ptr<arrow::Buffer> page;
+            if (optional) {
+                std::array<uint8_t, 10> levels{};
+                auto run = static_cast<uint32_t>(count) * 2;
+                std::size_t end = sizeof(uint32_t);
+                while (run >= 128) {
+                    levels[end++] = static_cast<uint8_t>((run & 127) | 128);
+                    run >>= 7;
+                }
+                levels[end++] = static_cast<uint8_t>(run);
+                levels[end++] = 1;
+                const auto level_bytes =
+                    arrow::bit_util::ToLittleEndian(static_cast<uint32_t>(end - sizeof(uint32_t)));
+                std::memcpy(levels.data(), &level_bytes, sizeof(level_bytes));
+                size += static_cast<int64_t>(end);
+                check(payload->Resize(size, false));
+                std::memcpy(payload->mutable_data(), levels.data(), end);
+                std::memcpy(payload->mutable_data() + end, data, static_cast<std::size_t>(length));
+                page = payload;
+            } else {
+                page = std::make_shared<arrow::Buffer>(data, length);
+            }
+            if (compressed) {
+                pages.Compress(*page, compressed.get());
+                page = compressed;
+            }
+            pages.WriteDataPage(::parquet::DataPageV1(
+                page, static_cast<int32_t>(count), ::parquet::Encoding::PLAIN,
+                ::parquet::Encoding::RLE, ::parquet::Encoding::RLE, size,
+                statistics ? stats_at(row, count) : ::parquet::EncodedStatistics{}));
+        }
+        pages.Close(false, false);
+        if (statistics) {
+            metadata.SetStatistics(stats_at(0, rows));
+        }
+    }
+
+    template <typename Physical, typename Array>
+    void write_plain_numbers(const Array& array, ::parquet::PageWriter& pages,
+                             ::parquet::ColumnChunkMetaDataBuilder& metadata) const {
+        const auto* numbers = array.raw_values();
+        write_plain_pages(array.length(), reinterpret_cast<const uint8_t*>(numbers),
+                          8 * sizeof(*numbers), pages, metadata, [&](int64_t row, int64_t count) {
+                              auto stats = ::parquet::MakeStatistics<Physical>(metadata.descr());
+                              stats->Update(numbers + row, count, 0);
+                              return stats->Encode();
+                          });
+    }
+
+    auto write_plain(const arrow::Array& array, bool allow_dictionary, ::parquet::PageWriter& pages,
+                     ::parquet::ColumnChunkMetaDataBuilder& metadata) const -> bool {
+        if (array.null_count() != 0 || std::endian::native != std::endian::little) {
+            return false;
+        }
+        if (array.type_id() == arrow::Type::BOOL) {
+            const auto* bitmap = static_cast<const arrow::BooleanArray&>(array).values()->data();
+            write_plain_pages(
+                array.length(), bitmap, 1, pages, metadata, [&](int64_t row, int64_t count) {
+                    const auto ones = arrow::internal::CountSetBits(bitmap, row, count);
+                    ::parquet::EncodedStatistics stats;
+                    stats.set_null_count(0)
+                        .set_min(std::string(1, static_cast<char>(ones == count)))
+                        .set_max(std::string(1, static_cast<char>(ones != 0)));
+                    return stats;
+                });
+            return true;
+        }
+        if (allow_dictionary) {
+            return false;
+        }
+        switch (array.type_id()) {
+            case arrow::Type::INT32:
+                write_plain_numbers<::parquet::Int32Type>(
+                    static_cast<const arrow::Int32Array&>(array), pages, metadata);
+                return true;
+            case arrow::Type::INT64:
+                write_plain_numbers<::parquet::Int64Type>(
+                    static_cast<const arrow::Int64Array&>(array), pages, metadata);
+                return true;
+            case arrow::Type::DOUBLE:
+                write_plain_numbers<::parquet::DoubleType>(
+                    static_cast<const arrow::DoubleArray&>(array), pages, metadata);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    auto encode(const Group& group, std::size_t index) const -> Chunk {
+        const auto* column = descriptor_->Column(static_cast<int>(index));
+        const auto arrays = build_arrays(group, index);
+        const auto* dictionary = dynamic_cast<const arrow::DictionaryArray*>(arrays.front().get());
+        const bool allow_dictionary = dictionary_pays(*arrays.front());
+        const auto& properties = dictionary         ? dictionary_props_
+                                 : allow_dictionary ? props_
+                                                    : plain_props_;
+        auto metadata = ::parquet::ColumnChunkMetaDataBuilder::Make(properties, column);
+        auto buffer = value(arrow::io::BufferOutputStream::Create());
+        // PageWriter uses offset zero as a sentinel for a missing dictionary.
+        check(buffer->Write("PAR1", 4));
+        const auto& options = props_->codec_options(column->path());
+        auto pages = ::parquet::PageWriter::Open(
+            buffer, props_->compression(column->path()), metadata.get(), -1, -1,
+            arrow::default_memory_pool(), false, nullptr, nullptr, false, nullptr, nullptr,
+            options ? *options : ::parquet::CodecOptions{});
+        if (arrays.size() == 1 &&
+            write_plain(*arrays.front(), allow_dictionary, *pages, *metadata)) {
+            return {value(buffer->Finish()), std::move(metadata)};
+        }
+        auto writer =
+            ::parquet::ColumnWriter::Make(metadata.get(), std::move(pages), properties.get());
+        ::parquet::ArrowWriteContext context(arrow::default_memory_pool(), arrow_props_.get());
+        const bool nullable = column->max_definition_level() != 0;
+        std::vector<int16_t> levels;
+        for (const auto& array : arrays) {
+            if (nullable) {
+                levels.resize(static_cast<std::size_t>(array->length()));
+                if (array->null_count() != 0) {
+                    for (int64_t row = 0; row < array->length(); ++row) {
+                        levels[static_cast<std::size_t>(row)] = array->IsValid(row) ? 1 : 0;
+                    }
+                } else {
+                    std::ranges::fill(levels, 1);
+                }
+            } else if (array->null_count() != 0) {
+                throw std::invalid_argument("parquet::write: null in a required column");
+            }
+            check(writer->WriteArrow(nullable ? levels.data() : nullptr, nullptr, array->length(),
+                                     *array, &context, nullable));
+        }
+        writer->Close();
+        if (dictionary && props_->statistics_enabled(column->path())) {
+            metadata->SetStatistics(
+                dictionary_statistics(*dictionary, props_->max_statistics_size(column->path())));
+        }
+        return {value(buffer->Finish()), std::move(metadata)};
+    }
+
+    auto append(const Chunk& chunk, int index, ::parquet::RowGroupMetaDataBuilder& group)
+        -> int64_t {
+        const ::parquet::ApplicationVersion version(props_->created_by());
+        const auto metadata = ::parquet::ColumnChunkMetaData::Make(
+            chunk.builder->contents(), descriptor_->Column(index),
+            ::parquet::default_reader_properties(), &version);
+        auto* target = group.NextColumnChunk();
+        if (auto stats = metadata->encoded_statistics()) {
+            target->SetStatistics(*stats);
+        }
+        if (auto stats = metadata->size_statistics()) {
+            target->SetSizeStatistics(*stats);
+        }
+        std::map<::parquet::Encoding::type, int32_t> dictionary_pages;
+        std::map<::parquet::Encoding::type, int32_t> data_pages;
+        for (const auto& page : metadata->encoding_stats()) {
+            auto& counts = page.page_type == ::parquet::PageType::DICTIONARY_PAGE ? dictionary_pages
+                                                                                  : data_pages;
+            counts[page.encoding] = page.count;
+        }
+        const int64_t offset = value(sink_->Tell()) - 4;
+        target->Finish(
+            metadata->num_values(),
+            metadata->has_dictionary_page() ? metadata->dictionary_page_offset() + offset : 0, -1,
+            metadata->data_page_offset() + offset, metadata->total_compressed_size(),
+            metadata->total_uncompressed_size(), metadata->has_dictionary_page(), false,
+            dictionary_pages, data_pages);
+        check(sink_->Write(chunk.bytes->data() + 4, chunk.bytes->size() - 4));
+        return metadata->total_uncompressed_size();
+    }
+
+    template <typename GetChunk>
+    void commit_group(std::size_t count, std::size_t columns, GetChunk chunk) {
+        auto* group = footer_->AppendRowGroup();
+        const auto rows = static_cast<int64_t>(count);
+        group->set_num_rows(rows);
+        int64_t bytes = 0;
+        for (std::size_t i = 0; i < columns; ++i) {
+            bytes += append(chunk(i), static_cast<int>(i), *group);
+        }
+        group->Finish(bytes);
+        rows_ += rows;
+    }
+
+    void commit_next_group() {
+        auto& encoded = groups_.front();
+        commit_group(encoded.input.rows, encoded.output.size(),
+                     [&](std::size_t i) { return encoded.output[i].get(); });
+        groups_.pop_front();
+    }
+
+    std::size_t group_rows_;
+    std::size_t workers_;
+    int64_t rows_ = 0;
+    Group pending_;
+    std::deque<EncodingGroup> groups_;
+    std::shared_ptr<::parquet::WriterProperties> props_;
+    std::shared_ptr<::parquet::WriterProperties> plain_props_;
+    std::shared_ptr<::parquet::WriterProperties> dictionary_props_;
+    std::shared_ptr<::parquet::ArrowWriterProperties> arrow_props_;
+    std::shared_ptr<arrow::Schema> schema_;
+    std::shared_ptr<::parquet::SchemaDescriptor> descriptor_;
+    std::unique_ptr<::parquet::FileMetaDataBuilder> footer_;
+    Output output_;
+    std::shared_ptr<arrow::io::FileOutputStream> sink_;
+    // Join encoding tasks before any member they reference is destroyed.
+    std::optional<runtime::WorkerPool::TaskGroup> tasks_;
+};
+
+inline auto write(const runtime::Table& table, std::string_view path,
+                  std::string_view compression = "zstd", int64_t level = 3,
+                  int64_t row_group_size = 122880, bool statistics = true) -> int64_t {
+    if (!std::in_range<int>(level)) {
+        throw std::invalid_argument("parquet::write: compression level out of range");
+    }
+    Writer writer(path, compression, static_cast<int>(level), row_group_size, statistics);
+    writer.push(table);
+    return writer.finish();
 }
 
 }  // namespace ibex::ext::parquet

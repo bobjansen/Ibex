@@ -4,6 +4,7 @@
 
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+import os
 import queue
 import threading
 import weakref
@@ -379,6 +380,50 @@ class _StreamedResult:
             self._thread.join()
 
 
+def _native_parquet_options(path, options):
+    if not isinstance(path, (str, os.PathLike)) or "://" in os.fsdecode(path):
+        return None
+    supported = {"compression", "compression_level", "statistics", "row_group_size",
+                 "data_page_size", "mkdir"}
+    defaults = {"maintain_order": True, "credential_provider": "auto"}
+    if any(value != defaults.get(name) for name, value in options.items() if name not in supported):
+        return None
+    compression = options.get("compression", "zstd")
+    if compression not in ("zstd", "snappy", "uncompressed"):
+        return None
+    level = options.get("compression_level")
+    if compression != "zstd" and level is not None:
+        return None
+    statistics = options.get("statistics", True)
+    if type(statistics) is not bool:
+        return None
+    group_size = options.get("row_group_size")
+    return {
+        "compression": compression,
+        "compression_level": 3 if level is None else level,
+        "statistics": statistics,
+        "row_group_size": 122_880 if group_size in (None, 0) else group_size,
+        "data_page_size": 1024 * 1024 if options.get("data_page_size") is None else options["data_page_size"],
+        "mkdir": options.get("mkdir", False),
+    }
+
+
+def _native_parquet_schema(expected):
+    schema = pl.DataFrame(schema=expected).to_arrow().schema
+    fields = []
+    for field in schema:
+        dtype = field.type
+        if pa.types.is_dictionary(dtype) and expected[field.name].base_type() == pl.Categorical:
+            field = field.with_type(pa.dictionary(dtype.index_type, pa.string()))
+        elif not (pa.types.is_integer(dtype) or pa.types.is_floating(dtype)
+                  or pa.types.is_boolean(dtype) or pa.types.is_large_string(dtype)
+                  or pa.types.is_date32(dtype) or pa.types.is_timestamp(dtype)
+                  or pa.types.is_decimal128(dtype)):
+            return None
+        fields.append(field)
+    return pa.schema(fields)
+
+
 class IbexEngine(pl.Engine):
     def __init__(self, *, cache_size=32):
         check_version()
@@ -462,16 +507,9 @@ class IbexEngine(pl.Engine):
         return SingleNodeQueryResult(self.collect(lf, optimizations=optimizations))
 
     def sink_parquet(self, lf, path, *, optimizations, **options):
-        """`lf.sink_parquet(path, engine=IbexEngine())`: run `lf` in Ibex, write with Polars.
+        """Run the query in Ibex and stream its result into a Parquet file."""
+        import ibex_pyarrow
 
-        The query runs in Ibex, and Polars' own Parquet writer writes its
-        result batch by batch as Ibex produces it, so the encoding overlaps the
-        query. Each batch reaches Polars as `collect`'s result would, mostly
-        sharing Arrow buffers. The file therefore has exactly the schema and metadata
-        Polars would write, and every `sink_parquet` option and target
-        (compression, statistics, row groups, `PartitionBy`, cloud storage,
-        file objects) behaves as it does in Polars.
-        """
         # The lock guards the plan cache only. The write runs after it is
         # released: Polars calls `batches` on its own streaming threads, and
         # anything there that reaches this engine (a collect routed here by the
@@ -486,6 +524,14 @@ class IbexEngine(pl.Engine):
             frame = self.collect(lf, optimizations=optimizations)
             frame.lazy().sink_parquet(path, engine="streaming", **options)
             return
+        native = getattr(ibex_pyarrow, "execute_pipeline_parquet", None)
+        writer_options = _native_parquet_options(path, options) if native is not None else None
+        if writer_options is not None:
+            schema = _native_parquet_schema(expected)
+            if schema is not None:
+                return native(source, os.fsdecode(path), schema.__arrow_c_schema__(),
+                              tables=bindings, scalars=scalars, **writer_options)
+
         # Polars' streaming sink writes each batch as Ibex produces it, so
         # encoding overlaps the query instead of following it.
         stream = _StreamedResult(source, bindings, scalars)

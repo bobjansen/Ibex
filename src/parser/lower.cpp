@@ -1940,19 +1940,22 @@ class Lowerer {
     /// `let n = sink(df, ...);` (which binds the sink's scalar result).
     auto lower_sink_call(const CallExpr& call, std::size_t position,
                          std::optional<std::string> bind) -> std::expected<ScriptSink, LowerError> {
-        if (call.args.empty() || !call.named_args.empty()) {
+        if (call.args.empty()) {
             return std::unexpected(LowerError{
-                .message = call.callee + ": table sink requires a positional table argument and "
-                                         "does not yet support named arguments"});
+                .message = call.callee + ": table sink requires a positional table argument"});
         }
-        auto input = lower_expr(*call.args.front());
+        auto bound = bind_extern_call_args(call);
+        if (!bound) {
+            return std::unexpected(std::move(bound.error()));
+        }
+        auto input = lower_expr(*bound->front());
         if (!input.has_value()) {
             return std::unexpected(input.error());
         }
         std::vector<ir::Expr> args;
-        args.reserve(call.args.size() - 1);
-        for (std::size_t i = 1; i < call.args.size(); ++i) {
-            auto arg = lower_expr_to_ir(*call.args[i]);
+        args.reserve(bound->size() - 1);
+        for (std::size_t i = 1; i < bound->size(); ++i) {
+            auto arg = lower_expr_to_ir(*(*bound)[i]);
             if (!arg.has_value()) {
                 return std::unexpected(arg.error());
             }

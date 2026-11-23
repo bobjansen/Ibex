@@ -2590,7 +2590,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      ColumnRegistry& columns, ModelRegistry& models,
                      const FunctionRegistry& functions, CompileTimeListRegistry& compile_time_lists,
                      const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
-                     runtime::ModelResult* model_out = nullptr)
+                     runtime::ModelResult* model_out = nullptr,
+                     const runtime::TableChunkSink* explicit_sink = nullptr)
     -> std::expected<runtime::Table, std::string>;
 
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
@@ -3324,11 +3325,24 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 if (bound_args->empty()) {
                     return std::unexpected(call->callee + "() requires a DataFrame first argument");
                 }
-                auto table =
-                    eval_table_expr(*(*bound_args)[0].expr, tables, lazy_tables, scalars, columns,
-                                    models, functions, compile_time_lists, extern_decls, externs);
-                if (!table) {
-                    return std::unexpected(table.error());
+                auto& input = *(*bound_args)[0].expr;
+                std::optional<runtime::Table> table;
+                // Resolve effectful scalar arguments after the table, as the
+                // eager call does. Opening a streaming sink needs its options first.
+                const bool can_stream =
+                    fn->chunk_consumer_func &&
+                    std::ranges::none_of(
+                        std::span{*bound_args}.subspan(1), [&](const BoundCallArg& arg) {
+                            return contains_repl_call(*arg.expr, functions, extern_decls);
+                        });
+                if (!can_stream) {
+                    auto evaluated =
+                        eval_table_expr(input, tables, lazy_tables, scalars, columns, models,
+                                        functions, compile_time_lists, extern_decls, externs);
+                    if (!evaluated) {
+                        return std::unexpected(std::move(evaluated.error()));
+                    }
+                    table = std::move(*evaluated);
                 }
                 runtime::ExternArgs scalar_args;
                 scalar_args.reserve(bound_args->size() - 1);
@@ -3341,7 +3355,24 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                     }
                     scalar_args.push_back(std::move(value.value()));
                 }
-                auto result = fn->table_consumer_func(table.value(), scalar_args);
+                auto result =
+                    table ? fn->table_consumer_func(*table, scalar_args)
+                          : fn->chunk_consumer_func(
+                                [&](const runtime::TableChunkSink& sink)
+                                    -> std::expected<void, std::string> {
+                                    auto evaluated = eval_table_expr(
+                                        input, tables, lazy_tables, scalars, columns, models,
+                                        functions, compile_time_lists, extern_decls, externs,
+                                        nullptr, &sink);
+                                    if (!evaluated) {
+                                        return std::unexpected(std::move(evaluated.error()));
+                                    }
+                                    if (!evaluated->columns.empty() || evaluated->rows() != 0) {
+                                        return sink(std::move(*evaluated));
+                                    }
+                                    return {};
+                                },
+                                scalar_args);
                 if (!result) {
                     return std::unexpected(result.error());
                 }
@@ -3550,7 +3581,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      ColumnRegistry& columns, ModelRegistry& models,
                      const FunctionRegistry& functions, CompileTimeListRegistry& compile_time_lists,
                      const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
-                     runtime::ModelResult* model_out)
+                     runtime::ModelResult* model_out, const runtime::TableChunkSink* explicit_sink)
     -> std::expected<runtime::Table, std::string> {
     if (const auto* table_expr = std::get_if<parser::TableExpr>(&expr.node);
         table_expr != nullptr && table_expr->row_count == nullptr) {
@@ -3767,14 +3798,13 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (const auto it = tables.find(ident->name); it != tables.end()) {
             return it->second;
         }
-        // A lazy binding named on its own — printed, passed to a function, written
-        // out — is consumed whole, so there is nothing to push down. Force it.
+        // A caller with a chunk sink can drain a bare lazy binding through
+        // its scan plan. An eager consumer still needs the full table.
         if (const auto it = lazy_tables.find(ident->name); it != lazy_tables.end()) {
-            return it->second->materialize(command_exec());
-        }
-        // A plan binding named on its own is run: lowered below, where the
-        // name inlines its plan.
-        if (!lazy_tables.plans.contains(ident->name)) {
+            if (explicit_sink == nullptr) {
+                return it->second->materialize(command_exec());
+            }
+        } else if (!lazy_tables.plans.contains(ident->name)) {
             return std::unexpected("unknown table: " + ident->name +
                                    " (available: " + format_table_names(tables, lazy_tables) + ")");
         }
@@ -3834,7 +3864,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     // expression, with streaming and deferred-probe scans. It used to take the
     // eager path whenever `model_out` was set: Q21's cached `l1` decoded
     // lineitem whole instead of streaming it.
-    if (plan_table_expressions() && (model_out == nullptr || !plan_fits_model(**lowered))) {
+    if (explicit_sink != nullptr ||
+        (plan_table_expressions() && (model_out == nullptr || !plan_fits_model(**lowered)))) {
         std::set<std::string> lazy_callees;
         for (const auto& [name, _] : extern_decls) {
             if (const auto* function = externs.find(name);
@@ -3843,8 +3874,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             }
         }
         // The statement's own expression, not one evaluated for it, streams.
-        const runtime::TableChunkSink* chunk_sink = nullptr;
-        if (auto& sink = result_chunk_sink(); sink.target == &expr && !sink.used) {
+        const runtime::TableChunkSink* chunk_sink = explicit_sink;
+        if (auto& sink = result_chunk_sink();
+            chunk_sink == nullptr && sink.target == &expr && !sink.used) {
             sink.used = true;
             chunk_sink = sink.sink;
         }
@@ -6913,6 +6945,40 @@ auto try_execute_whole_script(parser::Program& program, runtime::ExternRegistry&
     for (auto& sink : script->sinks) {
         if (!materialize_shared_before(sink.position)) {
             return false;
+        }
+        const auto* function = externs.find(sink.callee);
+        const bool reuses_input =
+            sink.input_binding && (script->result_binding == sink.input_binding ||
+                                   std::ranges::count(script->sinks, sink.input_binding,
+                                                      &parser::ScriptSink::input_binding) > 1);
+        const bool can_stream = function != nullptr && function->chunk_consumer_func &&
+                                !reuses_input &&
+                                std::ranges::all_of(sink.args, [](const ir::Expr& arg) {
+                                    return std::holds_alternative<ir::Literal>(arg.node) ||
+                                           std::holds_alternative<ir::ColumnRef>(arg.node);
+                                });
+        if (can_stream) {
+            auto args = literal_args(sink.args, scalars, externs);
+            if (!args) {
+                ibex::formatting::print("error: {}\n", args.error());
+                return false;
+            }
+            auto invoked = function->chunk_consumer_func(
+                [&](const runtime::TableChunkSink& chunk_sink) -> std::expected<void, std::string> {
+                    auto result =
+                        optimize_and_execute_plan(std::move(sink.input), base_tables, lazy_callees,
+                                                  externs, scalars, false, {}, &chunk_sink);
+                    if (!result) {
+                        return std::unexpected(std::move(result.error()));
+                    }
+                    return {};
+                },
+                *args);
+            if (!invoked) {
+                ibex::formatting::print("error: {}\n", invoked.error());
+                return false;
+            }
+            continue;
         }
         std::expected<runtime::Table, std::string> input = std::unexpected("");
         if (sink.input_binding.has_value()) {

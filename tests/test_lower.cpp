@@ -584,10 +584,11 @@ df;
 TEST_CASE("lower_script separates table sinks from the relational result", "[parser][lower]") {
     auto program = require_parse(R"(
 extern fn read(path: String) -> DataFrame from "reader.hpp";
-extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+extern fn write(df: DataFrame, path: String, level: Int = 3, statistics: Bool = true)
+    -> Int from "writer.hpp";
 let source = read("input");
 let result = source[select { id }];
-write(result, "output");
+write(result, statistics = false, path = "output");
 result;
 )");
 
@@ -598,8 +599,11 @@ result;
     CHECK(lowered->sinks[0].callee == "write");
     CHECK(lowered->sinks[0].input_binding == std::optional<std::string>{"result"});
     CHECK(lowered->result_binding == std::optional<std::string>{"result"});
-    REQUIRE(lowered->sinks[0].args.size() == 1);
-    REQUIRE(std::get_if<ir::Literal>(&lowered->sinks[0].args[0].node) != nullptr);
+    const auto& args = lowered->sinks[0].args;
+    REQUIRE(args.size() == 3);
+    CHECK(std::get<std::string>(std::get<ir::Literal>(args[0].node).value) == "output");
+    CHECK(std::get<std::int64_t>(std::get<ir::Literal>(args[1].node).value) == 3);
+    CHECK_FALSE(std::get<bool>(std::get<ir::Literal>(args[2].node).value));
 
     const auto* result = as_node<ir::ProjectNode>(lowered->result.get());
     REQUIRE(result != nullptr);

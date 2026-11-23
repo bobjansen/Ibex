@@ -194,6 +194,15 @@
       several queries should share it.
     </p>
     <p class="section-sub">
+      With <code>import "parquet"</code>, <code>parquet::write(df, path)</code>
+      writes a local file and returns its row count. It defaults to Zstandard
+      level 3, 122,880 rows per row group, and column statistics. Use
+      <code>compression</code>, <code>compression_level</code>,
+      <code>row_group_size</code>, and <code>statistics</code> to override them.
+      Supported codecs are <code>zstd</code>, <code>snappy</code>, and
+      <code>uncompressed</code>. A top-level write can stream a lazy query.
+    </p>
+    <p class="section-sub">
       Library functions live in namespaces: <code>import "csv"</code> then
       <code>csv::read(path)</code>, or <code>using csv;</code> and
       <code>read(path)</code>. Scripts declare their own with

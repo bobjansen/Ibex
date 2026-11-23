@@ -1,0 +1,10 @@
+import "parquet";
+
+let trades = Table(150000)[update {
+    symbol = rep(["ALFA", "BETA"], length_out = 150000),
+    quantity = rep([25, 50, 100], length_out = 150000)
+}];
+
+parquet::write(trades[filter quantity >= 50], "trades.parquet",
+               compression = "zstd", compression_level = 3, row_group_size = 32768,
+               statistics = true);

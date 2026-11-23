@@ -1,8 +1,10 @@
 # Parallel Parquet writer
 
-**Status: planned, 2026-11-23; not started.** Replace `parquet::write` (one `parquet::arrow::WriteTable`
+**Status: native writer and streaming entry points implemented.** The timing targets below remain open.
+
+The plan replaces `parquet::write` (one `parquet::arrow::WriteTable`
 call, one thread, uncompressed) with a writer that encodes column chunks on the worker pool
-and writes them in order, and let `IbexEngine.sink_parquet` use it instead of handing every
+and writes them in order, and lets `IbexEngine.sink_parquet` use it instead of handing every
 batch to Polars' writer.
 
 ## Why
@@ -128,7 +130,22 @@ enough. Phase 0 measures it anyway; if it reaches the target, this plan stops th
   differ. The sink tests that compare with `check_metadata=True` move to a logical comparison
   for the native path.
 
-## Still open
+## Implementation
 
-- **Scope of `sink_parquet` options** served natively in phase 4, and whether the
-  Polars-writer path stays as the fallback for the rest.
+The writer uses Arrow 22's public page writer and metadata builders for the
+encoded pages, offset rebasing, and footer. It queues independent column
+chunks on Ibex's worker pool and releases each row group after writing it in
+order. The native sink accepts local paths with Zstandard, Snappy, or no
+compression, boolean statistics, row group and page sizes, and directory
+creation. The Polars writer handles other options and destinations.
+
+To reproduce the paired resident and sink measurements, use the demo's trades
+file and the optional PDS-H lineitem fixture. The benchmark reports median
+wall time, process CPU time, and file size.
+
+```bash
+cmake --build build-release
+PYTHONPATH=build-release/python:python IBEX_CORES=8 POLARS_MAX_THREADS=8 \
+  taskset -c 0,2,4,6,8,10,12,14 .venv/bin/python benchmarking/bench_parquet_writer.py \
+  "$TRADES_PARQUET" --lineitem "$LINEITEM_PARQUET"
+```

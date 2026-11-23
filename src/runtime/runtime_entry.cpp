@@ -342,7 +342,7 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                     "parallel_hash_builds={} streamed_probes={} parallel_aggregate_partitions={} "
                     "parallel_aggregate_finalizes={} "
                     "grouped_lifted_group_state={} chunk_direct_updates={} "
-                    "untranslated_categorical_columns={}\n",
+                    "untranslated_categorical_columns={} late_topks={}\n",
                     stats.parallel_pipelines.load(), stats.serial_pipelines.load(),
                     stats.morsels.load(), stats.pipelined_scans.load(),
                     stats.pipelined_stages.load(), stats.range_heads.load(),
@@ -352,7 +352,7 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                     stats.parallel_aggregate_partitions.load(),
                     stats.parallel_aggregate_finalizes.load(),
                     stats.grouped_lifted_group_state.load(), stats.chunk_direct_updates.load(),
-                    stats.untranslated_categorical_columns.load());
+                    stats.untranslated_categorical_columns.load(), stats.late_topks.load());
             } catch (...) {  // NOLINT(bugprone-empty-catch)
             }
         }

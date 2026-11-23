@@ -20187,6 +20187,87 @@ TEST_CASE("A top-k over fixed-width keys matches the full sort",
     }
 }
 
+// An ungrouped top-k over a row-local chain over a table ranks on the columns
+// its keys need plus a row id, then runs the whole plan over the winners
+// (`try_late_topk`). Every output column must be the full sort's: through
+// renames, updates whose fields read other fields, projections that drop
+// columns, filters on columns the keys never read, strings and nulls.
+TEST_CASE("A late-materialized top-k returns the full sort's rows and columns",
+          "[runtime][order][topk]") {
+    constexpr std::size_t kRows = 40'000;
+    std::vector<std::int64_t> ids(kRows);
+    std::vector<std::int64_t> qtys(kRows);
+    std::vector<double> prices(kRows);
+    Column<std::string> names;
+    runtime::ValidityBitmap price_valid(kRows, true);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        ids[r] = static_cast<std::int64_t>(r);
+        qtys[r] = static_cast<std::int64_t>((r * 7) % 23);
+        prices[r] = static_cast<double>((r * 13) % 101) * 0.5;
+        names.push_back("n" + std::to_string(r % 977));
+        price_valid.set(r, r % 17 != 0);
+    }
+    runtime::Table t;
+    t.add_column("id", Column<std::int64_t>{ids});
+    t.add_column("q", Column<std::int64_t>{qtys});
+    t.add_column("p", Column<double>{prices}, price_valid);
+    t.add_column("s", std::move(names));
+    runtime::TableRegistry tables;
+    tables.emplace("t", t);
+
+    const std::vector<std::string> chains = {
+        // Rename, an update reading an earlier update's field, unneeded fields.
+        "t[filter q > 3][update { notional = p * Float64(q), tag = s }]"
+        "[select { id, s, notional, tag }][rename { label = tag }]"
+        "[update { score = notional + 1.0, twice = score * 2.0, unused = id * 2 }]",
+        // A key that is a renamed base column; the filter reads a dropped one.
+        "t[filter s != \"n5\"][select { id, q, p }][rename { k = q }]",
+        // A nullable key.
+        "t[filter id % 3 != 1][update { v = p }]",
+        // A swap: kept whole, or the rename left behind would collide.
+        "t[filter q > 2][rename { q = id, id = q }]",
+    };
+    const std::vector<std::string> orders = {"twice desc, id asc", "k desc, p asc", "v desc",
+                                             "id desc, q asc"};
+    for (std::size_t c = 0; c < chains.size(); ++c) {
+        const std::string base = chains[c] + "[order { " + orders[c] + " }]";
+        auto sorted = runtime::interpret(*require_ir((base + ";").c_str()), tables);
+        INFO((sorted.has_value() ? std::string{} : sorted.error()));
+        REQUIRE(sorted.has_value());
+        for (const char* limit : {"head 50", "tail 20"}) {
+            CAPTURE(c, limit);
+            const std::size_t k = limit[0] == 'h' ? 50 : 20;
+            runtime::ParallelPipelineStats stats;
+            runtime::ExecutionContext exec{.execution_profile = nullptr};
+            exec.parallel_stats = &stats;
+            auto out = runtime::interpret(*require_ir((base + "[" + limit + "];").c_str()), tables,
+                                          nullptr, nullptr, nullptr, exec);
+            INFO((out.has_value() ? std::string{} : out.error()));
+            REQUIRE(out.has_value());
+            // The late path ran, rather than a pruned chain falling back.
+            CHECK(stats.late_topks.load() == 1);
+            REQUIRE(out->rows() == k);
+            REQUIRE(out->columns.size() == sorted->columns.size());
+            const std::size_t first = limit[0] == 'h' ? 0 : sorted->rows() - k;
+            for (std::size_t col = 0; col < out->columns.size(); ++col) {
+                const auto& got = out->columns[col];
+                const auto& want = sorted->columns[col];
+                CAPTURE(got.name);
+                REQUIRE(got.name == want.name);
+                for (std::size_t i = 0; i < k; ++i) {
+                    CAPTURE(i);
+                    const bool want_null = runtime::is_null(want, first + i);
+                    CHECK(runtime::is_null(got, i) == want_null);
+                    if (!want_null) {
+                        CHECK(runtime::scalar_from_column(*got.column, i) ==
+                              runtime::scalar_from_column(*want.column, first + i));
+                    }
+                }
+            }
+        }
+    }
+}
+
 // An update below a run (TPC-H q22: a computed column, then a filter on it)
 // joins the streamed run (`Plan::stream_only_bottom_updates`): one scan
 // pipeline computes, filters and projects each unit. Before, the update

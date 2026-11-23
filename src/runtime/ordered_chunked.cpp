@@ -12,9 +12,13 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/compiler.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/ir/builder.hpp>
+#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
@@ -25,7 +29,10 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <numeric>
 #include <optional>
+#include <ranges>
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
@@ -37,6 +44,7 @@
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "physical_executor_internal.hpp"
+#include "physical_plan.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -2409,6 +2417,266 @@ auto build_physical_order(const ir::Node& node, const TableRegistry& registry,
 /// R16). `ChunkedOrderedLimitOperator` is a serial bounded-heap select
 /// (O(n log k), one pass) -- deliberately not a fan-out point, see
 /// src/runtime/PARALLELISM.md. Moved verbatim from the per-kind switch.
+namespace {
+
+/// The row-id column a late top-k's first phase carries through its chain.
+constexpr std::string_view kLateTopKRow = "__ibex_topk_row";
+
+/// `0, 1, ..., rows - 1` as an Int64 column over shared compact Int32
+/// storage: grown once and adopted by every late top-k after, so a query
+/// pays no per-run fill for its row ids.
+auto shared_row_ids(std::size_t rows) -> Column<std::int64_t> {
+    static std::mutex mutex;
+    static std::shared_ptr<ibex::detail::NoInitVector<std::int32_t>> ids;
+    const std::scoped_lock lock(mutex);
+    if (ids == nullptr || ids->size() < rows) {
+        auto grown = std::make_shared<ibex::detail::NoInitVector<std::int32_t>>(rows);
+        // NOLINTNEXTLINE(modernize-use-ranges): Apple libc++ does not provide ranges::iota.
+        std::iota(grown->begin(), grown->end(), std::int32_t{0});
+        ids = std::move(grown);
+    }
+    return Column<std::int64_t>::from_external_int32(ids, ids->data(), rows);
+}
+
+/// One step of a late top-k's key-only chain, pruned to what the keys need.
+struct LateStep {
+    const ir::Node* node = nullptr;
+    std::vector<ir::ColumnRef> project;  ///< Project: the columns kept
+    std::vector<ir::FieldSpec> fields;   ///< Update: the fields kept
+    bool keep_rename = false;            ///< Rename: whether it is kept, whole
+};
+
+/// An ungrouped top-k over a chain of row-local map steps over a registered
+/// table runs in two phases when its keys need few of the table's columns.
+///
+/// Phase 1 runs the chain pruned to what the keys (and every filter) read,
+/// over those columns of the table plus a row id, and keeps the winners' row
+/// ids. Phase 2 gathers just those rows of the whole table and runs the
+/// original plan over them: the chain is row-local, so each row passes the
+/// same filters and gets the same keys, and the gathered rows keep their
+/// order, so ties break as before. The answer is the original's.
+///
+/// Evaluated whole, the chain gathered every column of every surviving row
+/// to keep a hundred of them: `filter venue == x` then `order notional desc,
+/// head 100` over 10M rows gathered eight columns of 2M rows, 44% of the
+/// query's CPU.
+///
+/// Nullopt when the shape does not qualify; the caller then builds the
+/// ordinary operator.
+auto try_late_topk(const ir::TopKNode& topk, const TableRegistry& registry,
+                   const ScalarRegistry* scalars, const ExternRegistry* externs,
+                   const ExecutionContext& exec, ModelResult* model_out)
+    -> std::optional<std::expected<OperatorPtr, std::string>> {
+    constexpr std::size_t kMinRowsPerWinner = 64;
+    constexpr std::size_t kMaxCount = 100'000;
+    if (!topk.group_by().empty() || topk.count() == 0 || topk.count() > kMaxCount) {
+        return std::nullopt;
+    }
+    // The chain, top to bottom, down to the scan.
+    std::vector<const ir::Node*> chain;
+    const ir::Node* cur = topk.children().front().get();
+    while (cur != nullptr && cur->kind() != ir::NodeKind::Scan) {
+        bool row_local = false;
+        switch (cur->kind()) {
+            case ir::NodeKind::Filter:
+            case ir::NodeKind::Project:
+            case ir::NodeKind::Rename:
+                row_local = map_step_expressions_are_subset_evaluable(*cur);
+                break;
+            case ir::NodeKind::Update:
+                row_local = physical::is_stream_admissible_update(*cur);
+                break;
+            default:
+                break;
+        }
+        if (!row_local || cur->children().size() != 1) {
+            return std::nullopt;
+        }
+        chain.push_back(cur);
+        cur = cur->children().front().get();
+    }
+    // The gather this saves is a filter's, of its survivors. Without one the
+    // chain shares the table's columns and the heap copies only its winners,
+    // so a first phase would be pure overhead: `prices[order price desc,
+    // head 100]` read +5%.
+    if (cur == nullptr || std::ranges::none_of(chain, [](const ir::Node* node) {
+            return node->kind() == ir::NodeKind::Filter;
+        })) {
+        return std::nullopt;
+    }
+    const auto& scan = ir::node_cast<ir::ScanNode>(*cur);
+    const auto found = registry.find(scan.source_name());
+    if (found == registry.end() || scan.ascribed_schema().has_value()) {
+        return std::nullopt;
+    }
+    const Table& source = found->second;
+    const std::size_t rows = source.rows();
+    if (rows < topk.count() * kMinRowsPerWinner ||
+        rows >= std::numeric_limits<std::int32_t>::max() || source.time_index().has_value() ||
+        source.find_entry(std::string(kLateTopKRow)) != nullptr) {
+        return std::nullopt;
+    }
+
+    // What the keys need, walking down: a superset is always safe.
+    robin_hood::unordered_set<std::string> needed;
+    for (const auto& key : topk.keys()) {
+        needed.insert(key.name);
+    }
+    std::vector<LateStep> steps;
+    steps.reserve(chain.size());
+    for (const ir::Node* node : chain) {
+        LateStep step;
+        step.node = node;
+        switch (node->kind()) {
+            case ir::NodeKind::Filter:
+                ir::collect_expr_column_refs(ir::node_cast<ir::FilterNode>(*node).predicate(),
+                                             needed);
+                break;
+            case ir::NodeKind::Project:
+                for (const auto& column : ir::node_cast<ir::ProjectNode>(*node).columns()) {
+                    if (needed.contains(column.name)) {
+                        step.project.push_back(column);
+                    }
+                }
+                step.project.push_back(ir::ColumnRef{.name = std::string(kLateTopKRow)});
+                break;
+            case ir::NodeKind::Rename: {
+                // Whole or not at all: a rename whose source a projection
+                // below pruned would fail, and dropping one rename of a swap
+                // (`{ a = b, b = a }`) would collide with the column it left.
+                const auto& renames = ir::node_cast<ir::RenameNode>(*node).renames();
+                step.keep_rename = std::ranges::any_of(
+                    renames, [&](const ir::RenameSpec& r) { return needed.contains(r.new_name); });
+                if (step.keep_rename) {
+                    for (const auto& rename : renames) {
+                        needed.insert(rename.old_name);
+                    }
+                }
+            } break;
+            case ir::NodeKind::Update: {
+                // A kept field may read another field's alias, so keep
+                // whatever kept fields name, to a fixpoint.
+                const auto& fields = ir::node_cast<ir::UpdateNode>(*node).fields();
+                std::vector<bool> keep(fields.size(), false);
+                bool grew = true;
+                while (grew) {
+                    grew = false;
+                    for (std::size_t f = 0; f < fields.size(); ++f) {
+                        if (!keep[f] && needed.contains(fields[f].alias)) {
+                            keep[f] = true;
+                            ir::collect_expr_column_refs(fields[f].expr, needed);
+                            grew = true;
+                        }
+                    }
+                }
+                for (std::size_t f = 0; f < fields.size(); ++f) {
+                    if (keep[f]) {
+                        step.fields.push_back(fields[f]);
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        steps.push_back(std::move(step));
+    }
+
+    // Phase 1's input: the needed columns, shared, and the row ids.
+    Table narrow;
+    for (const auto& entry : source.columns) {
+        if (needed.contains(entry.name)) {
+            narrow.add_column_from(entry.name, entry);
+        }
+    }
+    if (narrow.columns.size() >= source.columns.size()) {
+        return std::nullopt;  // the keys read everything: no gather to save
+    }
+    narrow.add_column(std::string(kLateTopKRow), shared_row_ids(rows));
+
+    // The pruned chain, bottom up, under the same top-k.
+    ir::Builder builder;
+    ir::NodePtr plan = builder.scan(scan.source_name());
+    for (const LateStep& step : std::views::reverse(steps)) {
+        ir::NodePtr next;
+        switch (step.node->kind()) {
+            case ir::NodeKind::Filter:
+                next = builder.filter(ir::node_cast<ir::FilterNode>(*step.node).predicate());
+                break;
+            case ir::NodeKind::Project:
+                next = builder.project(step.project);
+                break;
+            case ir::NodeKind::Rename:
+                if (!step.keep_rename) {
+                    continue;
+                }
+                next = builder.rename(ir::node_cast<ir::RenameNode>(*step.node).renames());
+                break;
+            case ir::NodeKind::Update:
+                if (step.fields.empty()) {
+                    continue;
+                }
+                next = builder.update(step.fields);
+                break;
+            default:
+                return std::nullopt;
+        }
+        next->add_child(std::move(plan));
+        plan = std::move(next);
+    }
+    ir::NodePtr phase_one = builder.top_k(topk.keys(), topk.count(), {}, topk.keep_mode());
+    phase_one->add_child(std::move(plan));
+
+    TableRegistry narrow_registry;
+    narrow_registry.emplace(scan.source_name(), std::move(narrow));
+    // Unprofiled: the profile keys its entries by node id, and the pruned
+    // chain's fresh ids would be filed under unrelated nodes of the plan.
+    ExecutionContext phase_one_exec = exec;
+    phase_one_exec.execution_profile = nullptr;
+    auto winners_op =
+        build_operator(*phase_one, narrow_registry, scalars, externs, phase_one_exec, model_out);
+    if (!winners_op.has_value()) {
+        return std::nullopt;  // the pruned chain is not buildable: run the original
+    }
+    // A failure here is the pruned chain's: the original plan, run as usual,
+    // reports any error that is really the query's.
+    auto winners = materialize_operator(std::move(*winners_op));
+    if (!winners.has_value()) {
+        return std::nullopt;
+    }
+    const auto* row_entry = winners->find_entry(std::string(kLateTopKRow));
+    const auto* row_ids =
+        row_entry != nullptr ? std::get_if<Column<std::int64_t>>(row_entry->column.get()) : nullptr;
+    if (row_ids == nullptr) {
+        return std::nullopt;
+    }
+    std::vector<std::size_t> picked;
+    picked.reserve(row_ids->size());
+    for (const std::int64_t row : *row_ids) {
+        picked.push_back(static_cast<std::size_t>(row));
+    }
+    std::ranges::sort(picked);
+
+    // Phase 2: the original plan over the winning rows alone. Too few rows
+    // for phase 1 to qualify again.
+    TableRegistry winner_registry;
+    winner_registry.emplace(scan.source_name(), gather_rows(source, picked));
+    auto final_op = build_operator(topk, winner_registry, scalars, externs, exec, model_out);
+    if (!final_op.has_value()) {
+        return std::unexpected(std::move(final_op.error()));
+    }
+    auto result = materialize_operator(std::move(*final_op));
+    if (!result.has_value()) {
+        return std::unexpected(std::move(result.error()));
+    }
+    if (exec.parallel_stats != nullptr) {
+        exec.parallel_stats->late_topks.fetch_add(1, std::memory_order_relaxed);
+    }
+    return make_table_source(std::move(*result));
+}
+
+}  // namespace
+
 auto build_physical_topk(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
@@ -2416,6 +2684,9 @@ auto build_physical_topk(const ir::Node& node, const TableRegistry& registry,
     const auto& topk = ir::node_cast<ir::TopKNode>(node);
     if (topk.children().empty()) {
         return std::unexpected("topk node missing child");
+    }
+    if (auto late = try_late_topk(topk, registry, scalars, externs, exec, model_out)) {
+        return std::move(*late);
     }
     auto child_op =
         build_operator(*topk.children().front(), registry, scalars, externs, exec, model_out);

@@ -907,6 +907,11 @@ struct ParallelPipelineStats {
     /// narrowed gate, a newly nullable column) would cost the merge copy again
     /// with every test still green.
     std::atomic<std::uint64_t> two_phase_filters{0};
+    /// Top-k queries ranked on their key columns and a row id, with the whole
+    /// plan then run over the winners (`try_late_topk`). The answer is the same
+    /// either way, and the first phase falls back to the ordinary operator on
+    /// any failure, so a pruning gap would cost the speed with every test green.
+    std::atomic<std::uint64_t> late_topks{0};
     /// Grouped windowed updates whose groups were spread across worker threads.
     /// Same reason as the counters above: the output is identical either way,
     /// so without this a gate that quietly stopped matching — a newly nullable

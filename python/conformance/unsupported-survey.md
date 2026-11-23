@@ -108,7 +108,8 @@ compatibility.
 Source inspection also identifies explicit limits that this run did not
 necessarily reach: floating-point grouping keys; computed sort keys; most
 casts; remote/multiple-file scans and nondefault Parquet policies; and
-background/batch/async/sink execution. These have no occurrence count here.
+background/batch/async execution, lazy sinks and sinks other than
+`sink_parquet` (supported since 808b962f). These have no occurrence count here.
 
 ## Coverage gaps and suggested order
 

@@ -42,6 +42,27 @@ const T* as_node(const ir::Node* node) {
 
 }  // namespace
 
+TEST_CASE("Identical aggregates inside select expressions share one aggregate", "[parser][lower]") {
+    // `volume`-and-`vwap` shapes repeat `sum(qty)`: one pass computes it. A
+    // different function of the same column, or a count, stays its own.
+    auto program = require_parse(
+        "t[select { a = sum(x) + 1, b = sum(p) / Float64(sum(x)), c = mean(x) * 2.0, "
+        "d = count() + 0 }, by g];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+    const ir::AggregateNode* agg = nullptr;
+    for (const ir::Node* node = result->get(); node != nullptr && agg == nullptr;
+         node = node->children().empty() ? nullptr : node->children()[0].get()) {
+        agg = as_node<ir::AggregateNode>(node);
+    }
+    REQUIRE(agg != nullptr);
+    const auto& aggs = agg->aggregations();
+    REQUIRE(aggs.size() == 4);
+    CHECK(std::ranges::count_if(aggs, [](const ir::AggSpec& spec) {
+              return spec.func == ir::AggFunc::Sum && spec.column.name == "x";
+          }) == 1);
+}
+
 TEST_CASE("Lower corr(x, y) and cov(x, y) to paired aggregates", "[parser][lower]") {
     // `corr` and `cov` are reserved for the matrix clauses; in an expression
     // the call form is the paired aggregate, and its arguments lower like any

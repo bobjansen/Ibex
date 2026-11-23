@@ -5980,6 +5980,20 @@ class Lowerer {
                 if (!column_name.has_value()) {
                     return std::unexpected(column_name.error());
                 }
+                // The same aggregate of the same column, already computed into
+                // a temporary by an earlier expression, is read from there:
+                // `volume = sum(qty)` and `vwap = sum(p * qty) / sum(qty)`
+                // need one pass over `qty`, not two.
+                if (!temp_columns.contains(*column_name)) {
+                    const auto same = std::ranges::find_if(aggs, [&](const ir::AggSpec& spec) {
+                        return spec.func == func.value() && spec.column.name == *column_name &&
+                               !spec.column.lexical && spec.paired.name.empty() && !spec.is_count &&
+                               spec.param == 0.0 && temp_columns.contains(spec.alias);
+                    });
+                    if (same != aggs.end()) {
+                        return ir::Expr{.node = ir::ColumnRef{.name = same->alias}};
+                    }
+                }
                 aggs.push_back(ir::AggSpec{
                     .func = func.value(),
                     .column = ir::ColumnRef{.name = std::move(column_name.value())},

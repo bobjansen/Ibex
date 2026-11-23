@@ -1537,9 +1537,15 @@ auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
 // as much on those masks as on reading its columns. Compact Int32 columns and
 // the NaN-ordered compare join in, which the pair kernel above takes neither.
 
-/// Rows per block: a multiple of 64 (whole keep words), and a block's mask
-/// bytes plus its values (at most 8 bytes a row per leaf) stay in L1.
-constexpr std::size_t kFusedBlockRows = 2048;
+/// Rows per block: a multiple of 64 (whole keep words). Small on purpose: each
+/// leaf streams its own column, and the shorter the run of one leaf before the
+/// next starts, the more of the columns' memory streams are in flight at once.
+/// A q06-shaped global aggregate over 10M in-memory rows, its filter run in
+/// 64K-row morsels on one core: 2048 rows 17.5 ms, 256 15.3, 128 15.2, 64 14.8
+/// (8 cores: 4.1 -> 3.75). A standalone loop doing every compare per row, the
+/// ceiling, reads the same columns in 7.8 ms against 10.6 for 2048-row blocks
+/// and 8.2 for 64.
+constexpr std::size_t kFusedBlockRows = 64;
 
 /// ANDs leaf `values[i] op literal` into `out[i]` for `n` rows.
 using FusedLeafFn = void (*)(const void* values, std::int64_t lit_int, double lit_dbl,

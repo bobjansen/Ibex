@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -85,8 +86,9 @@ void atomic_or(std::uint64_t& word, std::uint64_t bits) noexcept {
 /// categorical) are all points inside it.
 class ChunkedDistinctOperator final : public Operator {
    public:
-    ChunkedDistinctOperator(OperatorPtr child, physical::BreakerParallelism dedup_plan)
-        : child_(std::move(child)), dedup_plan_(dedup_plan) {}
+    ChunkedDistinctOperator(OperatorPtr child, physical::BreakerParallelism dedup_plan,
+                            ParallelPipelineStats* stats)
+        : child_(std::move(child)), dedup_plan_(dedup_plan), stats_(stats) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
@@ -147,11 +149,31 @@ class ChunkedDistinctOperator final : public Operator {
                 if (!whole.has_value()) {
                     return std::unexpected(std::move(whole.error()));
                 }
-                if (*whole) {
+                // After a hold, the joined input (if any) comes back as one
+                // chunk the dense path already declined.
+                if (*whole && !dense_buffer_tried_) {
                     if (auto out = try_dense_whole_input(t)) {
+                        note_dense();
                         fast_dedup_seen_ = true;
                         return std::optional<Chunk>{table_to_chunk(std::move(*out))};
                     }
+                } else if (!dense_buffer_tried_ && dense_eligible(t.columns)) {
+                    dense_buffer_tried_ = true;
+                    auto whole_input = hold_dense_input(std::move(t));
+                    if (!whole_input.has_value()) {
+                        return std::unexpected(std::move(whole_input.error()));
+                    }
+                    if (whole_input->has_value()) {
+                        if (auto out = try_dense_whole_input(**whole_input)) {
+                            note_dense();
+                            fast_dedup_seen_ = true;
+                            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+                        }
+                        // The grid is too large after all: dedupe the joined
+                        // input as one chunk, which is what streaming it gives.
+                        held_.push_front(table_to_chunk(std::move(**whole_input)));
+                    }
+                    continue;  // the held chunks come back through `pull`
                 }
             }
             if (!generic_dedup_seen_) {
@@ -265,11 +287,14 @@ class ChunkedDistinctOperator final : public Operator {
     }
 
    private:
-    /// The child's next chunk: the one `input_ends_after_this_chunk` pulled
-    /// ahead, if any, else a fresh one.
+    /// The child's next chunk: one held back (pulled ahead by
+    /// `input_ends_after_this_chunk`, or by `hold_dense_input` and handed
+    /// back), if any, else a fresh one.
     auto pull() -> std::expected<std::optional<Chunk>, std::string> {
-        if (pending_.has_value()) {
-            return std::exchange(pending_, std::nullopt);
+        if (!held_.empty()) {
+            Chunk chunk = std::move(held_.front());
+            held_.pop_front();
+            return std::optional<Chunk>{std::move(chunk)};
         }
         if (child_done_) {
             return std::optional<Chunk>{};
@@ -284,8 +309,8 @@ class ChunkedDistinctOperator final : public Operator {
     /// Whether the chunk being processed is the input's last, by pulling the
     /// next one ahead (kept for `pull`). Asked once, for the first chunk.
     auto input_ends_after_this_chunk() -> std::expected<bool, std::string> {
-        if (child_done_ || pending_.has_value()) {
-            return child_done_ && !pending_.has_value();
+        if (child_done_ || !held_.empty()) {
+            return child_done_ && held_.empty();
         }
         auto ahead = child_->next();
         if (!ahead.has_value()) {
@@ -295,8 +320,75 @@ class ChunkedDistinctOperator final : public Operator {
             child_done_ = true;
             return true;
         }
-        pending_ = std::move(*ahead);
+        held_.push_back(std::move(**ahead));
         return false;
+    }
+
+    /// Whether `t` could be part of a dense distinct's input: two or more key
+    /// columns, none with nulls, each a type `try_dense_whole_input` takes.
+    /// Its ranges are judged once the whole input is in.
+    [[nodiscard]] static auto dense_eligible(const std::vector<ColumnEntry>& columns) -> bool {
+        return columns.size() >= 2 && std::ranges::all_of(columns, [](const ColumnEntry& entry) {
+                   return !entry.validity.has_value() &&
+                          (std::holds_alternative<Column<Categorical>>(*entry.column) ||
+                           std::holds_alternative<Column<bool>>(*entry.column) ||
+                           std::holds_alternative<Column<std::int64_t>>(*entry.column) ||
+                           std::holds_alternative<Column<Date>>(*entry.column));
+               });
+    }
+
+    /// The rest of a multi-chunk input, joined to `first`, when every chunk
+    /// stays dense-eligible: a Parquet scan hands `distinct` one chunk per row
+    /// group, and deduping those one by one fanned out and waited per chunk
+    /// (the demo's `unique(symbol, day)` over 41 row groups: 82 barriers, 85
+    /// of its 110 ms waiting). Nothing is emitted while chunks are held, so
+    /// declining stays exact: a chunk that does not qualify, or an input past
+    /// `kDenseHoldRows`, hands every held chunk back to `pull` in order
+    /// (nullopt).
+    auto hold_dense_input(Table first) -> std::expected<std::optional<Table>, std::string> {
+        // Rows are numbered in 32 bits on the dense path; held well below that.
+        constexpr std::size_t kDenseHoldRows = std::size_t{1} << 26;
+        std::vector<Chunk> chunks;
+        std::size_t rows = first.rows();
+        chunks.push_back(table_to_chunk(std::move(first)));
+        const auto hand_back = [&] {
+            held_.insert(held_.begin(), std::make_move_iterator(chunks.begin()),
+                         std::make_move_iterator(chunks.end()));
+        };
+        while (true) {
+            auto next = pull();
+            if (!next.has_value()) {
+                return std::unexpected(std::move(next.error()));
+            }
+            if (!next->has_value()) {
+                break;
+            }
+            Chunk chunk = std::move(**next);
+            if (chunk.rows() == 0) {
+                continue;  // contributes no row and no key
+            }
+            rows += chunk.rows();
+            const bool keep = rows <= kDenseHoldRows && dense_eligible(chunk.columns);
+            chunks.push_back(std::move(chunk));
+            if (!keep) {
+                hand_back();
+                return std::optional<Table>{};
+            }
+        }
+        // Categorical chunks may each carry their own dictionary; the
+        // materializer remaps them onto one, as any consumer of the scan must.
+        auto joined =
+            MaterializeOperator(std::make_unique<ChunkListSource>(std::move(chunks))).run();
+        if (!joined.has_value()) {
+            return std::unexpected(std::move(joined.error()));
+        }
+        return std::optional<Table>{std::move(*joined)};
+    }
+
+    void note_dense() const {
+        if (stats_ != nullptr) {
+            stats_->dense_distincts.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     /// One key column of the dense path: its values become a cell digit in
@@ -1207,10 +1299,14 @@ class ChunkedDistinctOperator final : public Operator {
     }
 
     OperatorPtr child_;
-    /// A chunk pulled ahead by `input_ends_after_this_chunk`, and whether the
-    /// child has reported its end.
-    std::optional<Chunk> pending_;
+    /// Chunks pulled ahead and not yet processed, in input order
+    /// (`input_ends_after_this_chunk`, `hold_dense_input`), and whether the
+    /// child is exhausted.
+    std::deque<Chunk> held_;
     bool child_done_ = false;
+    /// `hold_dense_input` runs at most once: a declined hold hands its chunks
+    /// back, and the first of them must not be held again.
+    bool dense_buffer_tried_ = false;
     /// Each grid cell's first row, for `try_dense_whole_input`.
     std::vector<std::uint32_t> dense_first_;
     // Multi-column dedup: `key_index_` hashes and compares each row in place and
@@ -1248,6 +1344,8 @@ class ChunkedDistinctOperator final : public Operator {
     /// `dedup_partition_count` -- rather than deciding for itself.
     /// src/runtime/PARALLELISM.md, "Parallelism as a plan decision".
     physical::BreakerParallelism dedup_plan_{};
+    /// Where `dense_distincts` is counted; null when nobody asked.
+    ParallelPipelineStats* stats_ = nullptr;
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
     TypedDedup<std::int64_t> seen_i64_;
     TypedDedup<double> seen_f64_;
@@ -1279,8 +1377,8 @@ auto distinct_table(const Table& input, const ExecutionContext& exec)
         {.rows = input.rows(), .source = physical::RowEstimate::Source::ChildExact});
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
     physical::resolve_breaker_parallelism(dedup_plan, exec, pool_size);
-    return materialize_operator(
-        std::make_unique<ChunkedDistinctOperator>(std::move(source), dedup_plan));
+    return materialize_operator(std::make_unique<ChunkedDistinctOperator>(
+        std::move(source), dedup_plan, exec.parallel_stats));
 }
 
 namespace physical_executor_detail {
@@ -1311,7 +1409,8 @@ auto build_physical_distinct(const physical::Plan& plan, const ir::Node& node,
     // serial query must not construct it just to learn it is serial.
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
     physical::resolve_breaker_parallelism(dedup_plan, exec, pool_size);
-    return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), dedup_plan);
+    return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), dedup_plan,
+                                                     exec.parallel_stats);
 }
 
 }  // namespace physical_executor_detail

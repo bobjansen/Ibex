@@ -20069,6 +20069,133 @@ TEST_CASE("A Float64 cast operand takes the direct numeric update", "[runtime][u
     }
 }
 
+// A distinct over many chunks (a Parquet scan's row groups) holds them while
+// they stay dense-eligible and answers once over the joined input. Each chunk
+// here carries its own Categorical dictionary, so a code names a different
+// label in every chunk, and the first occurrences span chunk boundaries. A
+// chunk with a null key, or a range too wide for the grid, hands the chunks
+// back to the hashed path, which must then behave exactly as it always has.
+TEST_CASE("A dense distinct over many chunks keeps first occurrences across them",
+          "[runtime][distinct][parallel]") {
+    struct Spec {
+        std::size_t rows;
+        std::size_t rotate;  // label k of this chunk's dictionary is "L(k + rotate)"
+    };
+    const std::vector<Spec> specs{{700, 0}, {1'500, 3}, {64, 7}, {2'000, 1}, {900, 5}};
+    using Tuple = std::tuple<std::string, bool, std::optional<std::int64_t>>;
+    const auto build = [&](std::size_t null_chunk, bool wide) {
+        std::vector<runtime::Chunk> chunks;
+        std::vector<Tuple> rows;
+        std::size_t global = 0;
+        for (std::size_t c = 0; c < specs.size(); ++c) {
+            std::vector<std::string> labels;
+            for (std::size_t k = 0; k < 9; ++k) {
+                labels.push_back("L" + std::to_string((k + specs[c].rotate) % 9));
+            }
+            Column<Categorical>::codes_storage codes;
+            Column<bool> flags;
+            std::vector<std::int64_t> ns;
+            runtime::ValidityBitmap valid(specs[c].rows, true);
+            for (std::size_t r = 0; r < specs[c].rows; ++r, ++global) {
+                const auto code = static_cast<std::int32_t>((global * 7) % 9);
+                const bool flag = (global * 5) % 3 == 0;
+                std::int64_t n = static_cast<std::int64_t>((global * 11) % 13) - 6;
+                if (wide && c == 3 && r == 0) {
+                    n = std::int64_t{1} << 40;
+                }
+                const bool is_null = c == null_chunk && r % 10 == 0;
+                codes.push_back(code);
+                flags.push_back(flag);
+                ns.push_back(n);
+                valid.set(r, !is_null);
+                rows.emplace_back(labels[static_cast<std::size_t>(code)], flag,
+                                  is_null ? std::nullopt : std::optional{n});
+            }
+            runtime::Chunk chunk;
+            chunk.columns.push_back({.name = "c",
+                                     .column = std::make_shared<runtime::ColumnValue>(
+                                         Column<Categorical>{labels, std::move(codes)}),
+                                     .validity = {}});
+            chunk.columns.push_back(
+                {.name = "f",
+                 .column = std::make_shared<runtime::ColumnValue>(std::move(flags)),
+                 .validity = {}});
+            runtime::ColumnEntry n_entry{
+                .name = "n",
+                .column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{ns}),
+                .validity = {}};
+            if (c == null_chunk) {
+                n_entry.validity = std::move(valid);
+            }
+            chunk.columns.push_back(std::move(n_entry));
+            chunks.push_back(std::move(chunk));
+        }
+        std::set<Tuple> seen;
+        std::vector<Tuple> want;
+        for (const auto& row : rows) {
+            if (seen.insert(row).second) {
+                want.push_back(row);
+            }
+        }
+        return std::pair{std::move(chunks), std::move(want)};
+    };
+
+    struct Case {
+        const char* name;
+        std::size_t null_chunk;
+        bool wide;
+        bool dense;
+    };
+    for (const Case& test :
+         {Case{"all dense", 99, false, true}, Case{"the first chunk has nulls", 0, false, false},
+          Case{"a later chunk has nulls", 2, false, false},
+          Case{"a range too wide for the grid", 99, true, false}}) {
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+            CAPTURE(test.name, threads);
+            auto [chunks, want] = build(test.null_chunk, test.wide);
+            runtime::ExternRegistry externs;
+            auto held = std::make_shared<std::vector<runtime::Chunk>>(std::move(chunks));
+            externs.register_chunked_table("parts", [held](const runtime::ExternArgs&) {
+                return std::expected<runtime::OperatorPtr, std::string>{
+                    std::make_unique<VectorSource>(*held)};
+            });
+            auto ir = require_ir(
+                "extern fn parts() -> DataFrame from \"x.hpp\"; parts()[distinct { c, f, n }];");
+            runtime::ParallelPipelineStats stats;
+            runtime::ExecutionContext exec{.execution_profile = nullptr};
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            exec.parallel_stats = &stats;
+            const runtime::TableRegistry registry;
+            auto out = runtime::interpret(*ir, registry, nullptr, &externs, nullptr, exec);
+            CHECK(stats.dense_distincts.load() == (test.dense ? 1U : 0U));
+            if (test.null_chunk == 2) {
+                // The held chunks went back to the hashed path, whose packed
+                // store cannot take nulls that first appear in a later chunk
+                // and says so rather than answer wrongly: unchanged by holding.
+                REQUIRE_FALSE(out.has_value());
+                CHECK(out.error() ==
+                      "ChunkedDistinctOperator: key column gained nulls across chunks");
+                continue;
+            }
+            INFO((out.has_value() ? std::string{} : out.error()));
+            REQUIRE(out.has_value());
+            REQUIRE(out->rows() == want.size());
+            const auto& c = std::get<Column<Categorical>>(*out->find_entry("c")->column);
+            const auto& f = std::get<Column<bool>>(*out->find_entry("f")->column);
+            const auto* n_entry = out->find_entry("n");
+            const auto& n = std::get<Column<std::int64_t>>(*n_entry->column);
+            for (std::size_t i = 0; i < want.size(); ++i) {
+                CAPTURE(i);
+                const bool valid = !n_entry->validity.has_value() || (*n_entry->validity)[i];
+                const Tuple got{std::string(c[i]), f[i],
+                                valid ? std::optional{n[i]} : std::nullopt};
+                REQUIRE(got == want[i]);
+            }
+        }
+    }
+}
+
 // A whole-input distinct over small key domains -- Categorical codes, Bool,
 // narrow Int64 / compact Int32 / Date ranges -- marks each grid cell's first
 // row instead of probing a hash set. The output must be exactly the serial

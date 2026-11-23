@@ -916,6 +916,11 @@ struct ParallelPipelineStats {
     /// of one (`SerialMorselRunOperator`). The whole-table chunk gives the same
     /// answer, so a narrowed gate would cost the speed with every test green.
     std::atomic<std::uint64_t> serial_range_runs{0};
+    /// Distincts answered by the dense first-occurrence path
+    /// (`try_dense_whole_input`), whole-input or held across chunks. The hash
+    /// path gives the same rows, so without this a narrowed gate would cost
+    /// the speed with every test green.
+    std::atomic<std::uint64_t> dense_distincts{0};
     /// Grouped windowed updates whose groups were spread across worker threads.
     /// Same reason as the counters above: the output is identical either way,
     /// so without this a gate that quietly stopped matching — a newly nullable

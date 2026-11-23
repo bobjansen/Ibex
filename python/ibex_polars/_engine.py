@@ -54,6 +54,19 @@ def _dictionary_codes(column, name):
     return labels, codes
 
 
+def _collect(lf, rows):
+    """Collect one of the conversion queries below on a named engine.
+
+    Named, because a bare collect follows the engine affinity, and with
+    IbexEngine set it re-entered IbexEngine while a sink held the engine's
+    lock. Streaming spreads a large column over every thread, but starting it
+    costs about 0.4 ms, which a small result pays several times over: a top
+    100 spent 1.3 of its 2.6 ms of conversion in three such starts. Below
+    64K rows the in-memory engine's single thread is the cheaper one.
+    """
+    return lf.collect(engine="in-memory" if rows < (1 << 16) else "streaming")
+
+
 def _categorical_from_arrow(column, dtype, name):
     """Translate the dictionary labels once, then gather Polars category ids.
 
@@ -65,9 +78,9 @@ def _categorical_from_arrow(column, dtype, name):
     labels, codes = _dictionary_codes(column, name)
     # `categorical` keeps a named mapping alive until the ids have their dtype.
     categorical = labels.cast(pl.String).cast(dtype, strict=True)
-    result = pl.DataFrame([codes]).lazy().select(
+    result = _collect(pl.DataFrame([codes]).lazy().select(
         pl.lit(categorical.to_physical()).gather(pl.col(name)).cat.to(dtype).alias(name)
-    ).collect(engine="streaming").to_series()
+    ), len(codes)).to_series()
     del categorical
     return result
 
@@ -81,11 +94,8 @@ def _strings_from_dictionary(column, name):
     gathers from the small label column by code, in parallel: 6 ms.
     """
     labels, codes = _dictionary_codes(column, name)
-    # Named: a bare collect follows the engine affinity, and with IbexEngine
-    # set it re-entered IbexEngine while a sink held the engine's lock.
-    return pl.DataFrame([codes]).lazy().select(
-        pl.lit(labels.cast(pl.String)).gather(pl.col(name)).alias(name)).collect(
-            engine="streaming").to_series()
+    return _collect(pl.DataFrame([codes]).lazy().select(
+        pl.lit(labels.cast(pl.String)).gather(pl.col(name)).alias(name)), len(codes)).to_series()
 
 
 def _known_codes(column, dtype, name, categories):
@@ -251,9 +261,10 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
         # One streaming query converts every column of ids. `cat.to` checks
         # each id serially per chunk; streaming splits the rows into morsels,
         # so the check runs on every thread instead of one per column.
-        converted = pl.DataFrame(list(known.values())).lazy().with_columns(
+        ids = pl.DataFrame(list(known.values()))
+        converted = _collect(ids.lazy().with_columns(
             [_known_ids(name, mappings[name]).cat.to(dictionaries[name]).alias(name) for name in known]
-        ).collect(engine="streaming")
+        ), ids.height)
         categorical.update({name: converted.get_column(name) for name in known})
     prebuilt = {**categorical, **decoded}
     if prebuilt:
@@ -264,7 +275,7 @@ def _to_polars(result, expected, output, categories=(), left_rows=None):
         frame = pl.from_arrow(result)
     assert isinstance(frame, pl.DataFrame)
     # Named category mappings still require conversion to the requested dtype.
-    return frame if frame.schema == expected else frame.lazy().cast(expected, strict=True).collect(engine="streaming")
+    return frame if frame.schema == expected else _collect(frame.lazy().cast(expected, strict=True), frame.height)
 
 
 def _join_chunks(tables):

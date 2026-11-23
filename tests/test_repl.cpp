@@ -1106,6 +1106,65 @@ auto register_int_capture(ibex::runtime::ExternRegistry& registry, const std::st
 
 }  // namespace
 
+TEST_CASE("REPL streaming sink drains a bare lazy reader call through its scan plan",
+          "[repl][lazy]") {
+    // `capture(read_fake())` with a chunk-consuming `capture`: the bare call
+    // has a lazy reader, so the sink drains it through the planner (the
+    // pipelined scan on a real file) instead of the eager reader, which
+    // decoded the whole file nearly serially before the sink saw a row.
+    ibex::runtime::ExternRegistry registry;
+    int eager_calls = 0;
+    registry.register_table("read_fake",
+                            [&eager_calls](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ++eager_calls;
+                                ibex::runtime::Table table;
+                                table.add_column("a", ibex::Column<std::int64_t>{1, 2, 3});
+                                table.add_column("b", ibex::Column<std::int64_t>{10, 20, 30});
+                                return ibex::runtime::ExternValue{std::move(table)};
+                            });
+    std::vector<std::vector<std::string>> decode_calls;
+    register_recording_lazy_source(registry, decode_calls);
+    std::vector<std::int64_t> streamed;
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [](const ibex::runtime::Table&, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            return std::unexpected("capture: expected the streaming entry point");
+        },
+        [&streamed](const ibex::runtime::ExternTableProducer& produce,
+                    const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            auto drained = produce(
+                [&streamed](ibex::runtime::Table chunk) -> std::expected<void, std::string> {
+                    const auto* values = std::get_if<ibex::Column<std::int64_t>>(chunk.find("a"));
+                    if (values == nullptr) {
+                        return std::unexpected("capture expected Int64 column a");
+                    }
+                    streamed.insert(streamed.end(), values->begin(), values->end());
+                    return {};
+                });
+            if (!drained) {
+                return std::unexpected(std::move(drained.error()));
+            }
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+    REQUIRE(session
+                .execute(R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+)")
+                .ok);
+    const auto result = session.execute("capture(read_fake());");
+    INFO("error: " << result.error);
+    REQUIRE(result.ok);
+    CHECK(eager_calls == 0);
+    CHECK(streamed == std::vector<std::int64_t>{1, 2, 3});
+    CHECK_FALSE(decode_calls.empty());
+}
+
 TEST_CASE("REPL lazy scan: a filtered count() decodes only the predicate column", "[repl][lazy]") {
     // The filter is absorbed by the scan, so demand is computed on the reduced
     // plan: count() reads no column, and `a` matters only for the selection.

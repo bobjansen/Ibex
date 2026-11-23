@@ -1,6 +1,6 @@
 # Parallel Parquet writer
 
-**Status: planned, 2026-11-23.** Replace `parquet::write` (one `parquet::arrow::WriteTable`
+**Status: planned, 2026-11-23; not started.** Replace `parquet::write` (one `parquet::arrow::WriteTable`
 call, one thread, uncompressed) with a writer that encodes column chunks on the worker pool
 and writes them in order, and let `IbexEngine.sink_parquet` use it instead of handing every
 batch to Polars' writer.
@@ -118,12 +118,17 @@ enough. Phase 0 measures it anyway; if it reaches the target, this plan stops th
   file size; A/Bs of the native suites where a script writes Parquet.
 - Run on the GCC wheel build too, not only Clang (`project-gcc-wheel-codegen`).
 
-## Open decisions
+## Decisions (2026-11-23)
 
-- **Default compression for `parquet::write`.** Today it writes uncompressed. Matching Polars
-  (zstd) makes files several times smaller and changes existing scripts' output size.
-- **How close the IbexEngine sink must match Polars' file.** Current tests require identical
-  schema and metadata (`check_metadata=True`); a native writer gives the same logical schema
-  and data, but its own `created_by` and possibly different row group and page boundaries.
+- **`parquet::write` defaults to zstd**, as Polars does. Existing scripts' output files get
+  smaller; their contents read back the same. SPEC.md and the docs say so in phase 3.
+- **The IbexEngine sink matches Polars' file logically, not byte for byte:** the same schema
+  as Arrow and Polars read it (types, nullability, Categorical as dictionary, `ARROW:schema`)
+  and the same data, while `created_by`, row group and page boundaries and encodings may
+  differ. The sink tests that compare with `check_metadata=True` move to a logical comparison
+  for the native path.
+
+## Still open
+
 - **Scope of `sink_parquet` options** served natively in phase 4, and whether the
-  Polars-writer path stays as the fallback.
+  Polars-writer path stays as the fallback for the rest.

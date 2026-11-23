@@ -80,8 +80,11 @@ def _strings_from_dictionary(column, name):
     gathers from the small label column by code, in parallel: 6 ms.
     """
     labels, codes = _dictionary_codes(column, name)
+    # Named: a bare collect follows the engine affinity, and with IbexEngine
+    # set it re-entered IbexEngine while a sink held the engine's lock.
     return pl.DataFrame([codes]).lazy().select(
-        pl.lit(labels.cast(pl.String)).gather(pl.col(name)).alias(name)).collect().to_series()
+        pl.lit(labels.cast(pl.String)).gather(pl.col(name)).alias(name)).collect(
+            engine="in-memory").to_series()
 
 
 def _known_codes(column, dtype, name, categories):
@@ -469,32 +472,38 @@ class IbexEngine(pl.Engine):
         (compression, statistics, row groups, `PartitionBy`, cloud storage,
         file objects) behaves as it does in Polars.
         """
+        # The lock guards the plan cache only. The write runs after it is
+        # released: Polars calls `batches` on its own streaming threads, and
+        # anything there that reaches this engine (a collect routed here by the
+        # engine affinity) would wait forever on a lock the sink held, as
+        # would every other collect on this engine for the whole write.
+        # Native runs are serialized by the session itself.
         with self._lock:
             source, bindings, scalars, expected, output, categories, left_rows = self._prepare(lf, optimizations)
-            if left_rows is not None or not expected:
-                # A join rebuilt from the original frame's rows, or a result
-                # without columns, converts whole.
-                frame = self.collect(lf, optimizations=optimizations)
-                frame.lazy().sink_parquet(path, engine="streaming", **options)
-                return
-            # Polars' streaming sink writes each batch as Ibex produces it, so
-            # encoding overlaps the query instead of following it.
-            stream = _StreamedResult(source, bindings, scalars)
-            schema = pl.Schema(expected)
+        if left_rows is not None or not expected:
+            # A join rebuilt from the original frame's rows, or a result
+            # without columns, converts whole.
+            frame = self.collect(lf, optimizations=optimizations)
+            frame.lazy().sink_parquet(path, engine="streaming", **options)
+            return
+        # Polars' streaming sink writes each batch as Ibex produces it, so
+        # encoding overlaps the query instead of following it.
+        stream = _StreamedResult(source, bindings, scalars)
+        schema = pl.Schema(expected)
 
-            def batches(with_columns, predicate, n_rows, batch_size):
-                remaining = n_rows
-                for batch in stream.batches():
-                    frame = _to_polars(batch, expected, output, categories)
-                    if with_columns is not None:
-                        frame = frame.select(with_columns)
-                    if predicate is not None:
-                        frame = frame.filter(predicate)
-                    if remaining is not None:
-                        frame = frame.head(remaining)
-                        remaining -= frame.height
-                    yield frame
-                    if remaining == 0:
-                        return
+        def batches(with_columns, predicate, n_rows, batch_size):
+            remaining = n_rows
+            for batch in stream.batches():
+                frame = _to_polars(batch, expected, output, categories)
+                if with_columns is not None:
+                    frame = frame.select(with_columns)
+                if predicate is not None:
+                    frame = frame.filter(predicate)
+                if remaining is not None:
+                    frame = frame.head(remaining)
+                    remaining -= frame.height
+                yield frame
+                if remaining == 0:
+                    return
 
-            register_io_source(batches, schema=schema).sink_parquet(path, engine="streaming", **options)
+        register_io_source(batches, schema=schema).sink_parquet(path, engine="streaming", **options)

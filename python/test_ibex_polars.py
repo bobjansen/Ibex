@@ -1329,6 +1329,42 @@ class EngineTests(unittest.TestCase):
             buffer.seek(0)
             assert_frame_equal(pl.read_parquet(buffer), query.collect(engine="streaming"))
 
+    def test_sink_parquet_under_ibex_engine_affinity(self):
+        # With IbexEngine as the engine affinity, a bare internal collect is
+        # routed back into the engine. The sink once held the engine's lock
+        # while Polars ran its batches on a streaming thread, and converting a
+        # String batch re-entered the engine there and waited on that lock
+        # forever. Run in a thread so a regression fails instead of hanging.
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "in.parquet"
+            self._sink_frame(200_000).write_parquet(source, row_group_size=25_000)
+            target = Path(directory) / "out.parquet"
+            query = pl.scan_parquet(source).filter(pl.col("day") > 20)
+            engine = IbexEngine()
+            errors = []
+
+            def run():
+                try:
+                    with pl.Config() as config:
+                        config.set_engine_affinity(engine)
+                        query.sink_parquet(target)
+                        # Another collect on the same engine while nothing
+                        # holds its lock.
+                        errors.append(query.select("id").collect().height)
+                except BaseException as error:  # reported below
+                    errors.append(error)
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            worker.join(timeout=60)
+            self.assertFalse(worker.is_alive(), "sink_parquet under the IbexEngine affinity hung")
+            self.assertEqual(len(errors), 1)
+            self.assertNotIsInstance(errors[0], BaseException)
+            expected = query.collect(engine="streaming")
+            self.assertEqual(errors[0], expected.height)
+            assert_frame_equal(pl.read_parquet(target), expected)
+
     def test_sink_parquet_of_an_empty_result_and_after_a_failed_write(self):
         with tempfile.TemporaryDirectory() as directory:
             query = self._sink_source(directory)

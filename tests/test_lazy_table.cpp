@@ -1759,7 +1759,9 @@ TEST_CASE("LazyTable: static range narrows a predicate-only categorical by dicti
         CHECK(int_column(*table, "v") == std::vector<std::int64_t>{15});
         CHECK(state->dictionary_scans == std::vector<std::string>{"flag"});
         CHECK(state->candidates_seen == std::vector<runtime::Selection>{{3, 4, 5}});
-        CHECK(state->decode_calls == std::vector<std::vector<std::string>>{{"v"}, {"v"}});
+        // `v` is decoded once, to test `v > 13`; the output gathers it from
+        // those rows rather than decoding it again.
+        CHECK(state->decode_calls == std::vector<std::vector<std::string>>{{"v"}});
     }
 
     SECTION("a reader that declines the dictionary scan falls back") {
@@ -2178,4 +2180,64 @@ TEST_CASE("LazyTable: a unit's join keys keep their nulls when a conjunct drops 
         }
     }
     CHECK(null_keys > 0);  // the case under test actually occurred
+}
+
+// A literal range answered by the reader's key scan, narrowed by a conjunct on
+// another column, decodes that column at the candidate rows to test it. When
+// the output also wants it, it is gathered from those rows: decoding it again
+// for the passing rows decompressed its pages a second time (q06 over Parquet
+// read `price` and `qty` twice). Only the columns nothing has decoded yet are
+// asked of the source, on the whole source and per unit alike.
+TEST_CASE("LazyTable: a range-narrowed output reuses the columns staged to narrow it",
+          "[runtime][lazy_table]") {
+    auto state = std::make_shared<TextSourceState>();
+    runtime::Table schema;
+    schema.add_column("n", Column<std::int64_t>{});
+    schema.add_column("m", Column<std::int64_t>{});
+    schema.add_column("s", Column<std::string>{});
+    runtime::LazyTable lazy{
+        std::move(schema), kText.size(),
+        [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<TextReader>(state)};
+        }};
+    // `n >= 1` is the reader's range; `m != 3` narrows what it passes. `m`
+    // decodes as the row number.
+    ir::CompareExpr not_three;
+    not_three.op = ir::CompareOp::Ne;
+    not_three.left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "m"}});
+    not_three.right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{3}}});
+    const std::vector<ir::Expr> conjuncts{greater_than("n", 0), ir::Expr{.node = not_three}};
+    const auto strings = [](const runtime::Table& table) {
+        const auto* s = std::get_if<Column<std::string>>(table.find("s"));
+        REQUIRE(s != nullptr);
+        std::vector<std::string> out;
+        for (std::size_t i = 0; i < s->size(); ++i) {
+            out.emplace_back((*s)[i]);
+        }
+        return out;
+    };
+
+    SECTION("whole source") {
+        auto table = lazy.project_where({"m", "s"}, conjuncts, kExec);
+        REQUIRE(table);
+        CHECK(state->key_scan_calls == std::vector<std::string>{"n"});
+        CHECK(state->decode_calls == std::vector<std::vector<std::string>>{{"m"}, {"s"}});
+        CHECK(names_of(*table) == std::vector<std::string>{"m", "s"});
+        CHECK(int_column(*table, "m") == std::vector<std::int64_t>{1, 2, 4, 5});
+        CHECK(strings(*table) == std::vector<std::string>{"bad apple", "cherry", "date", "elder"});
+    }
+    SECTION("one unit") {
+        auto table = lazy.project_where_unit({"m", "s"}, conjuncts, kUnits[1], kExec);
+        REQUIRE(table);
+        CHECK(state->decode_calls == std::vector<std::vector<std::string>>{{"m"}, {"s"}});
+        CHECK(int_column(*table, "m") == std::vector<std::int64_t>{2});
+        CHECK(strings(*table) == std::vector<std::string>{"cherry"});
+    }
+    SECTION("only staged columns wanted") {
+        auto table = lazy.project_where({"m"}, conjuncts, kExec);
+        REQUIRE(table);
+        CHECK(state->decode_calls == std::vector<std::vector<std::string>>{{"m"}});
+        CHECK(int_column(*table, "m") == std::vector<std::int64_t>{1, 2, 4, 5});
+        CHECK(table->rows() == 4);
+    }
 }

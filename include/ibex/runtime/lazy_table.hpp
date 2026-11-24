@@ -406,6 +406,16 @@ class LazyTable {
                                        const SourceUnit* unit, const ExecutionContext& exec,
                                        Column<std::int64_t>* values = nullptr)
         -> std::expected<std::optional<Selection>, std::string>;
+    /// The columns `narrow_selection` decoded at its candidate rows to test
+    /// the conjuncts the range did not express, and the positions among those
+    /// rows that passed. An output that names one of them gathers it from
+    /// here: decoding it again for the passing rows decompressed its pages a
+    /// second time (the demo's q06 over Parquet read `price` and `qty` twice,
+    /// 46 ms against 23 for the plain read).
+    struct StagedRows {
+        Table columns;
+        Selection passed;
+    };
     /// Rows of `unit` (the whole source when null) that satisfy `conjuncts`,
     /// decided inside the reader's decoder: the literal range on one integer
     /// column is a fused key scan (footer statistics prune whole row groups),
@@ -414,12 +424,24 @@ class LazyTable {
     /// `exact_shape_only` (a dynamic membership filter also applies, which
     /// this path would drop) only a predicate that is entirely such a range over
     /// a column `names` does not need is taken.
+    ///
+    /// `staged`, when given, receives the columns the narrowing decoded to test
+    /// the remaining conjuncts (see `StagedRows`).
     [[nodiscard]] auto static_range_selection(const std::vector<ir::Expr>& conjuncts,
                                               const std::set<std::string>& names,
                                               bool exact_shape_only, const SourceUnit* unit,
                                               const ExecutionContext& exec,
-                                              const ScalarRegistry* scalars)
+                                              const ScalarRegistry* scalars,
+                                              StagedRows* staged = nullptr)
         -> std::expected<std::optional<Selection>, std::string>;
+    /// The answered selection's output: `wanted` columns at `selected`,
+    /// gathered from `staged` where the narrowing already decoded them and
+    /// decoded by the source otherwise.
+    [[nodiscard]] auto decode_answered(const std::vector<std::string>& wanted,
+                                       const Selection& selected, std::size_t unit_rows,
+                                       StagedRows& staged, const SourceUnit* unit,
+                                       const ExecutionContext& exec)
+        -> std::expected<Table, std::string>;
     /// The conjunct columns eligible for staging through a selection; nullopt
     /// when any of them is variable-width and the staged path must be declined.
     [[nodiscard]] auto stageable_conjunct_columns(const std::vector<ir::Expr>& conjuncts) const
@@ -429,7 +451,8 @@ class LazyTable {
     [[nodiscard]] auto narrow_selection(const Selection& selected,
                                         const std::vector<ir::Expr>& conjuncts,
                                         const ExecutionContext& exec, const ScalarRegistry* scalars,
-                                        const SourceUnit* unit = nullptr)
+                                        const SourceUnit* unit = nullptr,
+                                        StagedRows* staged = nullptr)
         -> std::expected<std::optional<Selection>, std::string>;
     /// Phase A for one unit when the fused scan has no answer for it.
     [[nodiscard]] auto unit_key_selection_fallback(const std::vector<ir::Expr>& conjuncts,

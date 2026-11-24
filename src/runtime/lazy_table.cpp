@@ -841,25 +841,20 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     // the range does not express narrows the result afterwards. A source that
     // declines falls through to the established decode-and-filter path.
     if (reader_factory_ && !conjuncts.empty()) {
+        StagedRows staged;
         auto answered =
-            static_range_selection(conjuncts, names, membership, nullptr, exec, scalars);
+            static_range_selection(conjuncts, names, membership, nullptr, exec, scalars, &staged);
         if (!answered) {
             return std::unexpected(answered.error());
         }
         if (answered->has_value()) {
-            const Selection& selected = **answered;
-            const bool all_rows = selected.size() == rows_;
             std::vector<std::string> wanted;
             for (const auto& field : schema_.columns) {
                 if (names.contains(field.name)) {
                     wanted.push_back(field.name);
                 }
             }
-            auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected, nullptr, exec);
-            if (!decoded) {
-                return std::unexpected(decoded.error());
-            }
-            return std::move(*decoded);
+            return decode_answered(wanted, **answered, rows_, staged, nullptr, exec);
         }
     }
 
@@ -1216,24 +1211,20 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
     }
 
     if (reader_factory_ && !conjuncts.empty()) {
-        auto answered = static_range_selection(conjuncts, names, membership, &unit, exec, scalars);
+        StagedRows staged;
+        auto answered =
+            static_range_selection(conjuncts, names, membership, &unit, exec, scalars, &staged);
         if (!answered) {
             return std::unexpected(answered.error());
         }
         if (answered->has_value()) {
-            const Selection& selected = **answered;
-            const bool all_rows = selected.size() == unit.rows;
             std::vector<std::string> wanted;
             for (const auto& field : schema_.columns) {
                 if (names.contains(field.name)) {
                     wanted.push_back(field.name);
                 }
             }
-            auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected, &unit, exec);
-            if (!decoded) {
-                return std::unexpected(decoded.error());
-            }
-            return std::move(*decoded);
+            return decode_answered(wanted, **answered, unit.rows, staged, &unit, exec);
         }
     }
 
@@ -1698,7 +1689,7 @@ auto LazyTable::stageable_conjunct_columns(const std::vector<ir::Expr>& conjunct
 auto LazyTable::static_range_selection(const std::vector<ir::Expr>& conjuncts,
                                        const std::set<std::string>& names, bool exact_shape_only,
                                        const SourceUnit* unit, const ExecutionContext& exec,
-                                       const ScalarRegistry* scalars)
+                                       const ScalarRegistry* scalars, StagedRows* staged)
     -> std::expected<std::optional<Selection>, std::string> {
     auto range = split_static_range(conjuncts, schema_, scalars, &stats_);
     if (!range.has_value() || cache_.contains(range->column)) {
@@ -1784,12 +1775,12 @@ auto LazyTable::static_range_selection(const std::vector<ir::Expr>& conjuncts,
         }
         return std::optional{std::move(selected)};
     }
-    return narrow_selection(selected, *remainder, exec, scalars, unit);
+    return narrow_selection(selected, *remainder, exec, scalars, unit, staged);
 }
 
 auto LazyTable::narrow_selection(const Selection& selected, const std::vector<ir::Expr>& conjuncts,
                                  const ExecutionContext& exec, const ScalarRegistry* scalars,
-                                 const SourceUnit* unit)
+                                 const SourceUnit* unit, StagedRows* staged)
     -> std::expected<std::optional<Selection>, std::string> {
     const auto names = stageable_conjunct_columns(conjuncts);
     if (!names.has_value()) {
@@ -1814,7 +1805,60 @@ auto LazyTable::narrow_selection(const Selection& selected, const std::vector<ir
             out[i] = selected[(*local)[i]];
         }
     });
+    if (staged != nullptr) {
+        staged->columns = std::move(*stage);
+        staged->passed = std::move(*local);
+    }
     return std::optional{std::move(out)};
+}
+
+auto LazyTable::decode_answered(const std::vector<std::string>& wanted, const Selection& selected,
+                                std::size_t unit_rows, StagedRows& staged, const SourceUnit* unit,
+                                const ExecutionContext& exec) -> std::expected<Table, std::string> {
+    const bool all_rows = selected.size() == unit_rows;
+    std::vector<std::string> decode;
+    for (const auto& name : wanted) {
+        if (staged.columns.find_entry(name) == nullptr) {
+            decode.push_back(name);
+        }
+    }
+    Table decoded;
+    if (!decode.empty() || decode.size() == wanted.size()) {
+        auto columns = decode_columns(decode, all_rows ? nullptr : &selected, unit, exec);
+        if (!columns) {
+            return std::unexpected(columns.error());
+        }
+        if (decode.size() == wanted.size()) {
+            return std::move(*columns);
+        }
+        decoded = std::move(*columns);
+    }
+    Table out;
+    for (const auto& name : wanted) {
+        if (const auto* entry = decoded.find_entry(name); entry != nullptr) {
+            out.add_column_from(entry->name, *entry);
+            continue;
+        }
+        const auto* entry = staged.columns.find_entry(name);
+        if (entry == nullptr) {
+            return std::unexpected("lazy source did not produce requested column '" + name + "'");
+        }
+        ColumnEntry gathered;
+        gathered.name = entry->name;
+        gathered.column = std::make_shared<ColumnValue>(
+            gather_column(*entry->column, staged.passed.data(), staged.passed.size(), &exec));
+        if (entry->validity.has_value()) {
+            const ValidityBitmap& source = entry->validity.value();
+            ValidityBitmap validity(staged.passed.size(), true);
+            for (std::size_t row = 0; row < staged.passed.size(); ++row) {
+                validity.set(row, source[staged.passed[row]]);
+            }
+            gathered.validity = std::move(validity);
+        }
+        out.add_column_from(gathered.name, gathered);
+    }
+    out.logical_rows = selected.size();
+    return out;
 }
 
 auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,

@@ -111,3 +111,71 @@ which changed the trade-off for three leaves; re-measure before widening.
 **f. `distinct_symbol` read +7-8% at one core** in two A/Bs of `8401244c`,
 whose code it does not run (`prices[distinct { symbol }]`: no filter, no
 aggregate). Taken as code layout; not verified.
+
+## 5. The demo over Parquet (`--parquet`)
+
+The in-memory gains did not carry over to the demo's `--parquet` mode: there
+every query runs through the scan pipeline and the lazy scan's own filter
+path. Fixed 2026-11-23/24 (8 cores, local Clang build with the GCC-built zstd):
+
+| query | before | now | Polars |
+|---|---:|---:|---:|
+| global aggregate | 45 ms | 29 ms (`bc90f24b`: predicate columns no longer decoded twice) | 29 |
+| few groups | 47 | 36 (`96ff711a`: scan workers accumulate the dense pair path) | 42 |
+| distinct | 143 | 55 (`bf6dcc26`: dense path held across chunks) | 101 |
+
+Still behind, and neither has one cause to fix:
+
+- **zstd is not the gap.** Ibex and Polars spend the same CPU in zstd on
+  both queries (perf samples, 40 runs: top-N 17.4k vs 17.1k, wide 17.8k vs
+  17.2k). `IBEX_ZSTD_WITH_GCC` (libs/parquet/CMakeLists.txt) builds it with
+  GCC in the Clang dev builds and the local wheel build too. perf leaves
+  Polars' Huffman loop unnamed (its text segment's vaddr is file offset +
+  0x1000), which made Polars look zstd-light. The gap is all outside zstd:
+  top-N ~5k extra samples, wide ~11k, with memmove 4-6x Polars'.
+- **Top-N (54 vs 42 ms).** `venue == "XNAS"` keeps a random 20%, so
+  selected runs average 1.25 rows, and the selected decode called libc
+  memcpy per run (60% of Ibex's memmove samples). Fixed by "Parquet: copy short
+  selected runs as one inline block": 54.8 -> 54.0 ms. The rest of the gap is
+  not in copies.
+- **Wide result (81 vs 59 ms).** `qty > 10` keeps 99%. The key scan never
+  abandons: `kAbandonMinRows` is 262,144 rows and a streamed unit is a
+  couple of Polars' 123,457-row groups. Measured 2026-11-25, both ruled out:
+  abandoning once a value-free scan has seen its whole unit made it slower
+  (81.4 -> 85.8 ms, 0/8 pairs; the dense decode then filter loses, as
+  below), and moving a single-part `Selection` instead of copying it in
+  `copy_key_scan_parts` changed nothing (units span several groups, so
+  there are several parts). `qty` is still decoded twice (see below). The
+  result's conversion to Polars is ~14 ms (Polars' own gather turning
+  `symbol` into String).
+- **Per-stage split, 2026-11-25** (perf samples, 40 runs, 8 cores, stacks
+  classified by first matching frame; gaps are Ibex minus Polars). Both
+  engines keep ~7 of 8 cores busy, so the gap is extra CPU work (top-N
+  +22%, wide +27%), not idle cores.
+  - Wide (+10.4k): Polars turning Ibex's Categorical `symbol` back into
+    String after the hand-over (`convert_and_bound_index`, `take_values`
+    of views, `from_cats_and_dtype`) is ~5.9k, over half the gap. Ibex
+    decoding `symbol` as a Categorical (`decode_dictionary_column`,
+    `CategoricalDictionaryUnifier::gather`, string hashing) is ~6k more,
+    against Polars' plain view decode of under 1k. Polars spends ~3.6k
+    more on fixed-width decode.
+  - Top-N (+5.9k): `symbol`/`venue` Categorical decode ~+2.5k
+    (`decode_dictionary_column` 3.2k vs Polars' ~0.7k), pipeline and
+    scheduling +0.9k, integer dictionary decode through Arrow's
+    `DictionaryConverter` ~+1k. Polars spends 0.5k more in top-k, which
+    pushes its running threshold into the scan (`PrimitiveBottomKPredicate`)
+    and decodes payload columns masked (`decode_masked_required`).
+  - So the remaining gap is the String column: Ibex makes `symbol` a
+    Categorical (dictionary unify, per-row code remap) and the result then
+    has to be turned back into String. **Accepted 2026-11-25 as the cost of
+    the Categorical design**: the same representation is why distinct,
+    join and few groups beat Polars (1.8x, 1.6x, 1.1x). A pass-through-only
+    string-view path would need a second column representation and a view
+    column type for two boundary-heavy queries, so it is not planned.
+- **Not avoidable:** Arrow's `PlainDecoder::Decode` copying page bytes into
+  the batch buffer (~20% of memmove on both), and zstd's own copies.
+
+*Reopen* with a measurement of a dense decode followed by a gather against
+the selected decode when most rows pass, and with `reuse_key` extended to
+the static range.
+

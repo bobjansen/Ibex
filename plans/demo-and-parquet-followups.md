@@ -175,7 +175,18 @@ Still behind, and neither has one cause to fix:
 - **Not avoidable:** Arrow's `PlainDecoder::Decode` copying page bytes into
   the batch buffer (~20% of memmove on both), and zstd's own copies.
 
-*Reopen* with a measurement of a dense decode followed by a gather against
-the selected decode when most rows pass, and with `reuse_key` extended to
-the static range.
+**Measured 2026-11-24, ruled out: dense decode plus gather.** Decoding the
+payload columns whole and gathering the passing rows in Ibex, instead of the
+reader's selected decode, is slower on both queries (engine time, 8 cores):
+the wide result (99% of rows kept, payload through `decode_answered`) 67 ->
+87 ms, top-N (20% kept, through `project_where_unit`'s general path) 54 ->
+58 ms. The selected decode already writes each passing value once; the
+gather adds a full extra copy. The ~20% of CPU it shows is the decode
+itself, not avoidable overhead.
+
+Still open: the wide result decodes its range key `qty` twice (the trace
+showed all 7 columns decoded after the key scan). Extending `reuse_key` to
+`static_range_selection` would take the scanned values for an Int64 key that
+is also output; `qty` is ~10% of the file's compressed bytes, so expect a
+few percent.
 

@@ -19411,6 +19411,12 @@ class CatPipelineReader final : public runtime::LazySourceReader {
                     values.push_back(static_cast<std::int64_t>(row % 13));
                 }
                 out.add_column("q", Column<std::int64_t>{std::move(values)});
+            } else if (name == "b") {
+                Column<bool> flags;
+                for (const std::size_t row : rows) {
+                    flags.push_back((row % 5) < 2);
+                }
+                out.add_column("b", std::move(flags));
             } else {
                 return std::unexpected("cat pipeline reader: unknown column " + name);
             }
@@ -19420,12 +19426,18 @@ class CatPipelineReader final : public runtime::LazySourceReader {
     }
 };
 
-auto make_cat_pipeline_deferred() -> runtime::DeferredScanRegistry {
+/// `with_bool` adds a Bool column `b`, for a Categorical x Bool key pair.
+auto make_cat_pipeline_deferred(bool with_bool = false) -> runtime::DeferredScanRegistry {
     runtime::Table schema;
     schema.add_column("f", Column<Categorical>{std::vector<std::string>{}});
     schema.add_column("s", Column<Categorical>{std::vector<std::string>{}});
     schema.add_column("v", Column<double>{});
     schema.add_column("q", Column<std::int64_t>{});
+    std::set<std::string> demand{"f", "s", "v", "q"};
+    if (with_bool) {
+        schema.add_column("b", Column<bool>{});
+        demand.insert("b");
+    }
     auto lazy = std::make_shared<runtime::LazyTable>(
         std::move(schema), kCatUnits * kCatUnitRows,
         []() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
@@ -19434,7 +19446,7 @@ auto make_cat_pipeline_deferred() -> runtime::DeferredScanRegistry {
     runtime::DeferredScanRegistry deferred;
     deferred.emplace("df", runtime::DeferredScan{.lazy = std::move(lazy),
                                                  .conjuncts = {},
-                                                 .demand = {"f", "s", "v", "q"},
+                                                 .demand = std::move(demand),
                                                  .demand_all = false,
                                                  .key_column = {},
                                                  .filter = nullptr});
@@ -20853,6 +20865,42 @@ TEST_CASE("Scan pipeline workers accumulate a dense Categorical aggregate",
     runtime::ParallelPipelineStats above_serial;
     runtime::ParallelPipelineStats above_stats;
     same_columns(run(above, 4, above_stats), run(above, 1, above_serial));
+}
+
+// The pair path takes scan-worker partials too: a Categorical key with a Bool
+// one (`by { venue, is_buy }`) reads both as integers. Each worker numbers
+// cells over its unit's own dictionary and bounds; the aggregate maps every
+// cell to its own through the cell's first row, in the chunk as emitted, so a
+// rotated dictionary and a value first seen in the last unit still land in
+// their groups. The answer must be the serial one to the byte, and the
+// aggregate must not fan out itself: every unit arrived already accumulated.
+TEST_CASE("Scan pipeline workers accumulate a dense Categorical x Bool aggregate",
+          "[runtime][parallel][pipeline][aggregate]") {
+    const runtime::TableRegistry empty;
+    const auto run = [&](std::size_t threads, runtime::ParallelPipelineStats& stats) {
+        auto deferred = make_cat_pipeline_deferred(/*with_bool=*/true);
+        auto ir = require_ir(
+            "df[select { total = sum(v), n = count(), avg_q = mean(q), hi = max(q) }, "
+            "by { f, b }];");
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = threads;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+        INFO((out.has_value() ? std::string{} : out.error()));
+        REQUIRE(out.has_value());
+        return std::move(*out);
+    };
+    runtime::ParallelPipelineStats serial_stats;
+    const auto reference = run(1, serial_stats);
+    // {A, N, R} x {false, true}, and X only with false: X rows are 7 mod 1000.
+    CHECK(reference.rows() == 7);
+    runtime::ParallelPipelineStats stats;
+    const auto streamed = run(4, stats);
+    CHECK(stats.pipelined_scans.load() == 1);
+    CHECK(stats.parallel_fields.load() == 0);
+    const auto mismatch = runtime::compare_tables(reference, streamed);
+    INFO((mismatch.has_value() ? mismatch->message() : std::string{}));
+    CHECK_FALSE(mismatch.has_value());
 }
 
 // The pipeline left the last unit's keys over its own dictionary, expecting

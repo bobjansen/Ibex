@@ -2010,9 +2010,21 @@ class HashAggregateState final {
     /// aggregates. The same test a scan worker's shadow applies to its own
     /// first chunk (`prepare_worker_shadow`).
     [[nodiscard]] auto on_worker_partial_path() const -> bool {
-        return initialized_ && columns_.has_value() && cat_fast_path_ && group_by_->size() >= 2 &&
-               multi_dense_ && !multi_cat_any_nullable_ && !has_count_distinct_ &&
-               aggs_are_slot_combinable(true);
+        if (!initialized_ || !columns_.has_value() || has_count_distinct_ ||
+            !aggs_are_slot_combinable(true)) {
+            return false;
+        }
+        return (cat_fast_path_ && group_by_->size() >= 2 && multi_dense_ &&
+                !multi_cat_any_nullable_) ||
+               on_pair_worker_path();
+    }
+
+    /// The pair path's share of `on_worker_partial_path`: two non-null keys
+    /// that each read as a 32-bit integer (a Categorical's code, a Bool, a
+    /// Date), as `by { venue, is_buy }` does. Workers number cells over their
+    /// unit's own bounds; `try_process_rows_pair_dense` maps each to its own.
+    [[nodiscard]] auto on_pair_worker_path() const -> bool {
+        return !cat_fast_path_ && pair_int_fast_path_ && pair_packs_u64_ && group_by_->size() == 2;
     }
 
     /// Prepare this operator as a scan worker's SHADOW: fixed from the first
@@ -2551,7 +2563,9 @@ class HashAggregateState final {
         if (scan_sink_ != nullptr && !scan_sink_decided_) {
             scan_sink_decided_ = true;
             scan_sink_active_ = on_worker_partial_path();
-            if (scan_sink_active_) {
+            // The pair path's merge reads its keys from the emitted chunk, so
+            // they must arrive over the shared dictionary.
+            if (scan_sink_active_ && !on_pair_worker_path()) {
                 scan_sink_->defer_translation(untranslatable_key_columns());
             }
         }
@@ -4291,62 +4305,63 @@ class HashAggregateState final {
         }
     }
 
+    // Bind the key column's buffer once, the way `process_rows_int` does.
+    // Reading it through `std::get` per row costs a variant index check per
+    // key per row and re-derives the pointer every time, which on 8M rows
+    // over two keys was most of this loop.
+    struct RawKeyReader {
+        IntegerView i64 = nullptr;
+        const Date* dates = nullptr;
+        const Timestamp* stamps = nullptr;
+        const Column<Categorical>::code_type* codes = nullptr;
+        const Column<bool>* bools = nullptr;
+        IntKeyKind kind = IntKeyKind::Int64;
+
+        [[nodiscard]] auto operator()(std::size_t row) const -> std::int64_t {
+            switch (kind) {
+                case IntKeyKind::Int64:
+                    return i64[row];
+                case IntKeyKind::Date:
+                    return dates[row].days;
+                case IntKeyKind::Ts:
+                    return stamps[row].nanos;
+                case IntKeyKind::Cat:
+                    return codes[row];
+                case IntKeyKind::Bool:
+                    return (*bools)[row] ? 1 : 0;
+            }
+            return 0;
+        }
+    };
+    static auto bind_reader(const ColumnValue& col, IntKeyKind kind) -> RawKeyReader {
+        RawKeyReader reader;
+        reader.kind = kind;
+        switch (kind) {
+            case IntKeyKind::Int64:
+                reader.i64 = std::get<Column<std::int64_t>>(col).integer_view();
+                break;
+            case IntKeyKind::Date:
+                reader.dates = std::get<Column<Date>>(col).data();
+                break;
+            case IntKeyKind::Ts:
+                reader.stamps = std::get<Column<Timestamp>>(col).data();
+                break;
+            case IntKeyKind::Cat:
+                reader.codes = std::get<Column<Categorical>>(col).codes_data();
+                break;
+            case IntKeyKind::Bool:
+                reader.bools = &std::get<Column<bool>>(col);
+                break;
+        }
+        return reader;
+    }
+
     // Two fixed-width-integer keys, grouped as one composite. Mirrors
     // process_rows_int exactly, packing (key_a, key_b) into a two-word key so
     // a single hash probe replaces the generic path's per-key Key comparison.
     auto process_rows_int_pair(const std::vector<const ColumnEntry*>& group_entries,
                                const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
-        // Bind the key column's buffer once, the way `process_rows_int` does.
-        // Reading it through `std::get` per row costs a variant index check per
-        // key per row and re-derives the pointer every time, which on 8M rows
-        // over two keys was most of this loop.
-        struct RawKeyReader {
-            IntegerView i64 = nullptr;
-            const Date* dates = nullptr;
-            const Timestamp* stamps = nullptr;
-            const Column<Categorical>::code_type* codes = nullptr;
-            const Column<bool>* bools = nullptr;
-            IntKeyKind kind = IntKeyKind::Int64;
-
-            [[nodiscard]] auto operator()(std::size_t row) const -> std::int64_t {
-                switch (kind) {
-                    case IntKeyKind::Int64:
-                        return i64[row];
-                    case IntKeyKind::Date:
-                        return dates[row].days;
-                    case IntKeyKind::Ts:
-                        return stamps[row].nanos;
-                    case IntKeyKind::Cat:
-                        return codes[row];
-                    case IntKeyKind::Bool:
-                        return (*bools)[row] ? 1 : 0;
-                }
-                return 0;
-            }
-        };
-        const auto bind_reader = [](const ColumnValue& col, IntKeyKind kind) -> RawKeyReader {
-            RawKeyReader reader;
-            reader.kind = kind;
-            switch (kind) {
-                case IntKeyKind::Int64:
-                    reader.i64 = std::get<Column<std::int64_t>>(col).integer_view();
-                    break;
-                case IntKeyKind::Date:
-                    reader.dates = std::get<Column<Date>>(col).data();
-                    break;
-                case IntKeyKind::Ts:
-                    reader.stamps = std::get<Column<Timestamp>>(col).data();
-                    break;
-                case IntKeyKind::Cat:
-                    reader.codes = std::get<Column<Categorical>>(col).codes_data();
-                    break;
-                case IntKeyKind::Bool:
-                    reader.bools = &std::get<Column<bool>>(col);
-                    break;
-            }
-            return reader;
-        };
         const auto key_a_at = bind_reader(*group_entries[0]->column, int_key_kind_);
         const auto key_b_at = bind_reader(*group_entries[1]->column, int_key_kind_b_);
         const auto pack = [](std::int64_t a, std::int64_t b) -> PairIntKey {
@@ -4713,6 +4728,27 @@ class HashAggregateState final {
                     b_min + static_cast<std::int64_t>(cell % b_span)};
         };
         const std::size_t morsels = dense_morsel_count(n_cells, rows);
+        if (morsels != 0 && scan_sink_active_ && on_pair_worker_path()) {
+            // The scan worker accumulated this chunk while decoding it. Its
+            // cells are its own; each maps to ours through its first row, read
+            // in the chunk as emitted. Same morsel cuts, so the same
+            // first-occurrence order and combine order as accumulating here.
+            if (auto partial = std::move(worker_emission_.partial);
+                partial != nullptr && partial->rows == rows &&
+                partial->partials.morsels == morsels) {
+                auto new_group = [&](std::size_t cell) {
+                    const std::uint32_t gid = alloc_group();
+                    pair_order_.push_back(key_of_cell(cell));
+                    return gid;
+                };
+                merge_dense_partials(partial->partials, pair_dense_gid_, new_group, agg_entries,
+                                     [&](std::size_t m, std::size_t k, std::size_t /*local*/) {
+                                         return cell_of(partial->first_rows[m][k]);
+                                     });
+                publish_fused_accumulation();
+                return true;
+            }
+        }
         if (morsels != 0 && aggs_are_slot_combinable(accumulation_can_fan_out())) {
             pair_dense_cells_.resize(rows);
             auto* cell_buf = pair_dense_cells_.data();
@@ -6601,6 +6637,9 @@ class HashAggregateState final {
             return nullptr;
         }
         const physical::AggregateColumnMapping& cols = *columns_;
+        if (on_pair_worker_path()) {
+            return compute_worker_pair_partial(chunk, cols);
+        }
         std::vector<const Column<Categorical>*> cat_cols;
         cat_cols.reserve(cols.group_by.size());
         for (std::size_t g = 0; g < cols.group_by.size(); ++g) {
@@ -6616,22 +6655,11 @@ class HashAggregateState final {
             }
             cat_cols.push_back(cat);
         }
-        std::vector<const ColumnEntry*> agg_entries(n_aggs_, nullptr);
-        for (std::size_t i = 0; i < n_aggs_; ++i) {
-            if (plan_[i].func == ir::AggFunc::Count) {
-                continue;
-            }
-            const std::optional<std::size_t>& input = cols.aggregate_inputs[i];
-            if (!input.has_value() || *input >= chunk.columns.size() ||
-                chunk.columns[*input].name != (*aggregations_)[i].column.name) {
-                return nullptr;
-            }
-            const ColumnEntry* entry = &chunk.columns[*input];
-            if (expr_type_for_column(*entry->column) != plan_[i].kind) {
-                return nullptr;
-            }
-            agg_entries[i] = entry;
+        auto found_aggs = worker_agg_entries(chunk, cols);
+        if (!found_aggs.has_value()) {
+            return nullptr;
         }
+        const std::vector<const ColumnEntry*>& agg_entries = *found_aggs;
         const CatCellPlan plan = cat_cell_plan(cat_cols);
         if (!plan.dense_possible) {
             return nullptr;
@@ -6656,6 +6684,102 @@ class HashAggregateState final {
         std::vector<std::uint8_t> local_seen(n_cells, 0);
         for (std::size_t m = 0; m < morsels; ++m) {
             run_dense_morsel(cells.data(), agg_entries, rows, m, prepare, worker->partials,
+                             local_seen, &worker->first_rows[m]);
+        }
+        return worker;
+    }
+
+    /// A worker chunk's aggregate inputs, by the mapping's indices; nullopt
+    /// when the chunk is not laid out as the aggregate's input.
+    [[nodiscard]] auto worker_agg_entries(const Chunk& chunk,
+                                          const physical::AggregateColumnMapping& cols) const
+        -> std::optional<std::vector<const ColumnEntry*>> {
+        std::vector<const ColumnEntry*> agg_entries(n_aggs_, nullptr);
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            if (plan_[i].func == ir::AggFunc::Count) {
+                continue;
+            }
+            const std::optional<std::size_t>& input = cols.aggregate_inputs[i];
+            if (!input.has_value() || *input >= chunk.columns.size() ||
+                chunk.columns[*input].name != (*aggregations_)[i].column.name) {
+                return std::nullopt;
+            }
+            const ColumnEntry* entry = &chunk.columns[*input];
+            if (expr_type_for_column(*entry->column) != plan_[i].kind) {
+                return std::nullopt;
+            }
+            agg_entries[i] = entry;
+        }
+        return agg_entries;
+    }
+
+    /// `compute_worker_dense_partial` for the pair path. Cells are numbered
+    /// over this chunk's own key bounds (a Categorical over its unit's own
+    /// dictionary); the merge reads each cell's keys at its first row, in the
+    /// chunk as emitted, so the numbering never has to agree with the
+    /// operator's.
+    auto compute_worker_pair_partial(const Chunk& chunk,
+                                     const physical::AggregateColumnMapping& cols)
+        -> std::unique_ptr<WorkerDensePartial> {
+        const std::size_t rows = chunk.rows();
+        if (cols.group_by.size() != 2) {
+            return nullptr;
+        }
+        const std::array<IntKeyKind, 2> kinds{int_key_kind_, int_key_kind_b_};
+        std::array<const ColumnValue*, 2> keys{};
+        for (std::size_t g = 0; g < 2; ++g) {
+            const std::size_t index = cols.group_by[g];
+            if (index >= chunk.columns.size() ||
+                chunk.columns[index].name != (*group_by_)[g].name ||
+                chunk.columns[index].validity.has_value()) {
+                return nullptr;
+            }
+            const ColumnValue& column = *chunk.columns[index].column;
+            const bool matches =
+                (kinds[g] == IntKeyKind::Cat &&
+                 std::holds_alternative<Column<Categorical>>(column)) ||
+                (kinds[g] == IntKeyKind::Bool && std::holds_alternative<Column<bool>>(column)) ||
+                (kinds[g] == IntKeyKind::Date && std::holds_alternative<Column<Date>>(column));
+            if (!matches) {
+                return nullptr;
+            }
+            keys[g] = &column;
+        }
+        auto agg_entries = worker_agg_entries(chunk, cols);
+        if (!agg_entries.has_value()) {
+            return nullptr;
+        }
+        const RawKeyReader key_a = bind_reader(*keys[0], kinds[0]);
+        const RawKeyReader key_b = bind_reader(*keys[1], kinds[1]);
+        const auto [a_min, a_max] = key_bounds(key_a, *keys[0], kinds[0], rows);
+        const auto [b_min, b_max] = key_bounds(key_b, *keys[1], kinds[1], rows);
+        const auto a_span =
+            static_cast<std::uint64_t>(a_max) - static_cast<std::uint64_t>(a_min) + 1;
+        const auto b_span =
+            static_cast<std::uint64_t>(b_max) - static_cast<std::uint64_t>(b_min) + 1;
+        if (a_span == 0 || b_span == 0 || a_span > kDenseCellLimit / b_span) {
+            return nullptr;
+        }
+        const auto n_cells = static_cast<std::size_t>(a_span * b_span);
+        const std::size_t morsels = dense_morsel_count(n_cells, rows);
+        if (morsels == 0) {
+            return nullptr;
+        }
+        auto worker = std::make_unique<WorkerDensePartial>(WorkerDensePartial{
+            .rows = rows,
+            .partials = DensePartials(morsels, n_cells, n_aggs_, scratch_stride_),
+            .first_rows = std::vector<std::vector<std::uint32_t>>(morsels)});
+        std::vector<std::uint32_t> cells(rows);
+        auto prepare = [&](std::size_t begin, std::size_t end) {
+            for (std::size_t row = begin; row < end; ++row) {
+                cells[row] = static_cast<std::uint32_t>(
+                    (static_cast<std::uint64_t>(key_a(row) - a_min) * b_span) +
+                    static_cast<std::uint64_t>(key_b(row) - b_min));
+            }
+        };
+        std::vector<std::uint8_t> local_seen(n_cells, 0);
+        for (std::size_t m = 0; m < morsels; ++m) {
+            run_dense_morsel(cells.data(), *agg_entries, rows, m, prepare, worker->partials,
                              local_seen, &worker->first_rows[m]);
         }
         return worker;

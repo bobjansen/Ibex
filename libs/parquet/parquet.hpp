@@ -1421,40 +1421,8 @@ inline auto groups_have_no_nulls(const parquet::FileMetaData& metadata,
     return true;
 }
 
-/// Values readable past the start of every run `decode_physical_column` hands
-/// to `emit_run`: its scratch batch is padded by this many, so a short run can
-/// be copied as one fixed-size block.
-inline constexpr std::size_t kSelectedRunSlack = 8;
-
-/// Write `kSelectedRunSlack` values from `src` to `dst` without a library
-/// call. Clang otherwise folds a fixed-size `memcpy` next to a variable one
-/// into a single `memcpy@plt` call with a selected size, and turns a
-/// converting loop over bytes back into one.
-template <bool SameLayout, typename Out, typename Raw, typename Convert>
-inline void copy_selected_block(Out* dst, const Raw* src, Convert& convert) {
-    constexpr std::size_t kBytes = kSelectedRunSlack * sizeof(Out);
-    if constexpr (SameLayout) {
-#if defined(__clang__)
-        __builtin_memcpy_inline(dst, src, kBytes);
-#else
-        std::memcpy(dst, src, kBytes);
-#endif
-    } else {
-        std::array<Out, kSelectedRunSlack> block;
-        for (std::size_t i = 0; i < kSelectedRunSlack; ++i) {
-            block[i] = convert(src[i]);
-        }
-#if defined(__clang__)
-        __builtin_memcpy_inline(dst, block.data(), kBytes);
-#else
-        std::memcpy(dst, block.data(), kBytes);
-#endif
-    }
-}
-
 /// `emit_run(values, count)`, when given, takes runs of consecutive selected
-/// rows of a null-free group at once instead of one `emit` per row. At least
-/// `kSelectedRunSlack` values are readable from `values`, whatever `count` is.
+/// rows of a null-free group at once instead of one `emit` per row.
 template <typename DType, typename Emit, typename EmitRun = std::nullptr_t>
 inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_index,
                                    const ibex::runtime::Selection* selection,
@@ -1527,14 +1495,7 @@ inline auto decode_numeric_into(parquet::arrow::FileReader& reader, int leaf_ind
             },
             [&](const Raw* run, std::size_t count) {
                 validity.append_valid(count);
-                // A 20% filter keeps runs of ~1.25 rows, and a libc call per
-                // run cost more than the copy. A short run is written as one
-                // fixed-size block instead: the values it writes past the run
-                // are overwritten by the next runs, and the source is padded
-                // (`kSelectedRunSlack`).
-                if (count <= kSelectedRunSlack && output_rows - output_pos >= kSelectedRunSlack) {
-                    copy_selected_block<SameLayout>(output_data + output_pos, run, convert);
-                } else if constexpr (SameLayout) {
+                if constexpr (SameLayout) {
                     std::memcpy(output_data + output_pos, run, count * sizeof(Raw));
                 } else {
                     for (std::size_t i = 0; i < count; ++i) {
@@ -2138,10 +2099,7 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                                    EmitRun&& emit_run) -> std::size_t {
     using Raw = typename DType::c_type;
 
-    // Value-initialized so the slack past a batch's last value is never read
-    // uninitialized (see `kSelectedRunSlack`).
-    std::unique_ptr<Raw[]> values(
-        new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows) + kSelectedRunSlack]());
+    std::unique_ptr<Raw[]> values(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
     std::unique_ptr<std::int16_t[]> definitions(
         new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
 

@@ -134,10 +134,12 @@ Still behind, and neither has one cause to fix:
   0x1000), which made Polars look zstd-light. The gap is all outside zstd:
   top-N ~5k extra samples, wide ~11k, with memmove 4-6x Polars'.
 - **Top-N (54 vs 42 ms).** `venue == "XNAS"` keeps a random 20%, so
-  selected runs average 1.25 rows, and the selected decode called libc
-  memcpy per run (60% of Ibex's memmove samples). Fixed by "Parquet: copy short
-  selected runs as one inline block": 54.8 -> 54.0 ms. The rest of the gap is
-  not in copies.
+  selected runs average 1.25 rows, and the selected decode calls libc
+  memcpy per run (60% of Ibex's memmove samples). Measured 2026-11-25:
+  copying short runs as one inline 8-value block (padded scratch,
+  `__builtin_memcpy_inline`) gave only 54.8 -> 54.0 ms and was reverted as
+  not worth its write-past-the-run contract. The copies are the data, not
+  the call.
 - **Wide result (81 vs 59 ms).** `qty > 10` keeps 99%. The key scan never
   abandons: `kAbandonMinRows` is 262,144 rows and a streamed unit is a
   couple of Polars' 123,457-row groups. Measured 2026-11-25, both ruled out:

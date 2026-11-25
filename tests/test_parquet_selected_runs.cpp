@@ -108,16 +108,14 @@ TEST_CASE("for_each_selected_run splits strictly increasing rows into consecutiv
     CHECK(runs.empty());
 }
 
-TEST_CASE("Parquet selected decode copies runs of rows across row groups",
-          "[parquet][selected-runs]") {
+namespace {
+
+/// Decode all three columns under `selection` and compare every output row.
+void check_selected_decode(const ibex::runtime::Selection& selection) {
     auto reader = runs_reader();
     const auto& metadata = *reader->parquet_reader()->metadata();
     REQUIRE(metadata.num_row_groups() > 10);
     const auto groups = all_decode_groups(metadata);
-    const auto selection = run_selection();
-    REQUIRE(selection.size() > 1'000);
-    REQUIRE(selection.size() < kRows);
-
     const auto ints = direct_column(*reader, *arrow::field("i", arrow::int64()), 0, &selection,
                                     groups, selection.size());
     const auto doubles = direct_column(*reader, *arrow::field("d", arrow::float64()), 1, &selection,
@@ -139,4 +137,40 @@ TEST_CASE("Parquet selected decode copies runs of rows across row groups",
         REQUIRE(double_values[i] == double_at(selection[i]));
         REQUIRE(std::string(label_values[i]) == label_at(selection[i]));
     }
+}
+
+}  // namespace
+
+TEST_CASE("Parquet selected decode copies runs of rows across row groups",
+          "[parquet][selected-runs]") {
+    const auto selection = run_selection();
+    REQUIRE(selection.size() > 1'000);
+    REQUIRE(selection.size() < kRows);
+    check_selected_decode(selection);
+}
+
+// Runs of up to `kSelectedRunSlack` rows are copied as one fixed-size block
+// that writes past the run; the last few runs before the output's end must
+// fall back to an exact copy, and the selection ends on the file's last row.
+TEST_CASE("Parquet selected decode copies short runs up to the output's end",
+          "[parquet][selected-runs]") {
+    ibex::runtime::Selection selection;
+    std::size_t row = 0;
+    for (std::size_t i = 0; row < kRows; ++i) {
+        const std::size_t run = 1 + (i % (kSelectedRunSlack + 1));
+        for (std::size_t k = 0; k < run && row < kRows; ++k) {
+            selection.push_back(row++);
+        }
+        row += 1 + (i % 3);
+    }
+    if (selection.back() != kRows - 1) {
+        selection.push_back(kRows - 1);
+    }
+    for (const std::size_t tail : {std::size_t{1}, std::size_t{3}, kSelectedRunSlack - 1}) {
+        INFO("selection trimmed to end " << tail << " rows before its last run");
+        auto trimmed = selection;
+        trimmed.resize(selection.size() - tail);
+        check_selected_decode(trimmed);
+    }
+    check_selected_decode(selection);
 }

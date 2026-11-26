@@ -606,11 +606,17 @@ See
 The [PDS-H comparison](python/performance.md#pds-h-through-ibexengine-scale-10) runs all 22 unchanged
 upstream queries on SF10 through the engine; every result matches Polars,
 including row order and dtypes. Against Polars 2.1 streaming, re-run in the
-same sitting (2026-11-22, `b0070d41`, i7-13700 at a fixed 3.2 GHz), the
-geometric mean of per-query time ratios is **0.91× at eight threads** and
-**0.87× at one thread** (below 1 means Ibex is faster). Ibex is faster on
-15/22 queries at eight threads and 20/22 at one; the largest remaining
-eight-thread gaps are Q16 (1.11×), Q05 (1.07×) and Q14 (1.07×).
+same sitting (2026-11-26, `c317ea77`, i7-13700), the geometric mean of
+per-query time ratios is **0.93× at eight threads** and **0.88× at one
+thread** (below 1 means Ibex is faster). Ibex is faster on 12/22 queries at
+eight threads and 19/22 at one; the largest remaining eight-thread gaps are
+Q16 (1.16×), Q14 (1.12×) and Q04 (1.10×). On the h2o db-benchmark's
+in-memory 10M-row frames, the
+[groupby](python/performance.md#h2o-groupby-through-ibexengine) geomeans
+are **0.59–0.72× at eight threads** and **0.40–0.50× at one** across the
+five datasets. The [joins](python/performance.md#h2o-joins-through-ibexengine)
+are **1.18×** and **0.78×**: the small and medium inner joins still lose at
+eight threads.
 
 ## Independent lazy Python API (experimental)
 

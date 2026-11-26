@@ -20202,7 +20202,7 @@ TEST_CASE("A dense distinct over many chunks keeps first occurrences across them
                 const bool valid = !n_entry->validity.has_value() || (*n_entry->validity)[i];
                 const Tuple got{std::string(c[i]), f[i],
                                 valid ? std::optional{n[i]} : std::nullopt};
-                REQUIRE(got == want[i]);
+                REQUIRE((got == want[i]));
             }
         }
     }

@@ -6232,8 +6232,9 @@ class Writer {
         bool small_range = false;
         if constexpr (std::is_integral_v<T>) {
             const auto [lo, hi] = std::minmax_element(values, values + n);
-            const auto span =
-                static_cast<uint64_t>(static_cast<int64_t>(*hi) - static_cast<int64_t>(*lo));
+            // Wrapping unsigned difference: hi - lo overflows int64_t when the
+            // chunk spans more than half the Int64 range.
+            const auto span = static_cast<uint64_t>(*hi) - static_cast<uint64_t>(*lo);
             if (span < (uint64_t{1} << 20) && span <= 4 * static_cast<uint64_t>(n)) {
                 small_range = true;
                 const T base = *lo;

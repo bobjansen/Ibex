@@ -1,10 +1,9 @@
-# Python frontends: performance summary
+# IbexEngine: performance summary
 
-Where `IbexEngine` (Polars queries run on Ibex) and the independent `ibex`
-package stand against Polars. The PDS-H and h2o sections are measured against
-Polars 2.1.0, which `IbexEngine` pins; the other sections were measured
-against Polars 2.0.0 and have not been re-run. This replaces the per-change measurement
-diaries (`pdsh-performance.md`, `join-performance.md`,
+Where `IbexEngine` (Polars queries run on Ibex) stands against Polars. The
+PDS-H and h2o sections are measured against Polars 2.1.0, which `IbexEngine`
+pins; the other sections were measured against Polars 2.0.0 and have not been
+re-run. This replaces the per-change measurement diaries (`pdsh-performance.md`, `join-performance.md`,
 `polars-engine-performance.md`, `q01-performance.md`,
 `grouped-mean-performance.md`); the investigations behind each number live in
 git history and the plans.
@@ -130,35 +129,22 @@ At one thread Ibex led on the unique-key inner join (1.6×), semi/anti
 above, which targets the categorical and full-join gaps. Driver:
 `python/bench_polars_joins.py`.
 
-## Resident grouped mean (`IbexEngine` and `import ibex as pl`)
+## Resident grouped mean through `IbexEngine`
 
 Mean price by symbol and day on resident categorical inputs (`prices_multi`
 shape: 252 symbols, four days, 1,008 groups), warm collection medians,
 2026-10-12 (WSL2, before the native-box move):
 
-| Rows | Cores | `IbexEngine` | `ibex` package | Polars streaming |
-|---:|---:|---:|---:|---:|
-| 1M | 1 | 2.39 ms | 1.97 ms | 5.77 ms |
-| 1M | 8 | 1.62 ms | 1.16 ms | 3.02 ms |
-| 16M | 1 | 26.39 ms | 25.76 ms | 85.90 ms |
-| 16M | 8 | 9.43 ms | 8.89 ms | 14.52 ms |
+| Rows | Cores | `IbexEngine` | Polars streaming |
+|---:|---:|---:|---:|
+| 1M | 1 | 2.39 ms | 5.77 ms |
+| 1M | 8 | 1.62 ms | 3.02 ms |
+| 16M | 1 | 26.39 ms | 85.90 ms |
+| 16M | 8 | 9.43 ms | 14.52 ms |
 
-Every pair favours Ibex (p=0.00049). The page's historical 21.6× for this
-workload came from an older machine, older engines and plain string keys;
-it is not a claim for these packages. First use is a different cost: at 16M
-rows and eight cores, preparation took 530 ms (Polars 319 ms) and the first
-collection 162 ms (Polars 14.9 ms). The package pays off on repeated queries
-over prepared tables. Driver: `python/bench_mean_by_symbol_day.py`; example:
-[examples/ibex_python_group_mean.py](../examples/ibex_python_group_mean.py).
-
-## PDS-H q01 through the `ibex` package
-
-Upstream `queries.polars.q1.q` on SF-1 `lineitem` (6.0M rows) loaded before
-timing, 2026-10-12 (WSL2): 97.3 ms against 96.1 ms at one core (unclear,
-p=0.30) and 26.8 against 26.2 ms at eight (1.04×, p=0.021). Preparing
-native input once, with repeated strings encoded, is what makes the package
-competitive: the raw-import route took 39.4 ms against 14.2 ms prepared on
-1M synthetic rows. Driver: `python/bench_pdsh_q01.py`.
+The benchmark page's historical 21.6× for this workload came from an older
+machine, older engines and plain string keys; it is not a claim for
+`IbexEngine`. Driver: `python/bench_mean_by_symbol_day.py`.
 
 ## Rerunning
 

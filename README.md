@@ -602,7 +602,7 @@ Polars 2.1.0 and its private plan visitor. Prebuilt `ibex-polars` wheels
 `pip install --pre ibex-polars --find-links https://github.com/bobjansen/Ibex/releases/expanded_assets/wheels-latest`.
 See
 [scope and setup](python/ibex_polars/README.md) and
-[resident-table measurements](python/performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl).
+[resident-table measurements](python/performance.md#resident-grouped-mean-through-ibexengine).
 The [PDS-H comparison](python/performance.md#pds-h-through-ibexengine-scale-10) runs all 22 unchanged
 upstream queries on SF10 through the engine; every result matches Polars,
 including row order and dtypes. Against Polars 2.1 streaming, re-run in the
@@ -617,38 +617,6 @@ are **0.59–0.72× at eight threads** and **0.40–0.50× at one** across the
 five datasets. The [joins](python/performance.md#h2o-joins-through-ibexengine)
 are **1.18×** and **0.78×**: the small and medium inner joins still lose at
 eight threads.
-
-## Independent lazy Python API (experimental)
-
-An independent `ibex` Python frontend now implements the first subset of the
-Polars 2.0 API, supporting PDS-H q06 and q01. It provides its own lazy frames and
-expressions; Polars is not a runtime dependency.
-
-```python
-import ibex as pl
-
-query = (
-    pl.scan_parquet("trades.parquet")
-    .filter(pl.col("price") > 10)
-    .with_columns((pl.col("price") * pl.col("size")).alias("notional"))
-    .select(pl.sum("notional"))
-)
-result = query.collect()
-```
-
-Collection executes one complete pipeline through the same evaluator as the
-CLI and R host. This source-tree prototype supports filter, select, single
-column updates, grouped sums/means/counts and sorting; joins and full API
-compatibility remain follow-up work. In-memory frames retain a prepared native
-input so repeated collection avoids conversion and reuses categorical keys.
-Results use Ibex containers backed by Arrow, with Arrow
-dtype descriptors. See [Python setup and compatibility scope](python/README.md)
-for build instructions and the unchanged upstream query conformance runners.
-[Local q01 measurements](python/performance.md#pds-h-q01-through-the-ibex-package) include warm timings and
-the remaining first-use cost.
-The [grouped-mean example and measurements](python/performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl)
-show how one of the benchmark page's strongest supported wins translates into
-`import ibex as pl` on already-resident tables.
 
 ## IPython and Jupyter
 

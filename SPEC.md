@@ -5293,25 +5293,12 @@ points are provided:
 An additional `execute_pipeline(source, tables=None, scalars=None)` endpoint
 executes a complete generated pipeline through `repl::ReplSession`, sharing
 the CLI/R host's planner and lazy readers. Existing evaluation entry points
-retain their behavior. The independent experimental `ibex` Python package
-uses this endpoint after rendering immutable expression/pipeline nodes with
-typed scalar bindings. Its first Polars 2.0 API subset supports single-file
-Parquet scans, filtering, projection, one-expression updates, numeric
-sums/means, row counts, column-key grouping and sorting, covering upstream
-PDS-H q06 and q01 query bodies. In-memory frames retain prepared native inputs,
-applying the existing categorical promotion heuristic once at binding. Each
-collection executes the pipeline again; query results are not cached.
-Collection returns an
-Ibex DataFrame backed by Arrow; schema/dtype descriptors are currently Arrow
-types, with UInt32 row counts and large-UTF8 strings at the public Arrow boundary.
-Polars is not required by the package. Joins and full API
-compatibility are follow-up work; unsupported behavior has no Polars fallback.
-See `python/README.md` for the implemented scope and conformance runner.
+retain their behavior.
 
-The experimental `ibex_polars.IbexEngine` provides an alternative frontend:
-real Polars lazy plans are optimized by Polars, translated through its private
-visitor, and executed using the same native pipeline endpoint. Collection
-returns real Polars DataFrames. The initial slice covers upstream q01/q06,
+The experimental `ibex_polars.IbexEngine` uses this endpoint as a Polars
+engine: real Polars lazy plans are optimized by Polars, translated through its
+private visitor, and executed as one native pipeline. Collection returns real
+Polars DataFrames. It runs all 22 upstream PDS-H queries and supports
 resident inputs, simultaneous row-local updates, null predicates and Polars
 floating-point comparison/sort ordering. It pins Polars 2.1.0 and visitor
 version `(16, 0)`; unsupported plans fail without automatic fallback.

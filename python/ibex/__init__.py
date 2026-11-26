@@ -3,7 +3,7 @@
 """Experimental independent Ibex frontend with a Polars-compatible subset.
 
 The current subset supports PDS-H q06 and q01. It does not depend on Polars; collection
-requires the ibex_pyarrow native extension. See python/README.md for scope.
+requires the ibex_pyarrow native extension. See python/ibex/README.md for scope.
 """
 
 from ._expr import Expr, col, lit, sum, mean, len

@@ -54,7 +54,7 @@ pip wheel --no-deps ./python -w dist    # or: uv build --wheel python
 ```
 
 For development against a source build instead, see the
-[build instructions](https://github.com/bobjansen/Ibex/blob/main/python/README.md).
+[build instructions](https://github.com/bobjansen/Ibex/blob/main/python/README.md#building-from-source).
 
 ## Semantics
 
@@ -306,8 +306,8 @@ The focused suite checks null/empty behavior, simultaneous updates, category
 types, caching, ownership, demand projection and failures without fallback.
 CTest registers `ibex_polars_engine` when the pinned dependency is available.
 
-See [the performance summary](../performance.md#resident-grouped-mean-ibexengine-and-import-ibex-as-pl) for resident
-grouped-mean timings, including preparation and first collection.
+See [the performance summary](../performance.md#resident-grouped-mean-through-ibexengine) for resident
+grouped-mean timings.
 
 Matched join timings, preparation costs, raw samples and reproduction commands
 are in the [join performance summary](../performance.md#synthetic-joins-through-ibexengine).

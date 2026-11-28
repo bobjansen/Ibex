@@ -22,7 +22,7 @@ import ibex
 from ibex._expr import Expr
 from ibex._lower import _WIDENED_NUMERIC_TYPES, lower
 from . import _categories
-from ._temporal import NANOS_PER_UNIT, TEMPORAL_TYPES, is_temporal, literal_ticks, prepare_column
+from ._temporal import NANOS_PER_DAY, NANOS_PER_UNIT, TIME_PARTS, TEMPORAL_TYPES, is_temporal, literal_ticks, prepare_column
 
 
 VISITOR_VERSION = (16, 0)
@@ -419,6 +419,8 @@ class Adapter:
                 expr = _null_literal(value.dtype)
             elif original == pl.Time and value.dtype in (pl.Time, pl.Int64):
                 expr = self.expression(value.expr)
+            elif value.dtype == pl.Time and original.base_type() == pl.Datetime and original.time_zone in (None, "UTC"):
+                expr = Expr("time_of_day", (self.expression(value.expr), NANOS_PER_DAY))
             elif is_temporal(original) or is_temporal(value.dtype):
                 if original.base_type() != value.dtype.base_type():
                     raise NotImplementedError("casts between temporal and non-temporal types are unsupported")
@@ -609,6 +611,17 @@ class Adapter:
                     expr = Expr("polars_round", (args[0], decimals, mode))
                 else:
                     raise NotImplementedError(f"unsupported rounding input {dtype}")
+            elif name == "to_physical" and self.visitor.get_dtype(value.input[0]) == pl.Time:
+                expr = args[0]
+            elif name in (*TIME_PARTS, "Time") and len(args) == 1:
+                source = self.visitor.get_dtype(value.input[0])
+                if source == pl.Time:
+                    clock = args[0]
+                elif source.base_type() == pl.Datetime and source.time_zone in (None, "UTC"):
+                    clock = Expr("time_of_day", (args[0], NANOS_PER_DAY))
+                else:
+                    raise NotImplementedError(f"unsupported {name} extraction from {source}")
+                expr = clock if name == "Time" else Expr("time_part", (clock, *TIME_PARTS[name]))
             elif name == "Year" and len(args) == 1 and len(value.function_data) == 1:
                 if self.visitor.get_dtype(value.input[0]) != pl.Date:
                     raise NotImplementedError("year extraction currently requires Date input")

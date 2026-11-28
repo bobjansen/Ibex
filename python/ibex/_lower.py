@@ -172,6 +172,15 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return f"__ibex_{op.removeprefix('polars_')}({render(args[0])}, {params})"
         if op == "cumsum":
             return f"cumsum({render(args[0])})"
+        if op == "time_of_day":
+            day = bind(args[1])
+            return f"((({render(args[0])} % {day}) + {day}) % {day})"
+        if op == "time_part":
+            remainder = f"({render(args[0])} % {bind(args[1])})"
+            if args[2] == 1:
+                return remainder
+            # Day ticks fit exactly in Float64, including the last ns of a day.
+            return f"Int64(floor({remainder} / {bind(args[2])}))"
         if op == "year":
             return f"year({render(args[0])})"
         if op == "is_nan":
@@ -819,6 +828,10 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if dtype(args[0]) != pa.float64():
                 raise TypeError("is_nan requires a floating-point operand")
             return pa.bool_()
+        if op in ("time_part", "time_of_day"):
+            if dtype(args[0]) != pa.int64():
+                raise TypeError("clock extraction requires Int64 nanoseconds")
+            return pa.int64()
         if op == "year":
             if dtype(args[0]) != pa.date32():
                 raise NotImplementedError("year extraction currently requires Date input")

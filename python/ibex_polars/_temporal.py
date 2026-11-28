@@ -7,6 +7,16 @@ import pyarrow as pa
 
 
 NANOS_PER_UNIT = {"ns": 1, "us": 1000, "ms": 1_000_000}
+NANOS_PER_DAY = 86_400_000_000_000
+# Size of the repeating cycle and of one result unit, both in nanoseconds.
+TIME_PARTS = {
+    "Hour": (NANOS_PER_DAY, 3_600_000_000_000),
+    "Minute": (3_600_000_000_000, 60_000_000_000),
+    "Second": (60_000_000_000, 1_000_000_000),
+    "Millisecond": (1_000_000_000, 1_000_000),
+    "Microsecond": (1_000_000_000, 1_000),
+    "Nanosecond": (1_000_000_000, 1),
+}
 TEMPORAL_TYPES = (pl.Datetime, pl.Duration, pl.Time)
 
 

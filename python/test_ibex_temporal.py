@@ -54,6 +54,19 @@ class TemporalTests(unittest.TestCase):
         self.equal(frame.group_by("x", maintain_order=True).agg(pl.len()))
         self.equal(frame.with_columns(pl.lit(None).cast(pl.Time).alias("x")))
 
+    def test_clock_components(self):
+        day = 86_400_000_000_000
+        values = [0, 1, 3_600_000_000_000 - 1, day - 1, None]
+        for dtype in (pl.Time, pl.Datetime("ns"), pl.Datetime("ns", "UTC")):
+            ticks = values if dtype == pl.Time else [-day - 1, -1, *values, day + 1]
+            x = pl.col("x")
+            frame = pl.LazyFrame({"x": pl.Series(ticks, dtype=dtype)})
+            self.equal(frame.select(clock=x.dt.time(), hour=x.dt.hour(), minute=x.dt.minute(),
+                                   sec=x.dt.second(), ms=x.dt.millisecond(), us=x.dt.microsecond(),
+                                   ns=x.dt.nanosecond(), physical=x.dt.time().to_physical()))
+            self.equal(frame.filter(x.dt.hour() >= 1))
+            self.equal(frame.select(x.cast(pl.Time)))
+
     def test_timestamps_all_units_and_timezones(self):
         for unit in ("ms", "us", "ns"):
             for zone in (None, "UTC", "Europe/Amsterdam"):

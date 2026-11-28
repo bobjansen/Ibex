@@ -238,14 +238,18 @@ class Adapter:
                     raise NotImplementedError("window ordering requires a column key")
                 ordering = (order._name, value.order_by_descending, value.order_by_nulls_last)
             call = self.visitor.view_expression(value.function)
-            if type(call).__name__ == "Function" and call.function_data == ("cum_sum", False):
+            if type(call).__name__ == "Function" and call.function_data in (("cum_sum", False), ("cum_max", False)):
                 input_type = self.visitor.get_dtype(call.input[0])
                 if input_type not in (*_INTEGER_LAYOUTS, pl.Float64):
                     raise NotImplementedError("cumulative sums require integer or Float64 inputs")
                 child = self.expression(call.input[0])
-                if child._op != "col":
-                    raise NotImplementedError("cumulative sums require a column")
-                function = Expr("window_cumsum", (child, input_type == pl.Float64))
+                if not child._row_reference:
+                    # Cumulative functions on a scalar see one value per group.
+                    function = child
+                elif child._op == "col" and call.function_data[0] == "cum_sum":
+                    function = Expr("window_cumsum", (child, input_type == pl.Float64))
+                else:
+                    raise NotImplementedError("unsupported cumulative window input")
             elif type(call).__name__ == "Function" and call.function_data[0] == "rank":
                 _, method, descending, seed = call.function_data
                 child = self.expression(call.input[0])
@@ -263,10 +267,8 @@ class Adapter:
                 function = Expr("window_shift", (child, offset.value))
             else:
                 function = self.expression(value.function)
-            if value.options.kind == "join" and (not function._aggregate or function._row_reference):
+            if value.options.kind == "join" and function._row_reference:
                 raise NotImplementedError("list-valued window joins are unsupported")
-            if not function._aggregate and not function._row_reference:
-                raise NotImplementedError("scalar literal windows require a frame-sized broadcast")
             self.has_windows = True
             expr = Expr("window", (function, tuple(keys), ordering))
             if function._op == "window_cumsum" and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:

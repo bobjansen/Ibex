@@ -30,6 +30,11 @@ A release archive from the same commit also works. The content pin rejects
 changed tests, fixtures, or pytest configuration even if Git HEAD is unchanged.
 Generated Python bytecode is ignored by the digest.
 
+With the upstream test dependencies installed (including pytest-xdist), pass
+`--full-suite` to select the complete test tree and all markers. The adapter
+probe still records only explicit lazy collections in test bodies. The full
+suite exits unsuccessfully when any intercepted query is unsupported.
+
 For a focused run, repeat `--select` with test files or parametrized node IDs
 relative to upstream `py-polars`, for example:
 

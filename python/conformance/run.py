@@ -44,7 +44,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, default=Path("polars-conformance-results"))
-    parser.add_argument("--select", action="append", help="upstream test path/node ID, relative to py-polars; repeatable")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--full-suite", action="store_true", help="collect the complete pinned test tree, including all markers")
+    selection.add_argument("--select", action="append", help="upstream test path/node ID, relative to py-polars; repeatable")
     args = parser.parse_args()
     pin = json.loads(PIN.read_text())
     upstream = args.upstream.resolve()
@@ -59,8 +61,8 @@ def main():
         parser.error("--upstream must name the Polars repository root")
     if upstream_digest(upstream) != pin["test_tree_sha256"]:
         parser.error(f"upstream test tree differs from pinned commit {pin['commit']}; use an unmodified checkout/archive")
-    selected = args.select or pin["targets"]
-    for target in selected:
+    selected = ["tests"] if args.full_suite else args.select or pin["targets"]
+    for target in args.select or ():
         path = (upstream / "py-polars" / target.split("::")[0]).resolve()
         if not path.is_relative_to(upstream / "py-polars/tests") or not path.is_file():
             parser.error(f"selection must name a pinned upstream test file: {target}")
@@ -74,8 +76,9 @@ def main():
     # installed pinned wheel and this worktree's adapter in both processes.
     env["PYTHONPATH"] = os.pathsep.join([str(Path(__file__).resolve().parents[1]),
                                         str(upstream / "py-polars"), env.get("PYTHONPATH", "")])
+    markers = ["-p", "xdist.plugin"] if args.full_suite else ["-m", "not slow and not hypothesis and not write_disk and not release and not benchmark and not ci_only and not docs"]
     command = [sys.executable, "-m", "pytest", "-p", "conformance.plugin", "-o", "addopts=",
-               "--import-mode=importlib", "-m", "not slow and not hypothesis and not write_disk and not release and not benchmark and not ci_only and not docs",
+               "--import-mode=importlib", *markers,
                "-o", f"cache_dir={output / 'pytest-cache'}", "--tb=short", "-q", *selected]
     for mode in ("reference", "candidate"):
         env["IBEX_CONFORMANCE_MODE"] = mode
@@ -106,6 +109,7 @@ def main():
     print("Report:", output / "report.json")
     return int(bool(regressions or report["collection_errors"] or reference["pytest_exit"]
                     or candidate["pytest_exit"] or candidate["summary"].get("mismatch")
+                    or (args.full_suite and candidate["queries"].get("unsupported"))
                     or not candidate["queries"].get("pass")))
 
 

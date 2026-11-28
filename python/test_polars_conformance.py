@@ -15,7 +15,7 @@ from conformance.run import support_regressions, upstream_digest
 
 
 class ProbeTests(unittest.TestCase):
-    def compare(self, *, reference=None, candidate=None, error=None, calls=1, reference_error=None, check_row_order=True, allowed_rows=None):
+    def compare(self, *, reference=None, candidate=None, error=None, calls=1, reference_error=None, check_row_order=True, allowed_rows=None, random_rank=False):
         import ibex_pyarrow
         reference = pl.DataFrame({"x": [1]}) if reference is None else reference
         candidate = reference if candidate is None else candidate
@@ -32,7 +32,7 @@ class ProbeTests(unittest.TestCase):
                 raise reference_error
             return reference
 
-        probe = Probe(collect, check_row_order=check_row_order, allowed_rows=allowed_rows)
+        probe = Probe(collect, check_row_order=check_row_order, allowed_rows=allowed_rows, random_rank=random_rank)
         with patch("conformance.probe.IbexEngine", return_value=engine), \
                 patch.object(ibex_pyarrow, "execute_pipeline", return_value=None):
             try:
@@ -69,6 +69,14 @@ class ProbeTests(unittest.TestCase):
         for values, status in (([2, 1], "pass"), ([3, 1], "mismatch")):
             event, _ = self.compare(reference=pl.DataFrame({"x": [1, 2]}),
                                     candidate=pl.DataFrame({"x": values}), check_row_order=False)
+            self.assertEqual(event["status"], status)
+
+    def test_pinned_unseeded_rolling_ranks(self):
+        reference = pl.DataFrame({"a": [1, None], "lo": [2, None], "hi": [4, None], "random": [4, None]})
+        for draws, status in (([2, None], "pass"), ([5, None], "mismatch"),
+                              ([2, 0], "mismatch"), ([None, 1], "mismatch")):
+            candidate = reference.with_columns(pl.Series("random", draws))
+            event, _ = self.compare(reference=reference, candidate=candidate, random_rank=True)
             self.assertEqual(event["status"], status)
 
     def test_pinned_unordered_selection_checks_values_types_size_and_uniqueness(self):

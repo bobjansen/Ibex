@@ -22,17 +22,16 @@ import ibex
 from ibex._expr import Expr
 from ibex._lower import _WIDENED_NUMERIC_TYPES, lower
 from . import _categories
-from ._temporal import NANOS_PER_UNIT, TEMPORAL_TYPES, is_temporal, literal_ticks, prepare_column
+from ._temporal import NANOS_PER_DAY, NANOS_PER_UNIT, TIME_PARTS, TEMPORAL_TYPES, is_temporal, literal_ticks, prepare_column
 
 
 VISITOR_VERSION = (16, 0)
 POLARS_VERSION = "2.1.0"
 
-# These logical integer types all fit native Int64 storage. UInt32/UInt64
-# intentionally remain outside this subset.
+# These logical integer types all fit native Int64 storage. UInt64 needs a wider representation.
 _INTEGER_LAYOUTS = {
     pl.Int8: (8, True), pl.Int16: (16, True), pl.Int32: (32, True),
-    pl.Int64: (64, True), pl.UInt8: (8, False), pl.UInt16: (16, False),
+    pl.Int64: (64, True), pl.UInt8: (8, False), pl.UInt16: (16, False), pl.UInt32: (32, False),
 }
 _JOIN_NODE = re.compile(r'\{"Join"\s*:\s*\{')
 _JOIN_VALIDATION = re.compile(r'"validation"\s*:\s*"(ManyToMany|ManyToOne|OneToMany|OneToOne)"')
@@ -85,6 +84,8 @@ def _null_literal(dtype):
         placeholder = 0
     elif dtype in (pl.Float32, pl.Float64):
         placeholder = 0.0
+    elif dtype == pl.Time:
+        placeholder = 0
     elif dtype == pl.Boolean:
         placeholder = False
     elif dtype == pl.String:
@@ -174,8 +175,94 @@ class Adapter:
         self.root = None
         self.nodes = {}
         self.expressions = {}
+        self.has_windows = False
         self.frame_length_columns = {}
         self.sort_pruning_predicates = set()
+
+    def _rolling_operand(self, node, dtype):
+        child = self.expression(node)
+        if dtype == pl.Boolean:
+            return Expr("cast", (child, pa.int64()))
+        return child
+
+    def _rolling_rank(self, dtype, child, parameters):
+        method, seed = parameters
+        methods = ("average", "min", "max", "dense", "random")
+        if method not in methods:
+            raise NotImplementedError(f"unsupported rolling rank method {method}")
+        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.Date) and not is_temporal(dtype):
+            raise NotImplementedError(f"unsupported rolling rank input {dtype}")
+        if child._aggregate or not child._row_reference:
+            raise NotImplementedError("rolling rank requires a row expression")
+        op = "polars_rolling_avg_rank" if method == "average" else "polars_rolling_rank"
+        seed_words = (seed >> 32, seed & 0xffffffff) if method == "random" and seed is not None else ()
+        return op, (methods.index(method), *seed_words)
+
+    def _rolling_by_function(self, value):
+        operation, duration, minimum, closed, parameters = value.function_data
+        months, weeks, days, nanos, integer, negative = duration
+        name = str(operation).removeprefix("RollingFunctionBy.").lower()
+        if name not in ("sumby", "meanby", "rankby") or (parameters and name != "rankby") or negative or months:
+            raise NotImplementedError("unsupported indexed rolling operation or calendar interval")
+        dtype, index_type = (self.visitor.get_dtype(child) for child in value.input)
+        if name != "rankby" and dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean):
+            raise NotImplementedError(f"unsupported rolling value type {dtype}")
+        if index_type.base_type() == pl.Datetime and not integer:
+            if (days or weeks) and index_type.time_zone not in (None, "UTC"):
+                raise NotImplementedError("calendar intervals on zoned timestamps require calendar arithmetic")
+            nanos += (7 * weeks + days) * 86_400_000_000_000
+            if nanos % NANOS_PER_UNIT[index_type.time_unit]:
+                raise NotImplementedError("window duration must be representable in the index unit")
+        elif index_type == pl.Date and not integer:
+            day_ticks, remainder = divmod(nanos, 86_400_000_000_000)
+            if remainder:
+                raise NotImplementedError("Date rolling intervals must be whole days")
+            nanos = 7 * weeks + days + day_ticks
+        elif not (integer and index_type in (pl.Int32, pl.Int64, pl.UInt32)):
+            raise NotImplementedError(f"unsupported rolling index {index_type} for this interval")
+        if not 0 < nanos <= 2**63 - 1:
+            raise NotImplementedError("rolling interval must fit positive Int64 ticks")
+        args = (self._rolling_operand(value.input[0], dtype), self.expression(value.input[1]))
+        if any(child._aggregate or not child._row_reference for child in args):
+            raise NotImplementedError("indexed rolling requires row expressions")
+        closed_bits = {"none": 0, "left": 1, "right": 2, "both": 3}[closed]
+        if name == "rankby":
+            if closed not in ("right", "both"):
+                raise pl.exceptions.InvalidOperationError(
+                    "`rolling_rank_by` window needs to be closed on the right side "
+                    "(i.e., `closed` must be `right` or `both`)")
+            op, method = self._rolling_rank(dtype, args[0], parameters)
+            return Expr(op + "_by", (*args, nanos, minimum, closed_bits, *method))
+        op = "polars_rolling_sum_by" if name == "sumby" else "polars_rolling_mean_by"
+        return Expr(op, (*args, nanos, minimum, closed_bits, int(dtype == pl.Float32)))
+
+    def _rolling_function(self, value):
+        if str(value.function_data[0]).startswith("RollingFunctionBy."):
+            return self._rolling_by_function(value)
+        if len(value.function_data) != 6 or len(value.input) != 1:
+            raise NotImplementedError("unsupported rolling options")
+        operation, size, minimum, weights, center, parameters = value.function_data
+        name = str(operation).removeprefix("RollingFunction.").lower()
+        if weights is not None or (parameters and name != "rank") or not 0 <= minimum <= size or size > 2**63 - 1:
+            raise NotImplementedError("unsupported rolling options")
+        dtype = self.visitor.get_dtype(value.input[0])
+        if name == "rank":
+            child = self._rolling_operand(value.input[0], dtype)
+            op, method = self._rolling_rank(dtype, child, parameters)
+            return Expr(op, (child, size, minimum, int(center), *method))
+        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64) and not (
+                dtype == pl.Boolean and name in ("sum", "mean")):
+            raise NotImplementedError(f"unsupported rolling {name} input {dtype}")
+        child = self._rolling_operand(value.input[0], dtype)
+        if name in ("sum", "mean"):
+            if child._aggregate or not child._row_reference:
+                raise NotImplementedError("rolling sums and means require a row expression")
+            return Expr("polars_rolling_" + name, (child, size, minimum, int(center), int(dtype == pl.Float32)))
+        if child._op != "col":
+            raise NotImplementedError("rolling extrema require a column")
+        if name not in ("min", "max") or center or not minimum:
+            raise NotImplementedError("unsupported rolling operation or frame")
+        return Expr("window_rolling", (child, "rolling_" + name, size, minimum))
 
     def expression(self, node):
         # Dtypes and proofs of frame-sized lengths belong to the current input
@@ -196,12 +283,12 @@ class Adapter:
                 expr = ibex.lit(literal_ticks(value.value, value.dtype))
                 self.expressions[key] = expr
                 return expr
-            if value.dtype not in (*_INTEGER_LAYOUTS, pl.UInt32, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date):
+            if value.dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date):
                 raise NotImplementedError(f"unsupported literal type {value.dtype}")
             expr = ibex.lit(value.value)
         elif kind == "BinaryExpr":
             operators = {"Plus": "+", "Minus": "-", "Multiply": "*", "TrueDivide": "/", "Divide": "/",
-                         "Eq": "==", "NotEq": "!=", "Lt": "<", "LtEq": "<=", "Gt": ">", "GtEq": ">=",
+                         "EqValidity": "==", "NotEqValidity": "!=", "Eq": "==", "NotEq": "!=", "Lt": "<", "LtEq": "<=", "Gt": ">", "GtEq": ">=",
                          "And": "&&", "LogicalAnd": "&&", "Or": "||", "LogicalOr": "||"}
             name = str(value.op).split(".")[-1]
             if name not in operators:
@@ -217,7 +304,64 @@ class Adapter:
                     raise NotImplementedError("comparison between naive and zoned timestamps is unsupported")
             if operator in ("==", "!=", "<", "<=", ">", ">="):
                 operator = "polars_" + operator
-            expr = Expr(operator, (self.expression(value.left), self.expression(value.right)))
+            left, right = self.expression(value.left), self.expression(value.right)
+            expr = Expr(operator, (left, right))
+            if name in ("EqValidity", "NotEqValidity"):
+                left_null = Expr("is_null", (left,))
+                right_null = Expr("is_null", (right,))
+                both_missing = right_null if name == "EqValidity" else ~right_null
+                expr = Expr("case", (left_null, both_missing,
+                                     Expr("case", (right_null, ibex.lit(name == "NotEqValidity"), expr))))
+        elif kind == "Window":
+            if getattr(value.options, "kind", None) not in ("groups_to_rows", "join"):
+                raise NotImplementedError("unsupported window mapping")
+            keys = [self.expression(key) for key in value.partition_by]
+            if not keys or any(key._aggregate for key in keys):
+                raise NotImplementedError("window partitions require row expressions")
+            ordering = None
+            if value.order_by is not None:
+                order = self.expression(value.order_by)
+                if order._op != "col":
+                    raise NotImplementedError("window ordering requires a column key")
+                ordering = (order._name, value.order_by_descending, value.order_by_nulls_last)
+            call = self.visitor.view_expression(value.function)
+            if type(call).__name__ == "Function" and str(call.function_data[0]).startswith(("RollingFunction.", "RollingFunctionBy.")):
+                function = self._rolling_function(call)
+            elif type(call).__name__ == "Function" and call.function_data in (("cum_sum", False), ("cum_max", False)):
+                input_type = self.visitor.get_dtype(call.input[0])
+                if input_type not in (*_INTEGER_LAYOUTS, pl.Float64):
+                    raise NotImplementedError("cumulative sums require integer or Float64 inputs")
+                child = self.expression(call.input[0])
+                if not child._row_reference:
+                    # Cumulative functions on a scalar see one value per group.
+                    function = child
+                elif child._op == "col" and call.function_data[0] == "cum_sum":
+                    function = Expr("window_cumsum", (child, input_type == pl.Float64))
+                else:
+                    raise NotImplementedError("unsupported cumulative window input")
+            elif type(call).__name__ == "Function" and call.function_data[0] == "rank":
+                _, method, descending, seed = call.function_data
+                child = self.expression(call.input[0])
+                if (child._op != "col" or method not in ("average", "min", "max", "dense", "ordinal")
+                        or seed is not None):
+                    raise NotImplementedError("rank requires a column and a deterministic tie method")
+                function = Expr("window_rank", (child, "first" if method == "ordinal" else method, descending))
+            elif type(call).__name__ == "Function" and call.function_data == ("shift",) and len(call.input) == 2:
+                child = self.expression(call.input[0])
+                offset = self.visitor.view_expression(call.input[1])
+                if (child._op != "col" or self.visitor.get_dtype(call.input[0]) not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64)
+                        or type(offset).__name__ != "Literal" or type(offset.value) is not int
+                        or abs(offset.value) >= 2**63):
+                    raise NotImplementedError("window shift requires a numeric column and literal offset")
+                function = Expr("window_shift", (child, offset.value))
+            else:
+                function = self.expression(value.function)
+            if value.options.kind == "join" and function._row_reference:
+                raise NotImplementedError("list-valued window joins are unsupported")
+            self.has_windows = True
+            expr = Expr("window", (function, tuple(keys), ordering))
+            if function._op in ("window_cumsum", "window_rolling", "polars_rolling_sum", "polars_rolling_sum_by") and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
+                expr = _wrap_integer(expr, self.visitor.get_dtype(node))
         elif kind == "Ternary":
             expr = Expr("case", (self.expression(value.predicate), self.expression(value.truthy),
                                  self.expression(value.falsy)))
@@ -264,12 +408,19 @@ class Adapter:
             elif value.options not in (None, False):
                 raise NotImplementedError(f"unsupported {value.name} aggregate options")
             expr = Expr(operation, (self.expression(value.arguments[0]),))
+            if input_type == pl.Boolean and operation in ("sum", "nullable_sum"):
+                self.expressions[key] = expr
+                return expr
         elif kind == "Len":
             expr = ibex.len()
         elif kind == "Cast":
             original = self.visitor.get_dtype(value.expr)
             if original == pl.Null:
                 expr = _null_literal(value.dtype)
+            elif original == pl.Time and value.dtype in (pl.Time, pl.Int64):
+                expr = self.expression(value.expr)
+            elif value.dtype == pl.Time and original.base_type() == pl.Datetime and original.time_zone in (None, "UTC"):
+                expr = Expr("time_of_day", (self.expression(value.expr), NANOS_PER_DAY))
             elif is_temporal(original) or is_temporal(value.dtype):
                 if original.base_type() != value.dtype.base_type():
                     raise NotImplementedError("casts between temporal and non-temporal types are unsupported")
@@ -294,6 +445,27 @@ class Adapter:
                 raise NotImplementedError(f"unsupported cast to {value.dtype} with options {value.options}")
         elif kind == "Function":
             name = str(value.function_data[0]).split(".")[-1]
+            if str(value.function_data[0]).startswith(("RollingFunction.", "RollingFunctionBy.")):
+                function = self._rolling_function(value)
+                self.has_windows = True
+                expr = Expr("window", (function, (), None))
+                if self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
+                    expr = _wrap_integer(expr, self.visitor.get_dtype(node))
+                self.expressions[key] = expr
+                return expr
+            if str(value.function_data[0]) == "BooleanFunction.All":
+                child = self.expression(value.input[0])
+                if self.visitor.get_dtype(value.input[0]) != pl.Boolean:
+                    raise NotImplementedError("all requires a Boolean operand")
+                # Empty/all-null inputs contain no false observations.
+                all_true = Expr("sum", (~child,)) == 0
+                if value.function_data[1]:
+                    expr = all_true
+                else:
+                    has_null = Expr("sum", (Expr("is_null", (child,)),)) > 0
+                    expr = Expr("case", (all_true & has_null, _null_literal(pl.Boolean), all_true))
+                self.expressions[key] = expr
+                return expr
             if name == "repeat":
                 if len(value.input) != 2 or len(value.function_data) != 1:
                     raise NotImplementedError("unsupported repeat options")
@@ -439,6 +611,17 @@ class Adapter:
                     expr = Expr("polars_round", (args[0], decimals, mode))
                 else:
                     raise NotImplementedError(f"unsupported rounding input {dtype}")
+            elif name == "to_physical" and self.visitor.get_dtype(value.input[0]) == pl.Time:
+                expr = args[0]
+            elif name in (*TIME_PARTS, "Time") and len(args) == 1:
+                source = self.visitor.get_dtype(value.input[0])
+                if source == pl.Time:
+                    clock = args[0]
+                elif source.base_type() == pl.Datetime and source.time_zone in (None, "UTC"):
+                    clock = Expr("time_of_day", (args[0], NANOS_PER_DAY))
+                else:
+                    raise NotImplementedError(f"unsupported {name} extraction from {source}")
+                expr = clock if name == "Time" else Expr("time_part", (clock, *TIME_PARTS[name]))
             elif name == "Year" and len(args) == 1 and len(value.function_data) == 1:
                 if self.visitor.get_dtype(value.input[0]) != pl.Date:
                     raise NotImplementedError("year extraction currently requires Date input")
@@ -461,6 +644,17 @@ class Adapter:
                         or self.visitor.get_dtype(value.input[0]) != pl.Float64):
                     raise NotImplementedError("pow is supported only as a Float64 squared")
                 expr = Expr("square", (args[0],))
+            elif name in ("abs", "sqrt", "exp", "floor", "ceil") and len(args) == 1 and len(value.function_data) == 1:
+                if self.visitor.get_dtype(value.input[0]) != pl.Float64:
+                    raise NotImplementedError(f"{name} currently requires Float64")
+                expr = Expr(name, args)
+            elif name in ("LenChars", "LenBytes") and len(args) == 1:
+                expr = Expr("string_length" if name == "LenChars" else "byte_length", args)
+            elif name in ("IsNan", "IsNotNan") and len(args) == 1:
+                if self.visitor.get_dtype(value.input[0]) not in (pl.Float32, pl.Float64):
+                    raise NotImplementedError(f"{name} currently requires floating-point input")
+                predicate = Expr("is_nan", args)
+                expr = predicate if name == "IsNan" else ~predicate
             elif name == "Not" and len(args) == 1:
                 expr = ~args[0]
             elif name == "IsNull" and len(args) == 1:
@@ -476,6 +670,7 @@ class Adapter:
         # Keep narrow integers as logical types only. Each expression boundary
         # must wrap before a later comparison, division, cast or reduction.
         if kind in ("BinaryExpr", "Agg", "Function") and expr._op not in (
+            "count", "column_len", "n_unique", "filtered_n_unique",
             "polars_==", "polars_!=", "polars_<", "polars_<=", "polars_>", "polars_>=", "&&", "||", "!", "is_null"
         ) and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
             expr = _wrap_integer(expr, self.visitor.get_dtype(node))
@@ -510,24 +705,112 @@ class Adapter:
             raise NotImplementedError("join cardinality validation is not supported by this visitor adapter")
         self.checked_join_validation = True
 
-    def _aggregate_rounding(self, frame, fields, *, keys=None, maintain_order=False):
-        def contains_round(expr):
-            # Row expressions over a reduction's result: rounding, squaring.
-            return expr._op in ("polars_round", "square") or any(
-                contains_round(arg) for arg in expr._args if isinstance(arg, Expr))
-        if not any(expr._aggregate and contains_round(expr) for expr in fields):
+    def _window_fields(self, frame, fields, output_names):
+        if not self.has_windows:
+            return frame, fields
+        occupied = set(self.visitor.get_schema()) | set(output_names)
+        partitions = {}
+        columns = {}
+
+        inputs = []
+        prepared = {}
+        def fresh():
+            name = f"_ibex_window_{len(columns) + len(inputs)}"
+            while name in occupied:
+                name += "_"
+            occupied.add(name)
+            return name
+
+        def may_have_nulls(column):
+            kind, table = frame._source
+            return bool(frame._steps or kind != "table" or table[column._name].null_count)
+
+        def input_column(expr):
+            if expr._op == "col":
+                return expr._name
+            if id(expr) not in prepared:
+                name = fresh()
+                inputs.append(expr.alias(name))
+                prepared[id(expr)] = name
+            return prepared[id(expr)]
+
+        def rewrite(expr):
+            if expr._op == "window":
+                if id(expr) not in columns:
+                    function, keys, ordering = expr._args
+                    partition = tuple(input_column(key) for key in keys)
+                    name = fresh()
+                    result = ibex.col(name)
+                    if function._op == "window_cumsum":
+                        child, floating = function._args
+                        # A null contributes zero to the running total but
+                        # stays null in the output at its original position.
+                        if may_have_nulls(child):
+                            missing = Expr("is_null", (child,))
+                            clean = Expr("case", (missing, ibex.lit(0.0 if floating else 0), child))
+                            child = ibex.col(input_column(clean))
+                            result = Expr("case", (missing, Expr("null", ()), result))
+                        function = Expr("cumsum", (child,))
+                    elif function._op in ("polars_rolling_sum", "polars_rolling_mean", "polars_rolling_rank", "polars_rolling_avg_rank"):
+                        child, *params = function._args
+                        function = Expr(function._op, (ibex.col(input_column(child)), *params))
+                    elif function._op in ("polars_rolling_sum_by", "polars_rolling_mean_by", "polars_rolling_rank_by", "polars_rolling_avg_rank_by"):
+                        child, index, *params = function._args
+                        function = Expr(function._op, (ibex.col(input_column(child)), ibex.col(input_column(index)), *params))
+                    elif function._op == "window_rolling":
+                        child, op, size, minimum = function._args
+                        function = Expr(op, (child, size))
+                        if minimum > 1 or may_have_nulls(child):
+                            if may_have_nulls(child):
+                                present = Expr("case", (Expr("is_null", (child,)), ibex.lit(0), ibex.lit(1)))
+                                count = Expr("rolling_sum", (ibex.col(input_column(present)), size))
+                            else:
+                                count = Expr("rolling_count", (child, size))
+                            count_name = fresh()
+                            partitions.setdefault((partition, ordering), []).append(count.alias(count_name))
+                            result = Expr("case", (ibex.col(count_name) >= minimum, result, Expr("null", ())))
+                    elif function._op == "window_shift":
+                        child, offset = function._args
+                        direction = "lag" if offset >= 0 else "lead"
+                        if may_have_nulls(child):
+                            missing = Expr("is_null", (child,))
+                            flag = Expr("case", (missing, ibex.lit(1), ibex.lit(0)))
+                            flag_column = ibex.col(input_column(flag))
+                            flag_name = fresh()
+                            values = partitions.setdefault((partition, ordering), [])
+                            values.append(Expr(direction, (flag_column, abs(offset))).alias(flag_name))
+                            result = Expr("case", (ibex.col(flag_name) == 1, Expr("null", ()), result))
+                        function = Expr(direction, (child, abs(offset)))
+                    columns[id(expr)] = result
+                    partitions.setdefault((partition, ordering), []).append(function.alias(name))
+                return columns[id(expr)]
+            return Expr(expr._op, tuple(rewrite(arg) if isinstance(arg, Expr) else arg for arg in expr._args))
+
+        fields = [rewrite(expr) for expr in fields]
+        if inputs:
+            frame = frame._append("hstack", tuple(inputs))
+        for (keys, ordering), values in partitions.items():
+            frame = frame._append("window", (keys, tuple(values), ordering))
+        return frame, fields
+
+    def _aggregate_projection(self, frame, fields, *, keys=None, maintain_order=False):
+        def needs_projection(expr):
+            if expr._op in ("polars_round", "square", "abs", "sqrt", "exp", "floor", "ceil",
+                            "string_length", "byte_length", "is_nan", "==", ">"):
+                return expr._aggregate
+            return any(needs_projection(arg) for arg in expr._args if isinstance(arg, Expr))
+        if not any(expr._aggregate and needs_projection(expr) for expr in fields):
             return (frame.select(fields) if keys is None else
                     frame.group_by(*keys, maintain_order=maintain_order).agg(fields))
         if any(not expr._aggregate or expr._row_reference for expr in fields):
-            raise NotImplementedError("rounded aggregate projections require scalar reductions")
+            raise NotImplementedError("aggregate projections require scalar reductions")
         if keys is not None and any(expr._name in keys for expr in fields):
             raise ValueError("aggregate output name conflicts with a grouping key")
-        # Guarded rounding is a row expression. Materialize its reductions
-        # first, then round the aggregate rows in the same native query plan.
+        # Evaluate row functions over materialized reductions in the same native plan.
         occupied = set(self.visitor.get_schema()) | {expr._name for expr in fields}
         reductions = []
         def rewrite(expr):
-            if expr._aggregate and not contains_round(expr):
+            if expr._aggregate and not needs_projection(expr):
                 name = f"_ibex_round_aggregate_{len(reductions)}"
                 while name in occupied:
                     name += "_"
@@ -602,11 +885,14 @@ class Adapter:
                 frame = self.frame(marker.input)
                 self.visitor.set_node(marker.input)
                 expressions = tuple(self.named(expr) for expr in marker.exprs if expr.node not in hidden)
+                frame, expressions = self._window_fields(frame, expressions, marker_schema)
                 frame = self._hstack(frame, expressions, [name for name in marker_schema if name != height], node.input)
             else:
                 frame = self.frame(node.input)
             self.visitor.set_node(node.input)
-            frame = frame.select([self.expression(operand).alias(alias) for operand, alias in operands])
+            fields = [self.expression(operand).alias(alias) for operand, alias in operands]
+            frame, fields = self._window_fields(frame, fields, [alias for _, alias in operands])
+            frame = frame.select(fields)
             if operation[0] == "reverse":
                 return frame[::-1]
             return frame.gather_every(operation[2], offset=operation[1])
@@ -679,7 +965,7 @@ class Adapter:
     def _literal_count(self, node):
         value = self.visitor.view_expression(node)
         if (type(value).__name__ != "Literal" or type(value.value) is not int
-                or value.dtype not in (*_INTEGER_LAYOUTS, pl.UInt32) or value.value < 0):
+                or value.dtype not in _INTEGER_LAYOUTS or value.value < 0):
             raise NotImplementedError("per-group row counts must be non-negative integer literals")
         return value.value
 
@@ -795,7 +1081,7 @@ class Adapter:
             height = pl.DataFrame._from_pydf(node.df).height
             table = pa.table({"_ibex_height": pa.nulls(height, type=pa.int64())})
         for index, field in enumerate(table.schema):
-            if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type):
+            if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type) or pa.types.is_time(field.type):
                 table = table.set_column(index, field.name, prepare_column(table.column(index)))
             elif field.type in _WIDENED_NUMERIC_TYPES and field.type != pa.int32():
                 table = table.set_column(index, field.name, table.column(index).cast(_WIDENED_NUMERIC_TYPES[field.type]))
@@ -928,6 +1214,11 @@ class Adapter:
             # ordering proofs and general algorithms remain available.
             frame = self.frame(node.input)
             self.frame_length_columns[node_id] = self.frame_length_columns.get(node.input, set())
+        elif kind == "Union":
+            first, *others = node.inputs
+            frame = self.frame(first)._append("union", tuple(self.frame(child) for child in others))
+            if node.slice is not None:
+                frame = frame.slice(*node.slice)
         elif kind == "Cache":
             # Cache nodes can have different visitor node IDs while sharing
             # one Polars cache identity. Preserve that identity until lowering.
@@ -941,7 +1232,7 @@ class Adapter:
             if not isinstance(node.paths[0], str) or Path(node.paths[0]).is_dir():
                 raise NotImplementedError("only single local Parquet file paths are supported")
             for name, dtype in schema.items():
-                if is_temporal(dtype):
+                if is_temporal(dtype) and dtype != pl.Time:
                     raise NotImplementedError("temporal Parquet scans are not supported yet")
                 if dtype.base_type() not in _SUPPORTED_INPUT_TYPES:
                     raise NotImplementedError(f"unsupported Parquet column {name}: {dtype}")
@@ -1067,6 +1358,12 @@ class Adapter:
             self.visitor.set_node(node.input)
             if kind == "Filter":
                 predicate = self.expression(node.predicate.node)
+                if self.has_windows:
+                    expanded, (predicate,) = self._window_fields(frame, [predicate], schema)
+                    if expanded is not frame:
+                        frame = expanded.filter(predicate).select(list(schema))
+                        self.nodes[node_id] = frame
+                        return frame
                 pushed = self._filter_below_prefix_slice(node.input, predicate)
                 frame = pushed if pushed is not None else frame.filter(predicate)
             elif kind == "SimpleProjection":
@@ -1082,9 +1379,11 @@ class Adapter:
                     frame = frame.select(child.alias(node.expr[0].output_name)).unique(
                         maintain_order=value.function_data[1])
                 else:
-                    frame = self._aggregate_rounding(frame, [self.named(expr) for expr in node.expr])
+                    frame, fields = self._window_fields(frame, [self.named(expr) for expr in node.expr], schema)
+                    frame = self._aggregate_projection(frame, fields)
             elif kind == "HStack":
                 expressions = tuple(self.named(expr) for expr in node.exprs)
+                frame, expressions = self._window_fields(frame, expressions, schema)
                 frame = self._hstack(frame, expressions, list(schema), node_id)
             elif kind == "GroupBy":
                 if node.apply or any(getattr(node.options, name) is not None for name in ("dynamic", "rolling")):
@@ -1098,7 +1397,7 @@ class Adapter:
                     # NaN in one group and -0.0 with 0.0, as Polars does, and
                     # each group keeps its first row's key value.
                     keys.append(expr._name)
-                frame = self._aggregate_rounding(
+                frame = self._aggregate_projection(
                     frame, [self.named(expr) for expr in node.aggs],
                     keys=keys, maintain_order=node.maintain_order)
                 if node.options.slice is not None:
@@ -1139,9 +1438,14 @@ class Adapter:
                 if key not in prepared_sources:
                     prepared_sources[key] = ibex.DataFrame(source[1]).lazy()._source
                 source = prepared_sources[key]
-            steps = tuple((operation, (prepare_inputs(args[0]), *args[1:])) if operation == "join"
-                          else (operation, args) for operation, args in current._steps)
-            return ibex.LazyFrame(source, steps)
+            steps = []
+            for operation, args in current._steps:
+                if operation == "join":
+                    args = (prepare_inputs(args[0]), *args[1:])
+                elif operation == "union":
+                    args = tuple(prepare_inputs(branch) for branch in args)
+                steps.append((operation, args))
+            return ibex.LazyFrame(source, tuple(steps))
         frame = prepare_inputs(frame)
         result_schema = {}
         source, bindings, scalars = lower(frame, validate=True, result_schema=result_schema, widen_numeric_inputs=True)

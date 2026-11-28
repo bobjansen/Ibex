@@ -60,6 +60,7 @@
 #include "interpreter_internal.hpp"
 #include "kernel_gather.hpp"
 #include "numeric_math.hpp"
+#include "polars_rolling.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -1873,6 +1874,42 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
              }) {
             m.emplace(fn, rolling_transform);
         }
+
+        const BuiltinFn polars_rolling{
+            .min_args = 5,
+            .max_args = 5,
+            .infer = [](std::string_view name, const std::vector<ExprType>& args) -> IT {
+                if (name.starts_with("__ibex_rolling_rank"))
+                    return ExprType::Int;
+                if (name.starts_with("__ibex_rolling_avg_rank"))
+                    return ExprType::Double;
+                return name.starts_with("__ibex_rolling_mean") ? ExprType::Double : args.front();
+            },
+            .exec = TransformExec{.column_eval =
+                                      [](const ir::CallExpr& call, const Table& input, std::size_t,
+                                         const ColumnEvalCtx& ctx) {
+                                          RollingPartitions partitions{};
+                                          if (ctx.exec && (call.callee.ends_with("rank") ||
+                                                           call.callee.ends_with("rank_by")))
+                                              partitions.workers = group_barrier_worker_count(
+                                                  *ctx.exec, input.rows());
+                                          return polars_rolling_column(call, input, partitions);
+                                      }},
+        };
+        auto rank = polars_rolling;
+        rank.max_args += 2;
+        m.emplace("__ibex_rolling_rank", rank);
+        m.emplace("__ibex_rolling_avg_rank", polars_rolling);
+        m.emplace("__ibex_rolling_sum", polars_rolling);
+        m.emplace("__ibex_rolling_mean", polars_rolling);
+        auto indexed_rolling = polars_rolling;
+        indexed_rolling.min_args = indexed_rolling.max_args = 6;
+        auto indexed_rank = indexed_rolling;
+        indexed_rank.max_args += 2;
+        m.emplace("__ibex_rolling_rank_by", indexed_rank);
+        m.emplace("__ibex_rolling_avg_rank_by", indexed_rolling);
+        m.emplace("__ibex_rolling_sum_by", indexed_rolling);
+        m.emplace("__ibex_rolling_mean_by", indexed_rolling);
 
         // window_start() / window_end(): the nominal bounds of the enclosing
         // `window` clause's window for each row (grid boundaries when aligned,

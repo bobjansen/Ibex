@@ -7,7 +7,17 @@ import pyarrow as pa
 
 
 NANOS_PER_UNIT = {"ns": 1, "us": 1000, "ms": 1_000_000}
-TEMPORAL_TYPES = (pl.Datetime, pl.Duration)
+NANOS_PER_DAY = 86_400_000_000_000
+# Size of the repeating cycle and of one result unit, both in nanoseconds.
+TIME_PARTS = {
+    "Hour": (NANOS_PER_DAY, 3_600_000_000_000),
+    "Minute": (3_600_000_000_000, 60_000_000_000),
+    "Second": (60_000_000_000, 1_000_000_000),
+    "Millisecond": (1_000_000_000, 1_000_000),
+    "Microsecond": (1_000_000_000, 1_000),
+    "Nanosecond": (1_000_000_000, 1),
+}
+TEMPORAL_TYPES = (pl.Datetime, pl.Duration, pl.Time)
 
 
 def is_temporal(dtype):
@@ -17,11 +27,15 @@ def is_temporal(dtype):
 def storage_type(dtype):
     if dtype.base_type() == pl.Datetime:
         return pa.timestamp("ns", tz=dtype.time_zone)
+    if dtype == pl.Time:
+        return pa.time64("ns")
     return pa.duration("ns")
 
 
 def prepare_column(column):
     dtype = column.type
+    if pa.types.is_time(dtype):
+        return column.cast(pa.time64("ns")).cast(pa.int64())
     target = pa.timestamp("ns", tz=dtype.tz) if pa.types.is_timestamp(dtype) else pa.duration("ns")
     try:
         return column.cast(target).cast(pa.int64())
@@ -32,6 +46,8 @@ def prepare_column(column):
 def literal_ticks(value, dtype):
     if value is None:
         raise NotImplementedError("null temporal literals are not supported yet")
+    if dtype == pl.Time:
+        raise NotImplementedError("Time literal precision is not exposed by the Polars visitor")
     if dtype.base_type() == pl.Datetime:
         # Python datetime cannot carry sub-microsecond precision. The pinned
         # visitor has already discarded those bits; do not guess their value.

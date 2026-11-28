@@ -413,7 +413,7 @@ def _native_parquet_schema(expected):
             field = field.with_type(pa.dictionary(dtype.index_type, pa.string()))
         elif not (pa.types.is_integer(dtype) or pa.types.is_floating(dtype)
                   or pa.types.is_boolean(dtype) or pa.types.is_large_string(dtype)
-                  or pa.types.is_date32(dtype) or pa.types.is_timestamp(dtype)
+                  or pa.types.is_date32(dtype) or pa.types.is_timestamp(dtype) or dtype == pa.time64("ns")
                   or pa.types.is_decimal128(dtype)):
             return None
         fields.append(field)

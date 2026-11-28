@@ -11,7 +11,7 @@ from ._join import join_layout
 
 _WIDENED_NUMERIC_TYPES = {
     pa.int8(): pa.int64(), pa.int16(): pa.int64(), pa.int32(): pa.int64(),
-    pa.uint8(): pa.int64(), pa.uint16(): pa.int64(), pa.float32(): pa.float64(),
+    pa.uint8(): pa.int64(), pa.uint16(): pa.int64(), pa.uint32(): pa.int64(), pa.float32(): pa.float64(),
 }
 
 
@@ -156,6 +156,31 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return "substring(" + ", ".join(render(arg) for arg in args) + ")"
         if op == "string_length":
             return f"length({render(args[0])})"
+        if op in ("abs", "sqrt", "exp", "floor", "ceil", "byte_length"):
+            return f"{op}({render(args[0])})"
+        if op == "window_rank":
+            child, method, descending = args
+            ascending = "false" if descending else "true"
+            return f"rank({render(child)}, method = {method}, ascending = {ascending}, na_option = keep)"
+        if op in ("lag", "lead", "rolling_mean", "rolling_sum", "rolling_min", "rolling_max", "rolling_count"):
+            return f"{op}({render(args[0])}, {args[1]})"
+        if op in ("polars_rolling_sum_by", "polars_rolling_mean_by", "polars_rolling_rank_by", "polars_rolling_avg_rank_by"):
+            params = ", ".join(str(value) for value in args[2:])
+            return f"__ibex_{op.removeprefix('polars_')}({render(args[0])}, {render(args[1])}, {params})"
+        if op in ("polars_rolling_sum", "polars_rolling_mean", "polars_rolling_rank", "polars_rolling_avg_rank"):
+            params = ", ".join(str(value) for value in args[1:])
+            return f"__ibex_{op.removeprefix('polars_')}({render(args[0])}, {params})"
+        if op == "cumsum":
+            return f"cumsum({render(args[0])})"
+        if op == "time_of_day":
+            day = bind(args[1])
+            return f"((({render(args[0])} % {day}) + {day}) % {day})"
+        if op == "time_part":
+            remainder = f"({render(args[0])} % {bind(args[1])})"
+            if args[2] == 1:
+                return remainder
+            # Day ticks fit exactly in Float64, including the last ns of a day.
+            return f"Int64(floor({remainder} / {bind(args[2])}))"
         if op == "year":
             return f"year({render(args[0])})"
         if op == "is_nan":
@@ -285,6 +310,18 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             predicate = " && ".join(f"({render(expr)})" for expr in expressions)
             filter_scalars.clear()
             source += "[filter " + predicate + "]"
+        elif operation == "union":
+            sources = [source]
+            for branch in expressions:
+                namespace = f"union_{state.get('next_union', 0)}_"
+                state["next_union"] = state.get("next_union", 0) + 1
+                (branch_prefix, branch_source), _, _ = lower(
+                    branch, validate=validate, widen_numeric_inputs=widen_numeric_inputs,
+                    _state=state, _namespace=namespace, _return_parts=True)
+                prefix += branch_prefix
+                sources.append(branch_source)
+            if len(sources) > 1:
+                source = f"rbind({', '.join(sources)})"
         elif operation == "join":
             other, left_on, right_on, how, suffix, nulls_equal, coalesce, maintain_order, left_visible, right_visible = expressions
             join_id = state["next_join"]
@@ -383,6 +420,24 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             if not fields:
                 fields.append("_ibex_join_height = 0")
             source += f"[select {{ {', '.join(fields)} }}]"
+        elif operation == "window":
+            keys, fields, ordering = expressions
+            if ordering is not None:
+                order, reverse, last = ordering
+                row = internal(f"window_row_{index}")
+                while row in schemas[index]:
+                    row += "_"
+                direction = "desc" if reverse else "asc"
+                null_order = direction if last else direction + "_nulls_first"
+                source += (f"[update {{ {row} = seq() }}]"
+                           f"[order {{ {_identifier(order)} {null_order}, {row} asc }}]")
+            assignments = ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in fields)
+            partition = ", ".join(_identifier(key) for key in keys)
+            by = f", by {{ {partition} }}" if keys else ""
+            source += f"[update {{ {assignments} }}{by}]"
+            if ordering is not None:
+                columns = ", ".join(_identifier(name) for name in schemas[index])
+                source += f"[order {{ {row} asc }}][select {{ {columns} }}]"
         elif operation == "aggregate":
             keys, aggregates = expressions
             # Keep the complete aggregate in one native operator. The lowerer
@@ -650,7 +705,8 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
     if widen_numeric_inputs:
         # The Polars adapter retains logical types in its visitor/output
         # schema. Native Parquet decoding already widens narrow numeric types.
-        columns = {name: _WIDENED_NUMERIC_TYPES.get(dtype, dtype) for name, dtype in columns.items()}
+        columns = {name: pa.int64() if pa.types.is_time(dtype) else _WIDENED_NUMERIC_TYPES.get(dtype, dtype)
+                   for name, dtype in columns.items()}
     numeric = (pa.int64(), pa.float64())
     supported = numeric + (pa.uint32(), pa.bool_(), pa.string(), pa.large_string(), pa.date32())
 
@@ -743,6 +799,8 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "cast":
             original = dtype(args[0])
             target = args[1]
+            if target == pa.int64() and original == pa.bool_():
+                return target
             if target != pa.float64() or original not in numeric:
                 raise NotImplementedError("only numeric casts to Float64 are supported by this adapter")
             return target
@@ -755,10 +813,14 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
                     dtype(arg) != pa.int64() for arg in args[1:]):
                 raise TypeError("substring requires a string and integer offset/length")
             return pa.large_string()
-        if op == "string_length":
+        if op in ("string_length", "byte_length"):
             if dtype(args[0]) not in (pa.string(), pa.large_string()):
                 raise TypeError("string length requires a string operand")
             return pa.int64()
+        if op in ("abs", "sqrt", "exp", "floor", "ceil"):
+            if dtype(args[0]) != pa.float64():
+                raise TypeError(f"{op} requires a floating-point operand")
+            return pa.float64()
         if op == "polars_round":
             if dtype(args[0]) != pa.float64():
                 raise TypeError("floating rounding requires a floating-point operand")
@@ -767,6 +829,10 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             if dtype(args[0]) != pa.float64():
                 raise TypeError("is_nan requires a floating-point operand")
             return pa.bool_()
+        if op in ("time_part", "time_of_day"):
+            if dtype(args[0]) != pa.int64():
+                raise TypeError("clock extraction requires Int64 nanoseconds")
+            return pa.int64()
         if op == "year":
             if dtype(args[0]) != pa.date32():
                 raise NotImplementedError("year extraction currently requires Date input")
@@ -774,6 +840,25 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "is_null":
             dtype(args[0])
             return pa.bool_()
+        if op == "window_rank":
+            dtype(args[0])
+            return pa.float64() if args[1] == "average" else pa.int64()
+        if op in ("polars_rolling_rank", "polars_rolling_avg_rank", "polars_rolling_rank_by", "polars_rolling_avg_rank_by"):
+            dtype(args[0])
+            if op.endswith("_by"):
+                dtype(args[1])
+            return pa.float64() if "avg_rank" in op else pa.int64()
+        if op in ("polars_rolling_mean_by", "polars_rolling_sum_by"):
+            dtype(args[1])
+            value = dtype(args[0])
+            return pa.float64() if op == "polars_rolling_mean_by" else value
+        if op in ("rolling_mean", "polars_rolling_mean"):
+            dtype(args[0])
+            return pa.float64()
+        if op in ("cumsum", "lag", "lead", "rolling_sum", "rolling_min", "rolling_max", "rolling_count", "polars_rolling_sum"):
+            return dtype(args[0])
+        if op == "window":
+            raise NotImplementedError("nested windows and windows in this context are unsupported")
         if op == "wrap_integer":
             if dtype(args[0]) != pa.int64():
                 raise TypeError("integer wrapping requires an integral native expression")
@@ -822,9 +907,17 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             step_types.append(type_map)
             schemas.append(dict(columns))
             continue
-        if operation == "aggregate":
-            keys, expressions = expressions
+        if operation in ("aggregate", "window"):
+            keys, expressions = expressions[:2]
             key_types = [dtype(Expr("col", (name,))) for name in keys]
+        elif operation == "union":
+            for branch in expressions:
+                other = _validate_types(branch, widen_numeric_inputs=widen_numeric_inputs)[1][-1]
+                if list(columns.items()) != list(other.items()):
+                    raise NotImplementedError("union inputs require matching native schemas")
+            step_types.append(type_map)
+            schemas.append(dict(columns))
+            continue
         elif operation in ("slice", "python_slice", "cache"):
             step_types.append(type_map)
             schemas.append(dict(columns))

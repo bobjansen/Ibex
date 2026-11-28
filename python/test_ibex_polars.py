@@ -38,6 +38,239 @@ class EngineTests(unittest.TestCase):
         assert_frame_equal(actual, expected, rel_tol=1e-12, abs_tol=1e-9)
         return actual
 
+    def test_partitioned_window_reductions(self):
+        data = pl.DataFrame({"g": ["a", None, "a", None, "b"], "h": [1, 2, 1, 1, 2],
+                             "x": [2., 5., None, 3., None], "_ibex_window_0": range(5)})
+        x = pl.col("x")
+        for frame in (data.lazy(), data.clear().lazy()):
+            self.equal(frame.select("g", total=x.sum().over("g"), centered=x - x.mean().over("g"),
+                                    n=pl.len().over(["g", "h"]), present=x.count().over("h")))
+            self.equal(frame.with_columns(g=x.first().over("g"), x=x.last().over("g")))
+            self.equal(frame.filter(x == x.max().over("g")))
+        source = self.engine.explain(data.lazy().select(a=x.min().over("g"), b=x.max().over("g")))
+        self.assertEqual(source.count("by { `g` }"), 1)
+
+    def test_window_order_restores_input_positions(self):
+        frame = pl.LazyFrame({"g": [1, 2, 1, 1, 2], "k": [2, 3, None, 2, 1], "v": range(5)})
+        for descending in (False, True):
+            for last in (False, True):
+                opts = dict(order_by="k", descending=descending, nulls_last=last)
+                self.equal(frame.with_columns(first=pl.col("v").first().over("g", **opts),
+                                              last=pl.col("v").last().over("g", **opts)))
+        self.equal(frame.select(a=pl.col("v").first().over("g", order_by="k"),
+                                b=pl.col("v").first().over("g", order_by="v", descending=True)))
+
+    def test_window_cumulative_sums(self):
+        frame = pl.LazyFrame({"g": [0, 1, 0, 1, 0], "k": [2, 3, None, 2, 1],
+                              "x": pl.Series([2**31 - 1, None, 1, None, 3], dtype=pl.Int32)})
+        x = pl.col("x")
+        self.equal(frame.select(x.cum_sum().over("g"), global_sum=x.cum_sum().over(order_by="k"),
+                                ordered=x.cum_sum().over(pl.col("g") + 1, order_by="k")))
+        self.equal(frame.head(0).with_columns(running=x.cum_sum().over("g")))
+
+    def test_shift_over_a_partition(self):
+        frame = pl.LazyFrame({"g": [0, 1, 0, 1, 0], "x": [1., None, None, 2., 3.]})
+        for offset in (0, 1, -1, 2, -20):
+            shift = pl.col("x").shift(offset)
+            self.equal(frame.select(shift.over("g"), ordered=shift.over("g", order_by="x")))
+            self.equal(frame.head(0).select(shift.over("g")))
+
+    def test_source_null_counts_apply_only_to_unmodified_window_inputs(self):
+        frame = pl.LazyFrame({"g": [1, 1, 1], "x": [2, 3, 4]})
+        x = pl.col("x")
+        fields = [x.cum_sum().over("g").alias("total"), x.shift().over("g").alias("previous")]
+        self.equal(frame.select(fields))
+        self.assertNotIn("is_null", self.engine.explain(frame.select(fields)))
+        self.equal(frame.with_columns(pl.when(x != 3).then(x).alias("x")).select(fields))
+
+    def test_rank_over_with_ties_nulls_and_nans(self):
+        frame = pl.LazyFrame({"g": [1, 2, 1, 1, 2, 1], "x": [2., None, 2., float("nan"), 3., float("nan")]})
+        for method in ("average", "min", "max", "dense", "ordinal"):
+            for descending in (False, True):
+                rank = pl.col("x").rank(method, descending=descending)
+                self.equal(frame.select(rank.over("g"), same_group=pl.len().over("g")))
+                self.equal(frame.head(0).select(rank.over("g")))
+
+    def test_trailing_integer_windows(self):
+        x = pl.col("x")
+        data = pl.DataFrame({"g": [1, 2, 1, 2, 1, 1, 2], "x": [None, -4, None, 0, 9, -3, None]})
+        for frame in (data.lazy(), data.clear().lazy()):
+            for minimum in (1, 2, 3):
+                for op in (x.rolling_sum, x.rolling_mean, x.rolling_min, x.rolling_max):
+                    rolling = op(3, min_samples=minimum)
+                    self.equal(frame.select(rolling, grouped=rolling.over("g"),
+                                            ordered=rolling.over("g", order_by="x")))
+
+    def test_rolling_sum_and_mean_precision_and_frame_edges(self):
+        values = [None, -1e16, 3., 1e16, 0.25, None, float("inf"), 1., float("-inf"),
+                  float("nan"), None, 2., None, None, None, None, None, 7.]
+        for dtype in (pl.Float32, pl.Float64, pl.Int64, pl.UInt32):
+            data = values if dtype.is_float() else [None, 0, 3, 2**32 - 1, 2**31, None, 7, None]
+            series = pl.Series("x", data, dtype=dtype)
+            frame = pl.DataFrame({"x": series, "g": [i % 2 for i in range(len(series))]}).lazy()
+            for size, minimum in ((0, 0), (1, 0), (2, 1), (3, 0), (4, 4), (63, 3)):
+                for centered in (False, True):
+                    opts = dict(window_size=size, min_samples=minimum, center=centered)
+                    total = pl.col("x").rolling_sum(**opts)
+                    mean = pl.col("x").rolling_mean(**opts)
+                    query = frame.select(total=total, mean=mean, grouped=total.over("g"),
+                                         grouped_mean=mean.over("g"))
+                    with self.subTest(dtype=dtype, size=size, minimum=minimum, centered=centered):
+                        assert_frame_equal(query.collect(engine=self.engine), query.collect(engine="streaming"),
+                                           check_exact=True)
+
+    def test_interleaved_rolling_groups_write_nulls_to_original_rows(self):
+        size = 180_000
+        frame = pl.DataFrame({"row": range(size)}).with_columns(
+            g=pl.col("row") % 97, x=pl.when(pl.col("row") % 11 != 0).then(pl.col("row") * 0.25)).lazy()
+        x = pl.col("x")
+        query = frame.select(s=x.rolling_sum(9, min_samples=9).over("g"),
+                             m=x.rolling_mean(6, min_samples=6, center=True).over("g"))
+        assert_frame_equal(query.collect(engine=self.engine), query.collect(engine="streaming"), check_exact=True)
+
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_computed_rolling_values_across_parquet_row_groups(self):
+        data = pl.DataFrame({"x": [1., 3., None, 7., 4., 2.] * 1000, "g": [1, 2] * 3000,
+                             "big": [2**60, 2**60 + 1, None, -2**60, -2**60 + 1, 2**60] * 1000})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rolling.parquet"
+            data.write_parquet(path, row_group_size=149)
+            value = pl.col("x") * 2 + 3
+            query = pl.scan_parquet(path).select(
+                total=value.rolling_sum(303, min_samples=128),
+                mean=value.rolling_mean(305, min_samples=24, center=True).over("g"),
+                rank=value.rolling_rank(303, "min", min_samples=128),
+                dense=pl.col("big").rolling_rank(305, "dense", center=True).over("g"))
+            self.equal(query)
+
+    def test_indexed_rolling_sums_and_means(self):
+        x = pl.col("x")
+        data = dict(g=[1, 2, 1, 1, 1, 2, 2, 1, 2],
+                    i=[3, 1, 3, None, 1, 4, 1, 8, 9],
+                    x=[None, 5., 3., 19., float("inf"), -3., -0., float("nan"), 4.])
+        for dtype, span in ((pl.Int64, "3i"), (pl.Date, "3d"), (pl.Datetime("ns"), "3ns"),
+                            (pl.Datetime("ms", "Europe/Amsterdam"), "3ms")):
+            frame = pl.LazyFrame(data, schema_overrides={"i": dtype})
+            for closed in ("none", "both", "left", "right"):
+                for minimum in (0, 1, 3):
+                    opts = dict(by="i", window_size=span, closed=closed, min_samples=minimum)
+                    total, mean = x.rolling_sum_by(**opts), x.rolling_mean_by(**opts)
+                    q = frame.select(s=total, m=mean, gs=total.over("g"), gm=mean.over("g"))
+                    with self.subTest(dtype=dtype, closed=closed, minimum=minimum):
+                        assert_frame_equal(q.collect(engine=self.engine), q.collect(engine="streaming"),
+                                           check_exact=True)
+
+    def test_boolean_rolling_sums_and_means(self):
+        frame = pl.LazyFrame({"x": [True, None, False, True, True, None],
+                              "i": [0, 3, 1, 1, 2, 5], "g": [0, 0, 1, 0, 1, 1]})
+        x = pl.col("x")
+        for expr in (x.rolling_sum(3, min_samples=1), x.rolling_mean(2, center=True),
+                     x.rolling_sum_by("i", "2i"), x.rolling_mean_by("i", "2i")):
+            self.equal(frame.select(global_result=expr, grouped_result=expr.over("g")))
+
+    def test_rolling_ranks(self):
+        values = [3, 1, 3, None, 2, 1, 3, None, 4, 2, 4, 1]
+        for dtype in (pl.Int64, pl.Float32, pl.Float64, pl.UInt8, pl.Boolean,
+                      pl.Date, pl.Time, pl.Datetime("ns"), pl.Duration("us")):
+            x = pl.Series(values).cast(dtype)
+            if dtype.is_float():
+                x = pl.Series([0., -0., float("inf"), None, float("nan"), -1.,
+                               float("nan"), None, float("-inf"), 0., 9., -9.], dtype=dtype)
+            frame = pl.LazyFrame({"x": x, "g": [0, 1, 0] * 4,
+                                  "i": [1, 3, None, 1, 3, 5, 1, 2, 6, 5, 6, 1]})
+            for method in ("average", "min", "max", "dense"):
+                value = pl.col("x")
+                expressions = [
+                    value.rolling_rank(4, method, min_samples=minimum, center=center)
+                    for minimum in (0, 2, 4) for center in (False, True)
+                ] + [
+                    value.rolling_rank_by("i", "3i", method, min_samples=2, closed=closed)
+                    for closed in ("right", "both")
+                ]
+                for expr in expressions:
+                    with self.subTest(dtype=dtype, method=method, expr=expr):
+                        self.equal(frame.select(a=expr, b=expr.over("g")))
+
+    def test_boolean_all_over_rolling_rank_bounds(self):
+        frame = pl.LazyFrame({"x": [1, 2, None, 1]})
+        x = pl.col("x")
+        ranked = frame.with_columns(rank=x.rolling_rank(2, min_samples=1))
+        predicate = (pl.col("rank") >= 1) & (pl.col("rank") <= 2)
+        self.equal(ranked.select(predicate.all()))
+        for values in ([], [None], [True, None], [False, None], [True, True]):
+            data = pl.LazyFrame({"x": pl.Series(values, dtype=pl.Boolean)})
+            self.equal(data.select(default=x.all(), kleene=x.all(ignore_nulls=False)))
+
+    def test_rolling_rank_by_requires_right_endpoint(self):
+        frame = pl.LazyFrame({"x": [1, 2], "t": [2, 3]})
+        for closed in ("none", "left"):
+            query = frame.select(pl.col("x").rolling_rank_by("t", "2i", closed=closed))
+            for engine in (self.engine, "streaming"):
+                with self.assertRaisesRegex(pl.exceptions.InvalidOperationError, "closed on the right"):
+                    query.collect(engine=engine)
+
+    def test_large_rolling_rank_block_boundaries(self):
+        n = 131093
+        rows = pl.int_range(0, n, eager=True)
+        frame = pl.DataFrame({"i": rows}).with_columns(
+            x=pl.when(pl.col("i") % 131 != 0).then((pl.col("i") * 107) % 701),
+            t=pl.col("i") // 19).lazy()
+        for width, center, method in ((128, False, "average"), (129, True, "max"),
+                                      (4096, True, "dense")):
+            expr = pl.col("x").rolling_rank(width, method, center=center, min_samples=width // 2)
+            self.equal(frame.select(expr))
+        for interval in ("60i", "10000i"):
+            expr = pl.col("x").rolling_rank_by("t", interval, "dense", closed="both")
+            self.equal(frame.select(expr))
+
+    def test_rolling_rank_random_ties(self):
+        for last in (1, None):
+            frame = pl.LazyFrame({"x": [1] * 23 + [last], "g": [1, 2] * 12,
+                                  "i": [None, 1, 1, 0, 2, 3] * 4})
+            x = pl.col("x")
+            for seed in (0, 2**64 - 1):
+                for expr in (x.rolling_rank(5, "random", seed=seed, min_samples=3, center=True),
+                             x.rolling_rank_by("i", "2i", "random", seed=seed, closed="both")):
+                    self.equal(frame.select(a=expr, b=expr.over("g")))
+            bounds = frame.select(*[x.rolling_rank(5, m, min_samples=1).alias(m)
+                                    for m in ("min", "random", "max")]).collect(engine=self.engine)
+            for low, draw, high in bounds.iter_rows():
+                if low is None:
+                    self.assertIsNone(draw)
+                else:
+                    self.assertLessEqual(low, draw)
+                    self.assertLessEqual(draw, high)
+
+    def test_rolling_float_extrema(self):
+        frame = pl.LazyFrame({"x": [1., float("nan"), None, -3., float("inf"), -0., 0.]})
+        for op in (pl.col("x").rolling_min, pl.col("x").rolling_max):
+            self.equal(frame.select(op(3, min_samples=2)))
+
+    def test_vertical_concat_and_shared_branches(self):
+        first = pl.LazyFrame({"x": [1, None], "s": ["a", "b"]})
+        second = pl.LazyFrame({"x": [2, 3], "s": ["c", None]})
+        union = pl.concat([first, second, first])
+        self.equal(union)
+        self.equal(union.slice(1, 4))
+        self.equal(union.filter(pl.col("x") > 1).select(pl.col("x").sum()))
+        self.equal(pl.concat([first.head(0), second]))
+
+    def test_null_aware_equality(self):
+        frame = pl.DataFrame({"a": [None, None, 1., 1., float("nan"), -0.],
+                              "b": [None, 1., None, 2., float("nan"), 0.]}).lazy()
+        a, b = pl.col("a"), pl.col("b")
+        self.equal(frame.select(equal=a.eq_missing(b), different=a.ne_missing(b)))
+        self.equal(frame.filter(a.eq_missing(b)))
+
+    def test_unary_functions_and_utf8_lengths(self):
+        frame = pl.DataFrame({"x": [-1.5, -0.0, None, float("nan"), float("inf")],
+                              "s": ["é猫", "", None, "a", "🙂"]}).lazy()
+        x, s = pl.col("x"), pl.col("s")
+        self.equal(frame.select(x.abs(), root=x.sqrt(), exponential=x.exp(), down=x.floor(),
+                                up=x.ceil(), nan=x.is_nan(), valid=x.is_not_nan(),
+                                chars=s.str.len_chars(), bytes=s.str.len_bytes()))
+        self.equal(frame.select(x.mean().sqrt(), total=x.abs().sum()))
+
     def test_sum_that_is_null_when_a_group_has_no_values(self):
         # Polars documents `when(x.count() > 0).then(x.sum())` for a sum that
         # is null rather than zero on an empty group, and folds it into one
@@ -896,15 +1129,23 @@ class EngineTests(unittest.TestCase):
                 self.equal(frame)
                 self.equal(frame.select(value=pl.col("x") - 1))
                 self.equal(frame.select(total=pl.col("x").sum()))
-            for dtype in (pl.UInt32, pl.UInt64):
-                data = pl.DataFrame({"x": pl.Series([0, 1, None], dtype=dtype)})
-                path = Path(directory) / f"{dtype}.parquet"
-                data.write_parquet(path)
-                for query in (data.lazy(), pl.scan_parquet(path)):
-                    with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
-                        with self.assertRaises(NotImplementedError):
-                            query.collect(engine=self.engine)
-                        execute.assert_not_called()
+            data = pl.DataFrame({"u": pl.Series([0, 2**31, 2**32 - 1, None], dtype=pl.UInt32)})
+            path = Path(directory) / "u32.parquet"
+            data.write_parquet(path)
+            u = pl.col("u")
+            for frame in (data.lazy(), pl.scan_parquet(path)):
+                self.equal(frame)
+                self.equal(frame.select(u + 1, product=u * u, difference=u - 1))
+                self.equal(frame.select(total=u.sum(), count=u.count()))
+            dtype = pl.UInt64
+            data = pl.DataFrame({"x": pl.Series([0, 1, None], dtype=dtype)})
+            path = Path(directory) / f"{dtype}.parquet"
+            data.write_parquet(path)
+            for query in (data.lazy(), pl.scan_parquet(path)):
+                with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
+                    with self.assertRaises(NotImplementedError):
+                        query.collect(engine=self.engine)
+                    execute.assert_not_called()
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
     def test_int32_parquet_predicate_and_output_types(self):

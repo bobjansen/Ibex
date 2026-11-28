@@ -173,10 +173,43 @@ such as `pl.col("revenue") == pl.col("revenue").max()`. All reductions in a
 filter read its current input, before any predicate is applied; a later filter
 reduces its own input. The complete query still executes in one native call.
 Supported resident
-types are Int8, Int16, Int32, Int64, UInt8, UInt16, Float32, Float64, Boolean,
+types are Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, Float32, Float64, Boolean,
 String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric
-coercion to Float64 and null predicates are supported. Windows, UDFs,
+coercion to Float64 and null predicates are supported. Scalar reductions inside `.over(...)` broadcast to the input rows in projections,
+updates, and filters. Partition keys can be row expressions. Windows with matching
+partition and ordering keys share a grouped native update. A single-column
+`order_by` supports descending order and null placement, with ties broken in
+input order. Results return to their original row positions. Numeric columns
+support forward cumulative sums (integer and Float64) and literal-offset shifts.
+Ranks support average, min, max, dense and ordinal ties. Unweighted fixed-size
+sums and means support Boolean, integer, Float32 and Float64 columns, trailing
+or centered frames, and `min_samples` from zero to the window size. Only
+non-null observations count toward the minimum. Input NaNs and infinities age
+out as the frame advances. Numeric extrema support trailing frames and positive
+`min_samples`. All four operations work globally or per partition.
+
+`rolling_rank` ranks the current row in its trailing or centered frame.
+`rolling_rank_by` ranks it against every observation in the index interval,
+including peers with the same index. Supported index types and durations
+match indexed rolling sums. The interval must be closed on the right
+(`closed="right"` or `"both"`). Both functions support the engine's numeric,
+Boolean, Date, Datetime and Duration columns, and work per partition with
+`.over(...)`. A null value or index produces a null rank for that row.
+Average ties produce Float64. Min, max, dense and random ties produce the
+Polars index dtype. Pass `seed` for reproducible random ties.
+
+To compare rolling performance on a resident frame of one million rows, run
+the following commands from the repository root. Each query checks the Ibex
+result against Polars streaming, then reports median collection time in milliseconds. Add `--rank` to measure
+128-row average ranks, 4,096-row dense ranks, and 60-second average ranks.
+
+```sh
+PYTHONPATH=build-release/python:python IBEX_CORES=1 POLARS_MAX_THREADS=1 .venv/bin/python python/bench_polars_rolling.py
+PYTHONPATH=build-release/python:python .venv/bin/python python/bench_polars_rolling.py
+```
+
+UDFs,
 computed grouping/sort keys, aggregate broadcasting in projections/updates other than row counts, expression top-k
 operations, general inequality joins, other filtered aggregates, remote/multiple files, Enum, other numeric widths and nondefault scan
 policies are outside this slice. An already-sliced resident source is valid.
@@ -198,18 +231,16 @@ Polars planner declares a narrow integer result, using its signed or unsigned
 range. Wrapping happens before later comparisons, casts, divisions and
 reductions, and results recover the declared Polars dtype at export. Sums of
 Int8, Int16, UInt8 and UInt16 promote to Int64 and do not wrap at the input
-width; Int32 sums retain Int32 wrapping. Other mixed expressions also follow
+width. Int32 and UInt32 sums wrap at 32 bits. Other mixed expressions also follow
 the planner's result dtype. Safe widening casts and explicit integral casts
 with `wrap_numerical=True` are supported. Checked or null-producing casts that
-could overflow their destination range remain unsupported. UInt32 and UInt64
-inputs remain unsupported, for both resident tables and Parquet scans.
-UInt32 scalar literals are accepted for comparisons with count results; their
-values fit Int64 without introducing a native UInt32 input variant.
+could overflow their destination range remain unsupported. UInt32 values widen to Int64 for resident tables and Parquet scans.
+UInt64 inputs remain unsupported.
 
 Float32 inputs similarly widen once to Float64 for execution, including
-Parquet input. All arithmetic and reductions use Float64 intermediates; only
-declared Float32 output columns are downcast at the public result boundary.
-There is no emulation of intermediate Float32 rounding. This is an intentional
+Parquet input. Ordinary arithmetic and reductions use Float64 intermediates and downcast
+declared Float32 columns at the public result boundary. Rolling sums and means
+use the rounding of their respective Polars kernels. This is an intentional
 compatibility difference: cancellation, intermediate overflow/underflow, and
 predicates can differ from Polars even when the final dtype is Float32. For
 example, a Float32 input `x = 2**24` followed by `y = x + 1` and `y - x` yields
@@ -223,6 +254,8 @@ and restored at export. Conversion to nanoseconds is checked; values outside
 the signed Int64 nanosecond range are explicitly unsupported (approximately
 1677–2262 for timestamps, or ±292 years for durations). Nulls and nanosecond
 column precision are preserved without Python datetime conversion.
+
+Indexed rolling sums and means support Datetime indices with fixed elapsed-time intervals, Date indices with whole-day intervals, and Int32, UInt32 or Int64 indices with integer intervals. All four interval closures work, including on unsorted input, duplicate indices and within partitions. Calendar months and calendar days/weeks in timezones other than UTC remain unsupported.
 
 The temporal subset covers projection/aliases, null checks, comparisons,
 filters, sorting, grouping/row counts, min/max, and duration sums. Casts to finer

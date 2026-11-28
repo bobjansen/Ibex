@@ -43,6 +43,7 @@ add_library(ibex_runtime STATIC
     table_format.cpp
     table_compare.cpp
     update.cpp
+    polars_rolling.cpp
     window.cpp
     worker_pool.cpp
 )

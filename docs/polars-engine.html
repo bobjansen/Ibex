@@ -236,8 +236,12 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
       <article class="card">
         <h3>Supported</h3>
         <ul>
+          <li>Partitioned scalar reductions such as <code>mean().over("group")</code> in projections, updates, and filters. Windows support single-column <code>order_by</code>, forward cumulative sums, numeric shifts, and deterministic ranks. Unweighted fixed-size sums and means support Boolean, integer, Float32, and Float64, including centered windows and <code>min_samples=0</code>. Indexed sums and means support integer indices, Datetime indices, Date indices with whole-day intervals, all four interval closures, and duplicate or unsorted indices. Numeric minima and maxima support trailing windows and positive <code>min_samples</code>.</li>
+          <li><code>rolling_rank</code> supports trailing and centered row windows. <code>rolling_rank_by</code> supports integer and temporal indices with the right endpoint included. Both support average, min, max, dense and random tie breaking, including a seed, and work globally or per group.</li>
+          <li>Vertical concatenation via <code>pl.concat</code> and <code>pl.union</code> lowers to native <code>rbind</code>.</li>
           <li>Resident <code>DataFrame</code>s and single local Parquet files.</li>
-          <li><code>filter</code>, <code>select</code>, <code>with_columns</code>, arithmetic, comparisons, Boolean logic, <code>is_between</code>, <code>is_in</code>, <code>when/then/otherwise</code>, null checks and casts.</li>
+          <li><code>filter</code>, <code>select</code>, <code>with_columns</code>, arithmetic, comparisons, Boolean logic, <code>is_between</code>, <code>is_in</code>, <code>when/then/otherwise</code>, null checks and casts. Null-aware comparisons support <code>eq_missing</code> and <code>ne_missing</code>.</li>
+          <li>Float64 <code>abs</code>, <code>sqrt</code>, <code>exp</code>, <code>floor</code> and <code>ceil</code>, floating-point NaN checks, and string lengths in Unicode characters or UTF-8 bytes.</li>
           <li>Column-key <code>group_by</code> with <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>len</code>, <code>n_unique</code>, <code>first</code>/<code>last</code>, <code>median</code>, <code>std</code> (ddof 1), Pearson <code>corr</code> and its square, including the null-on-empty sum <code>pl.when(x.count() &gt; 0).then(x.sum())</code>.</li>
           <li>Equality joins (<code>inner</code>, <code>left</code>, <code>right</code>, <code>full</code>, <code>semi</code>, <code>anti</code>), cross joins, composite keys and suffixes.</li>
           <li>Per-group rows: <code>group_by(...).head(n)</code>, and <code>agg(pl.col(x).top_k(k)).explode(...)</code> on a numeric column.</li>
@@ -249,7 +253,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
         <h3>Not yet</h3>
         <ul>
           <li>Quantiles, <code>var</code>, <code>std</code> with another ddof, Spearman <code>corr</code>, and powers other than a float squared; list-valued results (<code>agg(pl.col(x).head(n))</code> without <code>explode</code>), and <code>explode</code> other than of a per-group head or top_k.</li>
-          <li>Window expressions (<code>over</code>), computed group or sort keys, Python UDFs.</li>
+          <li>Calendar-month rolling intervals, dynamic groups, computed group or sort keys, Python UDFs.</li>
           <li>As-of and general non-equi joins, nondefault join validation.</li>
           <li>General regular expressions; multiple or remote files; struct and list columns.</li>
           <li>Background and async execution, lazy sinks (<code>lazy=True</code>), and sinks other than <code>sink_parquet</code>.</li>

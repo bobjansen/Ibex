@@ -47,6 +47,7 @@
 #include "interpreter_internal.hpp"
 #include "kernel_update.hpp"
 #include "numeric_math.hpp"
+#include "polars_rolling.hpp"
 #include "runtime_internal.hpp"
 #include "welford.hpp"
 
@@ -2404,7 +2405,7 @@ auto grouped_shift_by_rows(const NativeGroupedOrderedCall& ordered, const Column
     const std::size_t k = ordered.offset;
     if ((!lag && ordered.kind != NativeGroupedOrderedKind::Lead) || k == 0 || k > kMaxOffset ||
         source.validity.has_value() || group_count * k * sizeof(double) > kMaxRingBytes ||
-        row_gid.size() != rows) {
+        rows == 0 || row_gid.size() != rows) {
         return std::nullopt;
     }
     const auto run =
@@ -3155,8 +3156,8 @@ auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::
     if (call == nullptr || !call->named_args.empty()) {
         return false;
     }
-    if (call->callee == "lag" || call->callee == "lead" || call->callee == "cumsum" ||
-        call->callee == "cumprod" || call->callee == "fill_forward" ||
+    if (is_polars_rolling(call->callee) || call->callee == "lag" || call->callee == "lead" ||
+        call->callee == "cumsum" || call->callee == "cumprod" || call->callee == "fill_forward" ||
         call->callee == "fill_backward") {
         return true;
     }
@@ -5788,6 +5789,25 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
     const GroupedRows& group_rows = grouped.rows;
     const auto row_gid = grouped.row_gid(rows);
 
+    if (fields.size() == 1) {
+        const auto& field = fields.front();
+        const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
+        if (call && is_polars_rolling(call->callee)) {
+            RollingPartitions partitions{{group_rows.flat.get(), rows},
+                                         group_rows.offsets,
+                                         grouped_reduction_worker_count(exec, group_count, rows)};
+            auto result = polars_rolling_column(*call, input, partitions);
+            if (!result)
+                return std::unexpected(result.error());
+            if (result->validity)
+                input.add_column(field.alias, std::move(result->column),
+                                 std::move(*result->validity));
+            else
+                input.add_column(field.alias, std::move(result->column));
+            apply_table_properties(input, derive_grouped_update_properties(input, fields));
+            return input;
+        }
+    }
     if (auto ordered = try_native_grouped_ordered_field(input, fields, group_rows, row_gid, exec);
         !ordered) {
         return std::unexpected(ordered.error());
@@ -5903,6 +5923,9 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
         return sub;
     };
 
+    if (group_count == 0) {
+        return run_group({});
+    }
     auto first = run_group(group_rows[0]);
     if (!first.has_value()) {
         return std::unexpected(first.error());
@@ -6195,9 +6218,6 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 return std::unexpected("cannot update time index column: " + field.alias);
             }
         }
-    }
-    if (input.rows() == 0) {
-        return update_table(std::move(input), fields, scalars, externs, exec);
     }
     // Asked before the grouping is discovered, so a row-local clause never pays
     // for a group plan it would not read. `grouped_update_table_with_plan` asks

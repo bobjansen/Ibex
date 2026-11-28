@@ -230,13 +230,17 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
         }
         // Functions that always return Float64.
         if (call->callee == "sqrt" || call->callee == "log" || call->callee == "exp" ||
+            call->callee == "__ibex_rolling_avg_rank" ||
+            call->callee == "__ibex_rolling_avg_rank_by" ||
+            call->callee == "__ibex_rolling_mean_by" || call->callee == "__ibex_rolling_mean" ||
             call->callee == "rolling_mean" || call->callee == "rolling_median" ||
             call->callee == "rolling_std" || call->callee == "rolling_ewma" ||
             call->callee == "rolling_quantile" || call->callee == "rolling_skew" ||
             call->callee == "rolling_kurtosis") {
             return ColumnType::Float64;
         }
-        if (call->callee == "rolling_count") {
+        if (call->callee == "__ibex_rolling_rank" || call->callee == "__ibex_rolling_rank_by" ||
+            call->callee == "rolling_count") {
             return ColumnType::Int64;
         }
         if (call->callee == "length" || call->callee == "byte_length") {
@@ -249,6 +253,7 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
         // argument's type.
         if (call->callee == "abs" || call->callee == "cumsum" || call->callee == "cumprod" ||
             call->callee == "lag" || call->callee == "lead" || call->callee == "rolling_sum" ||
+            call->callee == "__ibex_rolling_sum_by" || call->callee == "__ibex_rolling_sum" ||
             call->callee == "rolling_min" || call->callee == "rolling_max" ||
             call->callee == "rolling_first" || call->callee == "rolling_last") {
             if (!call->args.empty()) {

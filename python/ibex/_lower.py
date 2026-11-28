@@ -398,10 +398,22 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
                 fields.append("_ibex_join_height = 0")
             source += f"[select {{ {', '.join(fields)} }}]"
         elif operation == "window":
-            keys, fields = expressions
+            keys, fields, ordering = expressions
+            if ordering is not None:
+                order, reverse, last = ordering
+                row = internal(f"window_row_{index}")
+                while row in schemas[index]:
+                    row += "_"
+                direction = "desc" if reverse else "asc"
+                null_order = direction if last else direction + "_nulls_first"
+                source += (f"[update {{ {row} = seq() }}]"
+                           f"[order {{ {_identifier(order)} {null_order}, {row} asc }}]")
             assignments = ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in fields)
             partition = ", ".join(_identifier(key) for key in keys)
             source += f"[update {{ {assignments} }}, by {{ {partition} }}]"
+            if ordering is not None:
+                columns = ", ".join(_identifier(name) for name in schemas[index])
+                source += f"[order {{ {row} asc }}][select {{ {columns} }}]"
         elif operation == "aggregate":
             keys, aggregates = expressions
             # Keep the complete aggregate in one native operator. The lowerer
@@ -848,7 +860,7 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             schemas.append(dict(columns))
             continue
         if operation in ("aggregate", "window"):
-            keys, expressions = expressions
+            keys, expressions = expressions[:2]
             key_types = [dtype(Expr("col", (name,))) for name in keys]
         elif operation == "union":
             for branch in expressions:

@@ -226,18 +226,24 @@ class Adapter:
                 expr = Expr("case", (left_null, both_missing,
                                      Expr("case", (right_null, ibex.lit(name == "NotEqValidity"), expr))))
         elif kind == "Window":
-            if getattr(value.options, "kind", None) not in ("groups_to_rows", "join") or value.order_by is not None:
-                raise NotImplementedError("window ordering and alternative mappings are unsupported")
+            if getattr(value.options, "kind", None) not in ("groups_to_rows", "join"):
+                raise NotImplementedError("unsupported window mapping")
             keys = [self.expression(key) for key in value.partition_by]
             if not keys or any(key._op != "col" for key in keys):
                 raise NotImplementedError("window partitions require column keys")
+            ordering = None
+            if value.order_by is not None:
+                order = self.expression(value.order_by)
+                if order._op != "col":
+                    raise NotImplementedError("window ordering requires a column key")
+                ordering = (order._name, value.order_by_descending, value.order_by_nulls_last)
             function = self.expression(value.function)
             if value.options.kind == "join" and (not function._aggregate or function._row_reference):
                 raise NotImplementedError("list-valued window joins are unsupported")
             if not function._aggregate and not function._row_reference:
                 raise NotImplementedError("scalar literal windows require a frame-sized broadcast")
             self.has_windows = True
-            expr = Expr("window", (function, tuple(key._name for key in keys)))
+            expr = Expr("window", (function, tuple(key._name for key in keys), ordering))
         elif kind == "Ternary":
             expr = Expr("case", (self.expression(value.predicate), self.expression(value.truthy),
                                  self.expression(value.falsy)))
@@ -555,19 +561,19 @@ class Adapter:
         def rewrite(expr):
             if expr._op == "window":
                 if id(expr) not in columns:
-                    function, keys = expr._args
+                    function, keys, ordering = expr._args
                     name = f"_ibex_window_{len(columns)}"
                     while name in occupied:
                         name += "_"
                     occupied.add(name)
                     columns[id(expr)] = ibex.col(name)
-                    partitions.setdefault(keys, []).append(function.alias(name))
+                    partitions.setdefault((keys, ordering), []).append(function.alias(name))
                 return columns[id(expr)]
             return Expr(expr._op, tuple(rewrite(arg) if isinstance(arg, Expr) else arg for arg in expr._args))
 
         fields = [rewrite(expr) for expr in fields]
-        for keys, values in partitions.items():
-            frame = frame._append("window", (keys, tuple(values)))
+        for (keys, ordering), values in partitions.items():
+            frame = frame._append("window", (keys, tuple(values), ordering))
         return frame, fields
 
     def _aggregate_projection(self, frame, fields, *, keys=None, maintain_order=False):

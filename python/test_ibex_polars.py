@@ -50,6 +50,16 @@ class EngineTests(unittest.TestCase):
         source = self.engine.explain(data.lazy().select(a=x.min().over("g"), b=x.max().over("g")))
         self.assertEqual(source.count("by { `g` }"), 1)
 
+    def test_window_order_restores_input_positions(self):
+        frame = pl.LazyFrame({"g": [1, 2, 1, 1, 2], "k": [2, 3, None, 2, 1], "v": range(5)})
+        for descending in (False, True):
+            for last in (False, True):
+                opts = dict(order_by="k", descending=descending, nulls_last=last)
+                self.equal(frame.with_columns(first=pl.col("v").first().over("g", **opts),
+                                              last=pl.col("v").last().over("g", **opts)))
+        self.equal(frame.select(a=pl.col("v").first().over("g", order_by="k"),
+                                b=pl.col("v").first().over("g", order_by="v", descending=True)))
+
     def test_vertical_concat_and_shared_branches(self):
         first = pl.LazyFrame({"x": [1, None], "s": ["a", "b"]})
         second = pl.LazyFrame({"x": [2, 3], "s": ["c", None]})

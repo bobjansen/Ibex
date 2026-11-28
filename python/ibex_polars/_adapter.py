@@ -596,6 +596,10 @@ class Adapter:
             occupied.add(name)
             return name
 
+        def may_have_nulls(column):
+            kind, table = frame._source
+            return bool(frame._steps or kind != "table" or table[column._name].null_count)
+
         def input_column(expr):
             if expr._op == "col":
                 return expr._name
@@ -616,21 +620,24 @@ class Adapter:
                         child, floating = function._args
                         # A null contributes zero to the running total but
                         # stays null in the output at its original position.
-                        missing = Expr("is_null", (child,))
-                        clean = Expr("case", (missing, ibex.lit(0.0 if floating else 0), child))
-                        function = Expr("cumsum", (ibex.col(input_column(clean)),))
-                        result = Expr("case", (missing, Expr("null", ()), result))
+                        if may_have_nulls(child):
+                            missing = Expr("is_null", (child,))
+                            clean = Expr("case", (missing, ibex.lit(0.0 if floating else 0), child))
+                            child = ibex.col(input_column(clean))
+                            result = Expr("case", (missing, Expr("null", ()), result))
+                        function = Expr("cumsum", (child,))
                     elif function._op == "window_shift":
                         child, offset = function._args
                         direction = "lag" if offset >= 0 else "lead"
-                        missing = Expr("is_null", (child,))
-                        flag = Expr("case", (missing, ibex.lit(1), ibex.lit(0)))
-                        flag_column = ibex.col(input_column(flag))
-                        flag_name = fresh()
-                        values = partitions.setdefault((partition, ordering), [])
-                        values.append(Expr(direction, (flag_column, abs(offset))).alias(flag_name))
+                        if may_have_nulls(child):
+                            missing = Expr("is_null", (child,))
+                            flag = Expr("case", (missing, ibex.lit(1), ibex.lit(0)))
+                            flag_column = ibex.col(input_column(flag))
+                            flag_name = fresh()
+                            values = partitions.setdefault((partition, ordering), [])
+                            values.append(Expr(direction, (flag_column, abs(offset))).alias(flag_name))
+                            result = Expr("case", (ibex.col(flag_name) == 1, Expr("null", ()), result))
                         function = Expr(direction, (child, abs(offset)))
-                        result = Expr("case", (ibex.col(flag_name) == 1, Expr("null", ()), result))
                     columns[id(expr)] = result
                     partitions.setdefault((partition, ordering), []).append(function.alias(name))
                 return columns[id(expr)]

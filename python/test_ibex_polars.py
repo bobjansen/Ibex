@@ -75,6 +75,14 @@ class EngineTests(unittest.TestCase):
             self.equal(frame.select(shift.over("g"), ordered=shift.over("g", order_by="x")))
             self.equal(frame.head(0).select(shift.over("g")))
 
+    def test_source_null_counts_apply_only_to_unmodified_window_inputs(self):
+        frame = pl.LazyFrame({"g": [1, 1, 1], "x": [2, 3, 4]})
+        x = pl.col("x")
+        fields = [x.cum_sum().over("g").alias("total"), x.shift().over("g").alias("previous")]
+        self.equal(frame.select(fields))
+        self.assertNotIn("is_null", self.engine.explain(frame.select(fields)))
+        self.equal(frame.with_columns(pl.when(x != 3).then(x).alias("x")).select(fields))
+
     def test_rank_over_with_ties_nulls_and_nans(self):
         frame = pl.LazyFrame({"g": [1, 2, 1, 1, 2, 1], "x": [2., None, 2., float("nan"), 3., float("nan")]})
         for method in ("average", "min", "max", "dense", "ordinal"):

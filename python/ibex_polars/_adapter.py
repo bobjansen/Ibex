@@ -182,14 +182,18 @@ class Adapter:
             raise NotImplementedError("unsupported rolling options")
         operation, size, minimum, weights, center, parameters = value.function_data
         name = str(operation).removeprefix("RollingFunction.").lower()
-        if name not in ("sum", "mean", "min", "max") or weights is not None or center or parameters or not 1 <= minimum <= size:
-            raise NotImplementedError("unsupported rolling operation or frame")
+        if weights is not None or parameters or not 0 <= minimum <= size or size > 2**63 - 1:
+            raise NotImplementedError("unsupported rolling options")
         dtype = self.visitor.get_dtype(value.input[0])
-        if dtype not in _INTEGER_LAYOUTS and not (name in ("min", "max") and dtype in (pl.Float32, pl.Float64)):
+        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64):
             raise NotImplementedError(f"unsupported rolling {name} input {dtype}")
         child = self.expression(value.input[0])
         if child._op != "col":
             raise NotImplementedError("rolling windows require a column")
+        if name in ("sum", "mean"):
+            return Expr("polars_rolling_" + name, (child, size, minimum, int(center), int(dtype == pl.Float32)))
+        if name not in ("min", "max") or center or not minimum:
+            raise NotImplementedError("unsupported rolling operation or frame")
         return Expr("window_rolling", (child, "rolling_" + name, size, minimum))
 
     def expression(self, node):
@@ -288,7 +292,7 @@ class Adapter:
                 raise NotImplementedError("list-valued window joins are unsupported")
             self.has_windows = True
             expr = Expr("window", (function, tuple(keys), ordering))
-            if function._op in ("window_cumsum", "window_rolling") and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
+            if function._op in ("window_cumsum", "window_rolling", "polars_rolling_sum") and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
                 expr = _wrap_integer(expr, self.visitor.get_dtype(node))
         elif kind == "Ternary":
             expr = Expr("case", (self.expression(value.predicate), self.expression(value.truthy),

@@ -60,6 +60,7 @@
 #include "interpreter_internal.hpp"
 #include "kernel_gather.hpp"
 #include "numeric_math.hpp"
+#include "polars_rolling.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -1873,6 +1874,21 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
              }) {
             m.emplace(fn, rolling_transform);
         }
+
+        const BuiltinFn polars_rolling{
+            .min_args = 5,
+            .max_args = 5,
+            .infer = [](std::string_view name, const std::vector<ExprType>& args) -> IT {
+                return name == "__ibex_rolling_mean" ? ExprType::Double : args.front();
+            },
+            .exec = TransformExec{.column_eval =
+                                      [](const ir::CallExpr& call, const Table& input, std::size_t,
+                                         const ColumnEvalCtx&) {
+                                          return polars_rolling_column(call, input);
+                                      }},
+        };
+        m.emplace("__ibex_rolling_sum", polars_rolling);
+        m.emplace("__ibex_rolling_mean", polars_rolling);
 
         // window_start() / window_end(): the nominal bounds of the enclosing
         // `window` clause's window for each row (grid boundaries when aligned,

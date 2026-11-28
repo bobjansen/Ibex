@@ -101,6 +101,24 @@ class EngineTests(unittest.TestCase):
                     self.equal(frame.select(rolling, grouped=rolling.over("g"),
                                             ordered=rolling.over("g", order_by="x")))
 
+    def test_rolling_sum_and_mean_precision_and_frame_edges(self):
+        values = [None, -1e16, 3., 1e16, 0.25, None, float("inf"), 1., float("-inf"),
+                  float("nan"), None, 2., None, None, None, None, None, 7.]
+        for dtype in (pl.Float32, pl.Float64, pl.Int64, pl.UInt32):
+            data = values if dtype.is_float() else [None, 0, 3, 2**32 - 1, 2**31, None, 7, None]
+            series = pl.Series("x", data, dtype=dtype)
+            frame = pl.DataFrame({"x": series, "g": [i % 2 for i in range(len(series))]}).lazy()
+            for size, minimum in ((0, 0), (1, 0), (2, 1), (3, 0), (4, 4), (63, 3)):
+                for centered in (False, True):
+                    opts = dict(window_size=size, min_samples=minimum, center=centered)
+                    total = pl.col("x").rolling_sum(**opts)
+                    mean = pl.col("x").rolling_mean(**opts)
+                    query = frame.select(total=total, mean=mean, grouped=total.over("g"),
+                                         grouped_mean=mean.over("g"))
+                    with self.subTest(dtype=dtype, size=size, minimum=minimum, centered=centered):
+                        assert_frame_equal(query.collect(engine=self.engine), query.collect(engine="streaming"),
+                                           check_exact=True)
+
     def test_rolling_float_extrema(self):
         frame = pl.LazyFrame({"x": [1., float("nan"), None, -3., float("inf"), -0., 0.]})
         for op in (pl.col("x").rolling_min, pl.col("x").rolling_max):

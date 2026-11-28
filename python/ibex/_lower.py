@@ -164,6 +164,9 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return f"rank({render(child)}, method = {method}, ascending = {ascending}, na_option = keep)"
         if op in ("lag", "lead", "rolling_mean", "rolling_sum", "rolling_min", "rolling_max", "rolling_count"):
             return f"{op}({render(args[0])}, {args[1]})"
+        if op in ("polars_rolling_sum", "polars_rolling_mean"):
+            params = ", ".join(str(value) for value in args[1:])
+            return f"__ibex_{op.removeprefix('polars_')}({render(args[0])}, {params})"
         if op == "cumsum":
             return f"cumsum({render(args[0])})"
         if op == "year":
@@ -821,10 +824,10 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "window_rank":
             dtype(args[0])
             return pa.float64() if args[1] == "average" else pa.int64()
-        if op == "rolling_mean":
+        if op in ("rolling_mean", "polars_rolling_mean"):
             dtype(args[0])
             return pa.float64()
-        if op in ("cumsum", "lag", "lead", "rolling_sum", "rolling_min", "rolling_max", "rolling_count"):
+        if op in ("cumsum", "lag", "lead", "rolling_sum", "rolling_min", "rolling_max", "rolling_count", "polars_rolling_sum"):
             return dtype(args[0])
         if op == "window":
             raise NotImplementedError("nested windows and windows in this context are unsupported")

@@ -130,14 +130,17 @@ class EngineTests(unittest.TestCase):
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
     def test_computed_rolling_values_across_parquet_row_groups(self):
-        data = pl.DataFrame({"x": [1., 3., None, 7., 4., 2.] * 1000, "g": [1, 2] * 3000})
+        data = pl.DataFrame({"x": [1., 3., None, 7., 4., 2.] * 1000, "g": [1, 2] * 3000,
+                             "big": [2**60, 2**60 + 1, None, -2**60, -2**60 + 1, 2**60] * 1000})
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rolling.parquet"
             data.write_parquet(path, row_group_size=149)
             value = pl.col("x") * 2 + 3
             query = pl.scan_parquet(path).select(
                 total=value.rolling_sum(303, min_samples=128),
-                mean=value.rolling_mean(305, min_samples=24, center=True).over("g"))
+                mean=value.rolling_mean(305, min_samples=24, center=True).over("g"),
+                rank=value.rolling_rank(303, "min", min_samples=128),
+                dense=pl.col("big").rolling_rank(305, "dense", center=True).over("g"))
             self.equal(query)
 
     def test_indexed_rolling_sums_and_means(self):

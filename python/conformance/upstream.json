@@ -4,6 +4,10 @@
   "commit": "7f902bd3ffd27ff82d14278a09a295ff2f7aed92",
   "repository": "https://github.com/pola-rs/polars",
   "test_tree_sha256": "68c6eb96ef6bd0a42d82ed3c5d0077be09afe1c95e13dd5f0d4f4b35fd4295cc",
+  "random_rank_tests": [
+    "tests/unit/operations/rolling/test_rolling.py::test_rolling_rank_method_random[True]",
+    "tests/unit/operations/rolling/test_rolling.py::test_rolling_rank_method_random[False]"
+  ],
   "targets": [
     "tests/unit/operations/test_select.py",
     "tests/unit/operations/test_with_columns.py",

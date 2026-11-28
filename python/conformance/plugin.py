@@ -15,12 +15,13 @@ from .probe import Probe
 
 
 class Plugin:
-    def __init__(self, mode, output, baseline=None, unordered_tests=None, selection_tests=None):
+    def __init__(self, mode, output, baseline=None, unordered_tests=None, selection_tests=None, random_rank_tests=()):
         self.mode = mode
         self.output = Path(output)
         self.baseline = baseline or {}
         self.unordered_tests = unordered_tests or {}
         self.selection_tests = selection_tests or {}
+        self.random_rank_tests = set(random_rank_tests)
         self.tests = {}
         self.collection_errors = []
 
@@ -35,8 +36,11 @@ class Plugin:
             # its parametrizations.
             unordered = self.unordered_tests.get(item.nodeid,
                                                  self.unordered_tests.get(item.nodeid.split("[")[0]))
+            random_rank = item.nodeid in self.random_rank_tests
+            if random_rank:
+                row["comparison_policy"] = {"random_rank": "unseeded ties within exact min/max bounds"}
             probe = Probe(pl.LazyFrame.collect, check_row_order=unordered is None,
-                          allowed_rows=selection["allowed_rows"] if selection else None)
+                          allowed_rows=selection["allowed_rows"] if selection else None, random_rank=random_rank)
             if selection:
                 row["comparison_policy"] = {"unordered_selection": selection}
             if unordered is not None:
@@ -99,5 +103,5 @@ def pytest_configure(config):
                                         json.loads(Path(os.environ["IBEX_CONFORMANCE_BASELINE"]).read_text())["tests"]
                                         if "IBEX_CONFORMANCE_BASELINE" in os.environ else None,
                                         pin.get("unordered_tests"),
-                                        pin.get("unordered_selection_tests")),
+                                        pin.get("unordered_selection_tests"), pin.get("random_rank_tests", ())),
                                   "ibex-conformance-recorder")

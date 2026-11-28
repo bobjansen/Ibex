@@ -12,10 +12,11 @@ from ibex_polars import IbexEngine
 
 
 class Probe:
-    def __init__(self, original, *, check_row_order=True, allowed_rows=None):
+    def __init__(self, original, *, check_row_order=True, allowed_rows=None, random_rank=False):
         self.original = original
         self.check_row_order = check_row_order
         self.allowed_rows = allowed_rows
+        self.random_rank = random_rank
         self.events = []
         self.active = ContextVar("ibex_conformance_active", default=False)
 
@@ -70,7 +71,18 @@ class Probe:
                 event["reason"] = "Ibex returned a result without native execution"
             else:
                 try:
-                    if self.allowed_rows is None:
+                    result = "matching_frame"
+                    if self.random_rank and reference.columns == ["a", "lo", "hi", "random"]:
+                        assert candidate.schema == reference.schema, "random rank schema mismatch"
+                        assert_frame_equal(candidate.drop("random"), reference.drop("random"), check_exact=True)
+                        for frame in (candidate, reference):
+                            for low, high, draw in frame.select("lo", "hi", "random").iter_rows():
+                                if low is None:
+                                    assert high is None and draw is None, "random rank null mismatch"
+                                else:
+                                    assert draw is not None and low <= draw <= high, "random rank outside tie"
+                        result = "matching_random_rank_contract"
+                    elif self.allowed_rows is None:
                         assert_frame_equal(candidate, reference, check_row_order=self.check_row_order,
                                            rel_tol=1e-12, abs_tol=1e-9)
                     else:
@@ -79,6 +91,7 @@ class Probe:
                         assert candidate.columns == reference.columns, "column mismatch"
                         assert candidate.schema == reference.schema, "dtype mismatch"
                         assert candidate.height == reference.height, "height mismatch"
+                        result = "matching_selection_contract"
                         domain = {tuple(row) for row in self.allowed_rows}
                         for frame in (reference, candidate):
                             rows = frame.rows()
@@ -87,7 +100,7 @@ class Probe:
                 except AssertionError as error:
                     event["reason"] = str(error)
                 else:
-                    event.update(status="pass", result="matching_frame" if self.allowed_rows is None else "matching_selection_contract")
+                    event.update(status="pass", result=result)
                 # Upstream assertions also inspect actual accepted Ibex results.
                 return candidate
 

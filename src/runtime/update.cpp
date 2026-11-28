@@ -2404,7 +2404,7 @@ auto grouped_shift_by_rows(const NativeGroupedOrderedCall& ordered, const Column
     const std::size_t k = ordered.offset;
     if ((!lag && ordered.kind != NativeGroupedOrderedKind::Lead) || k == 0 || k > kMaxOffset ||
         source.validity.has_value() || group_count * k * sizeof(double) > kMaxRingBytes ||
-        row_gid.size() != rows) {
+        rows == 0 || row_gid.size() != rows) {
         return std::nullopt;
     }
     const auto run =
@@ -5903,6 +5903,9 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
         return sub;
     };
 
+    if (group_count == 0) {
+        return run_group({});
+    }
     auto first = run_group(group_rows[0]);
     if (!first.has_value()) {
         return std::unexpected(first.error());
@@ -6195,9 +6198,6 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 return std::unexpected("cannot update time index column: " + field.alias);
             }
         }
-    }
-    if (input.rows() == 0) {
-        return update_table(std::move(input), fields, scalars, externs, exec);
     }
     // Asked before the grouping is discovered, so a row-local clause never pays
     // for a group plan it would not read. `grouped_update_table_with_plan` asks

@@ -385,6 +385,16 @@ auto sorted(std::vector<std::int64_t> values) -> std::vector<std::int64_t> {
 
 }  // namespace
 
+TEST_CASE("empty grouped updates retain aggregate output columns", "[update][group]") {
+    const auto result =
+        run("t[head 0][update { s = coalesce(sum(v), 0), n = count(), l = lag(v, 1) }, by k];",
+            nan_keys());
+    CHECK(result.rows() == 0);
+    CHECK(ints(result, "s").empty());
+    CHECK(ints(result, "n").empty());
+    CHECK(ints(result, "l").empty());
+}
+
 // NaN keys form ONE group whatever their payload or sign, as in Polars, DuckDB
 // and PostgreSQL; -0.0 and 0.0 form one group; null stays its own group.
 // Groups: NaN rows {0,2,5} = 37, 1.0 rows {1,7} = 130, zero rows {3,4} = 24,

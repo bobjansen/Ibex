@@ -19,6 +19,7 @@
 #include <ibex/core/time_zone.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -985,6 +986,23 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         const auto pred = [times, dur](std::size_t l, std::size_t r) {
                             return times[l] <= times[r] - dur;
                         };
+                        if constexpr (std::is_same_v<T, double>) {
+                            // A contiguous precheck keeps NaN bookkeeping out of the
+                            // serial accumulator loop. Preserve add-before-remove order.
+                            if (!has_nulls &&
+                                std::none_of(col_values, col_values + rows,
+                                             [](double value) { return std::isnan(value); })) {
+                                double total = 0.0;
+                                std::size_t lo = 0;
+                                for (std::size_t i = 0; i < rows; ++i) {
+                                    total += col_values[i];
+                                    while (lo < i && pred(lo, i))
+                                        total -= col_values[lo++];
+                                    result_values[i] = total;
+                                }
+                                return ComputedColumn{std::move(result), std::nullopt};
+                            }
+                        }
                         if (has_nulls) {
                             run_rows(pred, std::true_type{});
                         } else {

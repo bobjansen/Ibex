@@ -742,12 +742,14 @@ class Adapter:
                 frame = self.frame(marker.input)
                 self.visitor.set_node(marker.input)
                 expressions = tuple(self.named(expr) for expr in marker.exprs if expr.node not in hidden)
-                frame, expressions = self._window_fields(frame, expressions, schema)
+                frame, expressions = self._window_fields(frame, expressions, marker_schema)
                 frame = self._hstack(frame, expressions, [name for name in marker_schema if name != height], node.input)
             else:
                 frame = self.frame(node.input)
             self.visitor.set_node(node.input)
-            frame = frame.select([self.expression(operand).alias(alias) for operand, alias in operands])
+            fields = [self.expression(operand).alias(alias) for operand, alias in operands]
+            frame, fields = self._window_fields(frame, fields, [alias for _, alias in operands])
+            frame = frame.select(fields)
             if operation[0] == "reverse":
                 return frame[::-1]
             return frame.gather_every(operation[2], offset=operation[1])

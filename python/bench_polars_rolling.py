@@ -29,6 +29,7 @@ def measure(query, ibex, repeats):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, default=1_000_000)
+    parser.add_argument("--rank", action="store_true", help="measure rolling ranks")
     parser.add_argument("--groups", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=10)
     args = parser.parse_args()
@@ -51,6 +52,12 @@ def main():
             "sum_60s": value.rolling_sum_by("ts", "60s"),
             "mean_5m": value.rolling_mean_by("ts", "5m"),
         }
+        if args.rank:
+            expressions = {
+                "rank_128": value.rolling_rank(128, min_samples=1),
+                "rank_dense_4096": value.rolling_rank(4096, "dense", min_samples=1),
+                "rank_60s": value.rolling_rank_by("ts", "60s"),
+            }
         for name, expr in expressions.items():
             for partition, window in (("global", expr), ("group", expr.over("group"))):
                 ibex_ms, polars_ms = measure(frame.select(window), engine, args.repeats)

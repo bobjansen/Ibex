@@ -1232,7 +1232,7 @@ class Adapter:
             if not isinstance(node.paths[0], str) or Path(node.paths[0]).is_dir():
                 raise NotImplementedError("only single local Parquet file paths are supported")
             for name, dtype in schema.items():
-                if is_temporal(dtype):
+                if is_temporal(dtype) and dtype != pl.Time:
                     raise NotImplementedError("temporal Parquet scans are not supported yet")
                 if dtype.base_type() not in _SUPPORTED_INPUT_TYPES:
                     raise NotImplementedError(f"unsupported Parquet column {name}: {dtype}")

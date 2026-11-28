@@ -705,7 +705,8 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
     if widen_numeric_inputs:
         # The Polars adapter retains logical types in its visitor/output
         # schema. Native Parquet decoding already widens narrow numeric types.
-        columns = {name: _WIDENED_NUMERIC_TYPES.get(dtype, dtype) for name, dtype in columns.items()}
+        columns = {name: pa.int64() if pa.types.is_time(dtype) else _WIDENED_NUMERIC_TYPES.get(dtype, dtype)
+                   for name, dtype in columns.items()}
     numeric = (pa.int64(), pa.float64())
     supported = numeric + (pa.uint32(), pa.bool_(), pa.string(), pa.large_string(), pa.date32())
 

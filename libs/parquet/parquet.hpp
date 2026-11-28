@@ -652,6 +652,20 @@ inline void append_date64_column(const std::shared_ptr<arrow::ChunkedArray>& chu
     }
 }
 
+// Polars and the Ibex adapter use Int64 nanoseconds since midnight.
+inline auto time_to_nanoseconds(const arrow::DataType& type) {
+    const auto unit = static_cast<const arrow::TimeType&>(type).unit();
+    const std::int64_t scale = unit == arrow::TimeUnit::SECOND  ? 1'000'000'000
+                               : unit == arrow::TimeUnit::MILLI ? 1'000'000
+                               : unit == arrow::TimeUnit::MICRO ? 1'000
+                                                                : 1;
+    return [scale, limit = 86'400'000'000'000LL / scale](std::int64_t value) {
+        if (value < 0 || value >= limit)
+            throw std::runtime_error("parquet::read: time value outside a day");
+        return value * scale;
+    };
+}
+
 inline void append_timestamp_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
                                     const std::shared_ptr<arrow::DataType>& type,
                                     std::vector<ibex::Timestamp>& out) {
@@ -842,6 +856,20 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
                 emit(ibex::Column<ibex::Date>{std::move(values)});
                 break;
             }
+            case arrow::Type::TIME32:
+            case arrow::Type::TIME64: {
+                std::vector<std::int64_t> values;
+                values.reserve(static_cast<std::size_t>(col->length()));
+                const auto convert = time_to_nanoseconds(*col->type());
+                for (const auto& chunk : col->chunks()) {
+                    if (chunk->type_id() == arrow::Type::TIME32)
+                        append_converted<arrow::Time32Array>(*chunk, values, convert);
+                    else
+                        append_converted<arrow::Time64Array>(*chunk, values, convert);
+                }
+                emit(ibex::Column<std::int64_t>{std::move(values)});
+                break;
+            }
             case arrow::Type::TIMESTAMP: {
                 std::vector<ibex::Timestamp> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
@@ -872,6 +900,8 @@ inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtim
     ibex::runtime::Table out;
     for (const auto& field : schema.fields()) {
         switch (field->type()->id()) {
+            case arrow::Type::TIME32:
+            case arrow::Type::TIME64:
             case arrow::Type::INT8:
             case arrow::Type::INT16:
             case arrow::Type::INT32:
@@ -2725,6 +2755,16 @@ inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow:
                 });
             break;
         }
+        case arrow::Type::TIME32:
+            planned.decode_range = sharded_numeric<parquet::Int32Type, std::int64_t, false>(
+                planned.entry, leaf_index, selection, output_rows,
+                time_to_nanoseconds(*field.type()));
+            break;
+        case arrow::Type::TIME64:
+            planned.decode_range = sharded_numeric<parquet::Int64Type, std::int64_t, false>(
+                planned.entry, leaf_index, selection, output_rows,
+                time_to_nanoseconds(*field.type()));
+            break;
         case arrow::Type::TIMESTAMP: {
             // INT96 timestamps go through the per-value physical path, which
             // this does not cover.
@@ -2809,6 +2849,20 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
                     return static_cast<std::int64_t>(value);
                 });
             verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        case arrow::Type::TIME32:
+        case arrow::Type::TIME64: {
+            ibex::Column<std::int64_t> out;
+            out.reserve(output_rows);
+            const auto convert = time_to_nanoseconds(*field.type());
+            if (field.type()->id() == arrow::Type::TIME32)
+                verify(decode_numeric_column<parquet::Int32Type, std::int64_t, false>(
+                    reader, leaf_index, selection, groups, out, validity, convert));
+            else
+                verify(decode_numeric_column<parquet::Int64Type, std::int64_t, false>(
+                    reader, leaf_index, selection, groups, out, validity, convert));
             entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
             break;
         }
@@ -3387,9 +3441,15 @@ inline auto read_column_stats(const parquet::FileMetaData& metadata,
         // A leaf's path is the Arrow field name only for flat schemas; nested
         // columns (a struct's fields) share a top-level name and must not be
         // conflated, so take only leaves whose path is a top-level field.
-        if (arrow_schema.GetFieldIndex(descr->Column(leaf)->path()->ToDotString()) < 0) {
+        const auto field = arrow_schema.GetFieldByName(descr->Column(leaf)->path()->ToDotString());
+        if (!field)
             continue;
-        }
+        // Footer bounds are in file units. Rescaled clock columns must not
+        // use those bounds to prune predicates over nanosecond values.
+        if ((field->type()->id() == arrow::Type::TIME32 ||
+             field->type()->id() == arrow::Type::TIME64) &&
+            static_cast<const arrow::TimeType&>(*field->type()).unit() != arrow::TimeUnit::NANO)
+            continue;
         leaves.push_back(leaf);
     }
     const auto groups = static_cast<std::size_t>(metadata.num_row_groups());

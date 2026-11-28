@@ -3,6 +3,7 @@
 """Temporal storage, precision, range and public dtype checks."""
 
 from datetime import datetime, timedelta, timezone
+import os
 import tempfile
 from pathlib import Path
 import unittest
@@ -127,6 +128,24 @@ class TemporalTests(unittest.TestCase):
                     execute.assert_not_called()
         for dtype in (pl.Datetime("ns"), pl.Duration("ns")):
             self.equal(pl.LazyFrame({"x": pl.Series([-(2**63), 2**63 - 1, None], dtype=dtype)}))
+
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_parquet_clock_units(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for unit, day, dtype in (("ms", 86_400_000, pa.time32("ms")),
+                                     ("us", 86_400_000_000, pa.time64("us")),
+                                     ("ns", 86_400_000_000_000, pa.time64("ns"))):
+                path = Path(directory) / f"{unit}.parquet"
+                clock = pa.array([0, 1, 2, None, day - 1, day // 2, 1] * 250, type=dtype)
+                pq.write_table(pa.table({"clock": clock, "g": [1, 2] * 875}), path,
+                               row_group_size=113)
+                frame = pl.scan_parquet(path)
+                x = pl.col("clock")
+                self.equal(frame)
+                self.equal(frame.filter(x.to_physical() >= 43_200_000_000_000))
+                self.equal(frame.select(hour=x.dt.hour(), rank=x.rolling_rank(23, "dense"),
+                                       grouped=x.rolling_rank(24, min_samples=1).over("g")))
+                self.equal(frame.group_by("g", maintain_order=True).agg(lo=x.min(), hi=x.max()))
 
     def test_temporal_parquet_is_explicitly_unsupported(self):
         with tempfile.TemporaryDirectory() as directory:

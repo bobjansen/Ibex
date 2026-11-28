@@ -162,7 +162,7 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             child, method, descending = args
             ascending = "false" if descending else "true"
             return f"rank({render(child)}, method = {method}, ascending = {ascending}, na_option = keep)"
-        if op in ("lag", "lead"):
+        if op in ("lag", "lead", "rolling_mean", "rolling_sum", "rolling_min", "rolling_max", "rolling_count"):
             return f"{op}({render(args[0])}, {args[1]})"
         if op == "cumsum":
             return f"cumsum({render(args[0])})"
@@ -820,7 +820,10 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "window_rank":
             dtype(args[0])
             return pa.float64() if args[1] == "average" else pa.int64()
-        if op in ("cumsum", "lag", "lead"):
+        if op == "rolling_mean":
+            dtype(args[0])
+            return pa.float64()
+        if op in ("cumsum", "lag", "lead", "rolling_sum", "rolling_min", "rolling_max", "rolling_count"):
             return dtype(args[0])
         if op == "window":
             raise NotImplementedError("nested windows and windows in this context are unsupported")

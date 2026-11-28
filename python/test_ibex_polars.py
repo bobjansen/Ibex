@@ -91,6 +91,21 @@ class EngineTests(unittest.TestCase):
                 self.equal(frame.select(rank.over("g"), same_group=pl.len().over("g")))
                 self.equal(frame.head(0).select(rank.over("g")))
 
+    def test_trailing_integer_windows(self):
+        x = pl.col("x")
+        data = pl.DataFrame({"g": [1, 2, 1, 2, 1, 1, 2], "x": [None, -4, None, 0, 9, -3, None]})
+        for frame in (data.lazy(), data.clear().lazy()):
+            for minimum in (1, 2, 3):
+                for op in (x.rolling_sum, x.rolling_mean, x.rolling_min, x.rolling_max):
+                    rolling = op(3, min_samples=minimum)
+                    self.equal(frame.select(rolling, grouped=rolling.over("g"),
+                                            ordered=rolling.over("g", order_by="x")))
+
+    def test_rolling_float_extrema(self):
+        frame = pl.LazyFrame({"x": [1., float("nan"), None, -3., float("inf"), -0., 0.]})
+        for op in (pl.col("x").rolling_min, pl.col("x").rolling_max):
+            self.equal(frame.select(op(3, min_samples=2)))
+
     def test_vertical_concat_and_shared_branches(self):
         first = pl.LazyFrame({"x": [1, None], "s": ["a", "b"]})
         second = pl.LazyFrame({"x": [2, 3], "s": ["c", None]})

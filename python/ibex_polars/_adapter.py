@@ -177,6 +177,21 @@ class Adapter:
         self.frame_length_columns = {}
         self.sort_pruning_predicates = set()
 
+    def _rolling_function(self, value):
+        if len(value.function_data) != 6 or len(value.input) != 1:
+            raise NotImplementedError("unsupported rolling options")
+        operation, size, minimum, weights, center, parameters = value.function_data
+        name = str(operation).removeprefix("RollingFunction.").lower()
+        if name not in ("sum", "mean", "min", "max") or weights is not None or center or parameters or not 1 <= minimum <= size:
+            raise NotImplementedError("unsupported rolling operation or frame")
+        dtype = self.visitor.get_dtype(value.input[0])
+        if dtype not in _INTEGER_LAYOUTS and not (name in ("min", "max") and dtype in (pl.Float32, pl.Float64)):
+            raise NotImplementedError(f"unsupported rolling {name} input {dtype}")
+        child = self.expression(value.input[0])
+        if child._op != "col":
+            raise NotImplementedError("rolling windows require a column")
+        return Expr("window_rolling", (child, "rolling_" + name, size, minimum))
+
     def expression(self, node):
         # Dtypes and proofs of frame-sized lengths belong to the current input
         # node: a filter can change the height without changing the schema.
@@ -238,7 +253,9 @@ class Adapter:
                     raise NotImplementedError("window ordering requires a column key")
                 ordering = (order._name, value.order_by_descending, value.order_by_nulls_last)
             call = self.visitor.view_expression(value.function)
-            if type(call).__name__ == "Function" and call.function_data in (("cum_sum", False), ("cum_max", False)):
+            if type(call).__name__ == "Function" and str(call.function_data[0]).startswith("RollingFunction."):
+                function = self._rolling_function(call)
+            elif type(call).__name__ == "Function" and call.function_data in (("cum_sum", False), ("cum_max", False)):
                 input_type = self.visitor.get_dtype(call.input[0])
                 if input_type not in (*_INTEGER_LAYOUTS, pl.Float64):
                     raise NotImplementedError("cumulative sums require integer or Float64 inputs")
@@ -271,7 +288,7 @@ class Adapter:
                 raise NotImplementedError("list-valued window joins are unsupported")
             self.has_windows = True
             expr = Expr("window", (function, tuple(keys), ordering))
-            if function._op == "window_cumsum" and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
+            if function._op in ("window_cumsum", "window_rolling") and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
                 expr = _wrap_integer(expr, self.visitor.get_dtype(node))
         elif kind == "Ternary":
             expr = Expr("case", (self.expression(value.predicate), self.expression(value.truthy),
@@ -352,6 +369,14 @@ class Adapter:
                 raise NotImplementedError(f"unsupported cast to {value.dtype} with options {value.options}")
         elif kind == "Function":
             name = str(value.function_data[0]).split(".")[-1]
+            if str(value.function_data[0]).startswith("RollingFunction."):
+                function = self._rolling_function(value)
+                self.has_windows = True
+                expr = Expr("window", (function, (ibex.lit(1),), None))
+                if self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
+                    expr = _wrap_integer(expr, self.visitor.get_dtype(node))
+                self.expressions[key] = expr
+                return expr
             if name == "repeat":
                 if len(value.input) != 2 or len(value.function_data) != 1:
                     raise NotImplementedError("unsupported repeat options")
@@ -626,6 +651,18 @@ class Adapter:
                             child = ibex.col(input_column(clean))
                             result = Expr("case", (missing, Expr("null", ()), result))
                         function = Expr("cumsum", (child,))
+                    elif function._op == "window_rolling":
+                        child, op, size, minimum = function._args
+                        function = Expr(op, (child, size))
+                        if minimum > 1 or may_have_nulls(child):
+                            if may_have_nulls(child):
+                                present = Expr("case", (Expr("is_null", (child,)), ibex.lit(0), ibex.lit(1)))
+                                count = Expr("rolling_sum", (ibex.col(input_column(present)), size))
+                            else:
+                                count = Expr("rolling_count", (child, size))
+                            count_name = fresh()
+                            partitions.setdefault((partition, ordering), []).append(count.alias(count_name))
+                            result = Expr("case", (ibex.col(count_name) >= minimum, result, Expr("null", ())))
                     elif function._op == "window_shift":
                         child, offset = function._args
                         direction = "lag" if offset >= 0 else "lead"

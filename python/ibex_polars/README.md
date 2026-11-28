@@ -182,7 +182,9 @@ partition and ordering keys share a grouped native update. A single-column
 `order_by` supports descending order and null placement, with ties broken in
 input order. Results return to their original row positions. Numeric columns
 support forward cumulative sums (integer and Float64) and literal-offset shifts.
-Ranks support average, min, max, dense and ordinal ties.
+Ranks support average, min, max, dense and ordinal ties. Fixed-size trailing windows
+support integer sums and means and numeric extrema, including floating-point NaNs.
+They count present values for positive `min_samples` and work globally or per partition.
 UDFs,
 computed grouping/sort keys, aggregate broadcasting in projections/updates other than row counts, expression top-k
 operations, general inequality joins, other filtered aggregates, remote/multiple files, Enum, other numeric widths and nondefault scan

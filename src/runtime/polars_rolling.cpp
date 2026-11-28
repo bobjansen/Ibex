@@ -271,9 +271,13 @@ auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& v
             if (advance_rng)
                 (*rng)();
         }
+        const auto sort_key = [&](std::size_t i) -> std::uint64_t {
+            const auto row = position(i);
+            return !validity || (*validity)[row] ? key(row) : 0;
+        };
         std::vector<std::uint64_t> keys(length);
         for (std::size_t i = 0; i < length; ++i)
-            keys[i] = key(position(i));
+            keys[i] = sort_key(i);
         auto sorted = radix_sort_u64_asc(std::move(keys), length);
         std::vector<std::size_t> ids(length);
         std::size_t distinct = 0;
@@ -281,7 +285,7 @@ auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& v
             [&](const auto& order) {
                 std::uint64_t previous = 0;
                 for (auto row : order) {
-                    const auto current = key(position(row));
+                    const auto current = sort_key(row);
                     if (distinct == 0 || current != previous)
                         ++distinct;
                     ids[row] = distinct;

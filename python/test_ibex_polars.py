@@ -188,6 +188,14 @@ class EngineTests(unittest.TestCase):
                     with self.subTest(dtype=dtype, method=method, expr=expr):
                         self.equal(frame.select(a=expr, b=expr.over("g")))
 
+    def test_rolling_rank_by_requires_right_endpoint(self):
+        frame = pl.LazyFrame({"x": [1, 2], "t": [2, 3]})
+        for closed in ("none", "left"):
+            query = frame.select(pl.col("x").rolling_rank_by("t", "2i", closed=closed))
+            for engine in (self.engine, "streaming"):
+                with self.assertRaisesRegex(pl.exceptions.InvalidOperationError, "closed on the right"):
+                    query.collect(engine=engine)
+
     def test_large_rolling_rank_block_boundaries(self):
         n = 131093
         rows = pl.int_range(0, n, eager=True)

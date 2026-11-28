@@ -226,7 +226,9 @@ class Adapter:
         closed_bits = {"none": 0, "left": 1, "right": 2, "both": 3}[closed]
         if name == "rankby":
             if closed not in ("right", "both"):
-                raise NotImplementedError("rolling_rank_by requires right or both closure")
+                raise pl.exceptions.InvalidOperationError(
+                    "`rolling_rank_by` window needs to be closed on the right side "
+                    "(i.e., `closed` must be `right` or `both`)")
             op, method = self._rolling_rank(dtype, args[0], parameters)
             return Expr(op + "_by", (*args, nanos, minimum, closed_bits, *method))
         op = "polars_rolling_sum_by" if name == "sumby" else "polars_rolling_mean_by"

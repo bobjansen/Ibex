@@ -75,6 +75,14 @@ class EngineTests(unittest.TestCase):
             self.equal(frame.select(shift.over("g"), ordered=shift.over("g", order_by="x")))
             self.equal(frame.head(0).select(shift.over("g")))
 
+    def test_rank_over_with_ties_nulls_and_nans(self):
+        frame = pl.LazyFrame({"g": [1, 2, 1, 1, 2, 1], "x": [2., None, 2., float("nan"), 3., float("nan")]})
+        for method in ("average", "min", "max", "dense", "ordinal"):
+            for descending in (False, True):
+                rank = pl.col("x").rank(method, descending=descending)
+                self.equal(frame.select(rank.over("g"), same_group=pl.len().over("g")))
+                self.equal(frame.head(0).select(rank.over("g")))
+
     def test_vertical_concat_and_shared_branches(self):
         first = pl.LazyFrame({"x": [1, None], "s": ["a", "b"]})
         second = pl.LazyFrame({"x": [2, 3], "s": ["c", None]})

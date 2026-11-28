@@ -158,6 +158,10 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return f"length({render(args[0])})"
         if op in ("abs", "sqrt", "exp", "floor", "ceil", "byte_length"):
             return f"{op}({render(args[0])})"
+        if op == "window_rank":
+            child, method, descending = args
+            ascending = "false" if descending else "true"
+            return f"rank({render(child)}, method = {method}, ascending = {ascending}, na_option = keep)"
         if op in ("lag", "lead"):
             return f"{op}({render(args[0])}, {args[1]})"
         if op == "cumsum":
@@ -813,6 +817,9 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "is_null":
             dtype(args[0])
             return pa.bool_()
+        if op == "window_rank":
+            dtype(args[0])
+            return pa.float64() if args[1] == "average" else pa.int64()
         if op in ("cumsum", "lag", "lead"):
             return dtype(args[0])
         if op == "window":

@@ -246,6 +246,13 @@ class Adapter:
                 if child._op != "col":
                     raise NotImplementedError("cumulative sums require a column")
                 function = Expr("window_cumsum", (child, input_type == pl.Float64))
+            elif type(call).__name__ == "Function" and call.function_data[0] == "rank":
+                _, method, descending, seed = call.function_data
+                child = self.expression(call.input[0])
+                if (child._op != "col" or method not in ("average", "min", "max", "dense", "ordinal")
+                        or seed is not None):
+                    raise NotImplementedError("rank requires a column and a deterministic tie method")
+                function = Expr("window_rank", (child, "first" if method == "ordinal" else method, descending))
             elif type(call).__name__ == "Function" and call.function_data == ("shift",) and len(call.input) == 2:
                 child = self.expression(call.input[0])
                 offset = self.visitor.view_expression(call.input[1])

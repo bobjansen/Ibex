@@ -27,6 +27,10 @@ using Info = BuiltinFunctionInfo;
 // whose shape affects lowering/planning need an entry. `builtins()` validates
 // its executable entries against this table at startup.
 constexpr auto kBuiltinFunctionInfo = std::to_array<std::pair<std::string_view, Info>>({
+    {"__ibex_rolling_rank", {.kind = FnKind::Transform, .order_dependent = true}},
+    {"__ibex_rolling_rank_by", {.kind = FnKind::Transform, .order_dependent = true}},
+    {"__ibex_rolling_avg_rank", {.kind = FnKind::Transform, .order_dependent = true}},
+    {"__ibex_rolling_avg_rank_by", {.kind = FnKind::Transform, .order_dependent = true}},
     {"__ibex_rolling_sum_by", {.kind = FnKind::Transform, .order_dependent = true}},
     {"__ibex_rolling_mean_by", {.kind = FnKind::Transform, .order_dependent = true}},
     {"__ibex_rolling_sum", {.kind = FnKind::Transform, .order_dependent = true}},

@@ -165,6 +165,29 @@ class EngineTests(unittest.TestCase):
                      x.rolling_sum_by("i", "2i"), x.rolling_mean_by("i", "2i")):
             self.equal(frame.select(global_result=expr, grouped_result=expr.over("g")))
 
+    def test_rolling_ranks(self):
+        values = [3, 1, 3, None, 2, 1, 3, None, 4, 2, 4, 1]
+        for dtype in (pl.Int64, pl.Float32, pl.Float64, pl.UInt8, pl.Boolean,
+                      pl.Date, pl.Datetime("ns"), pl.Duration("us")):
+            x = pl.Series(values).cast(dtype)
+            if dtype.is_float():
+                x = pl.Series([0., -0., float("inf"), None, float("nan"), -1.,
+                               float("nan"), None, float("-inf"), 0., 9., -9.], dtype=dtype)
+            frame = pl.LazyFrame({"x": x, "g": [0, 1, 0] * 4,
+                                  "i": [1, 3, None, 1, 3, 5, 1, 2, 6, 5, 6, 1]})
+            for method in ("average", "min", "max", "dense"):
+                value = pl.col("x")
+                expressions = [
+                    value.rolling_rank(4, method, min_samples=minimum, center=center)
+                    for minimum in (0, 2, 4) for center in (False, True)
+                ] + [
+                    value.rolling_rank_by("i", "3i", method, min_samples=2, closed=closed)
+                    for closed in ("right", "both")
+                ]
+                for expr in expressions:
+                    with self.subTest(dtype=dtype, method=method, expr=expr):
+                        self.equal(frame.select(a=expr, b=expr.over("g")))
+
     def test_rolling_float_extrema(self):
         frame = pl.LazyFrame({"x": [1., float("nan"), None, -3., float("inf"), -0., 0.]})
         for op in (pl.col("x").rolling_min, pl.col("x").rolling_max):

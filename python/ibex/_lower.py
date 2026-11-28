@@ -164,10 +164,10 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return f"rank({render(child)}, method = {method}, ascending = {ascending}, na_option = keep)"
         if op in ("lag", "lead", "rolling_mean", "rolling_sum", "rolling_min", "rolling_max", "rolling_count"):
             return f"{op}({render(args[0])}, {args[1]})"
-        if op in ("polars_rolling_sum_by", "polars_rolling_mean_by"):
+        if op in ("polars_rolling_sum_by", "polars_rolling_mean_by", "polars_rolling_rank_by", "polars_rolling_avg_rank_by"):
             params = ", ".join(str(value) for value in args[2:])
             return f"__ibex_{op.removeprefix('polars_')}({render(args[0])}, {render(args[1])}, {params})"
-        if op in ("polars_rolling_sum", "polars_rolling_mean"):
+        if op in ("polars_rolling_sum", "polars_rolling_mean", "polars_rolling_rank", "polars_rolling_avg_rank"):
             params = ", ".join(str(value) for value in args[1:])
             return f"__ibex_{op.removeprefix('polars_')}({render(args[0])}, {params})"
         if op == "cumsum":
@@ -829,6 +829,11 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "window_rank":
             dtype(args[0])
             return pa.float64() if args[1] == "average" else pa.int64()
+        if op in ("polars_rolling_rank", "polars_rolling_avg_rank", "polars_rolling_rank_by", "polars_rolling_avg_rank_by"):
+            dtype(args[0])
+            if op.endswith("_by"):
+                dtype(args[1])
+            return pa.float64() if "avg_rank" in op else pa.int64()
         if op in ("polars_rolling_mean_by", "polars_rolling_sum_by"):
             dtype(args[1])
             value = dtype(args[0])

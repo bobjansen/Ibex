@@ -71,59 +71,11 @@ struct Frame {
     bool closed_left, closed_right;
 };
 
-template <class Total, typename Logical, bool Mean, typename T>
-auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, Frame frame,
-          RollingPartitions partitions) -> ComputedColumn {
-    using Out = std::conditional_t<std::is_integral_v<Logical>, std::int64_t, double>;
-    const auto n = col.size();
-    Column<Out> out;
-    if (frame.size == 0) {
-        out.resize(n);
-        return {.column = std::move(out),
-                .validity = Mean ? std::optional{ValidityBitmap(n, false)} : std::nullopt};
-    }
-    out.resize_for_overwrite(n);
-    auto* dest = out.data();
-    std::optional<ValidityBitmap> valid;
-    const auto values = value_reader(col);
+template <class Out, class Scan>
+void visit_windows(std::size_t n, Frame frame, RollingPartitions partitions, Out* dest,
+                   std::optional<ValidityBitmap>& valid, const Scan& scan) {
     const auto right = frame.centered ? (frame.size + 1) / 2 : 1;
     const auto left = frame.size - right;
-    const auto scan = [&](std::size_t length, auto position, auto mark_null, auto bounds) {
-        Total total;
-        std::size_t lo = 0, hi = 0, present = 0;
-        for (std::size_t i = 0; i < length; ++i) {
-            const auto [start, end] = bounds(i, length);
-            if (start >= hi) {
-                total = {};
-                present = 0;
-                lo = hi = start;
-            }
-            while (lo < start) {
-                if (!validity || (*validity)[position(lo)]) {
-                    total.template change<false>(static_cast<Logical>(values[position(lo)]));
-                    --present;
-                }
-                ++lo;
-            }
-            while (hi < end) {
-                if (!validity || (*validity)[position(hi)]) {
-                    total.template change<true>(static_cast<Logical>(values[position(hi)]));
-                    ++present;
-                }
-                ++hi;
-            }
-            if (present < frame.minimum || (Mean && !present)) {
-                mark_null(position(i));
-                dest[position(i)] = {};
-            } else {
-                const auto sum = static_cast<Logical>(total.value());
-                if constexpr (Mean)
-                    dest[position(i)] = sum / static_cast<Logical>(present);
-                else
-                    dest[position(i)] = sum;
-            }
-        }
-    };
     const auto scan_partition = [&](std::size_t length, auto position, auto mark_null) {
         if (!frame.index) {
             scan(length, position, mark_null, [&](std::size_t i, std::size_t len) {
@@ -214,6 +166,142 @@ auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, F
             }
         }
     }
+}
+
+template <class Total, typename Logical, bool Mean, typename T>
+auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, Frame frame,
+          RollingPartitions partitions) -> ComputedColumn {
+    using Out = std::conditional_t<std::is_integral_v<Logical>, std::int64_t, double>;
+    const auto n = col.size();
+    Column<Out> out;
+    if (frame.size == 0) {
+        out.resize(n);
+        return {.column = std::move(out),
+                .validity = Mean ? std::optional{ValidityBitmap(n, false)} : std::nullopt};
+    }
+    out.resize_for_overwrite(n);
+    auto* dest = out.data();
+    std::optional<ValidityBitmap> valid;
+    const auto values = value_reader(col);
+    const auto scan = [&](std::size_t length, auto position, auto mark_null, auto bounds) {
+        Total total;
+        std::size_t lo = 0, hi = 0, present = 0;
+        for (std::size_t i = 0; i < length; ++i) {
+            const auto [start, end] = bounds(i, length);
+            if (start >= hi) {
+                total = {};
+                present = 0;
+                lo = hi = start;
+            }
+            while (lo < start) {
+                if (!validity || (*validity)[position(lo)]) {
+                    total.template change<false>(static_cast<Logical>(values[position(lo)]));
+                    --present;
+                }
+                ++lo;
+            }
+            while (hi < end) {
+                if (!validity || (*validity)[position(hi)]) {
+                    total.template change<true>(static_cast<Logical>(values[position(hi)]));
+                    ++present;
+                }
+                ++hi;
+            }
+            if (present < frame.minimum || (Mean && !present)) {
+                mark_null(position(i));
+                dest[position(i)] = {};
+            } else {
+                const auto sum = static_cast<Logical>(total.value());
+                if constexpr (Mean)
+                    dest[position(i)] = sum / static_cast<Logical>(present);
+                else
+                    dest[position(i)] = sum;
+            }
+        }
+    };
+    visit_windows(n, frame, partitions, dest, valid, scan);
+    return {.column = std::move(out), .validity = std::move(valid)};
+}
+
+// Compress the partition once. A Fenwick tree counts the observations below
+// each key in the current frame. Dense rank stores one count per distinct key.
+template <typename Out, typename Key>
+auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& validity,
+                  Frame frame, RollingPartitions partitions, std::int64_t method)
+    -> ComputedColumn {
+    Column<Out> out;
+    out.resize_for_overwrite(n);
+    auto* dest = out.data();
+    std::optional<ValidityBitmap> valid;
+    if (!frame.size)
+        return {.column = std::move(out), .validity = ValidityBitmap(n, false)};
+    const auto scan = [&](std::size_t length, auto position, auto mark_null, auto bounds) {
+        std::vector<std::uint64_t> keys(length);
+        for (std::size_t i = 0; i < length; ++i)
+            keys[i] = key(position(i));
+        auto sorted = radix_sort_u64_asc(std::move(keys), length);
+        std::vector<std::size_t> ids(length);
+        std::size_t distinct = 0;
+        std::visit(
+            [&](const auto& order) {
+                std::uint64_t previous = 0;
+                for (auto row : order) {
+                    const auto current = key(position(row));
+                    if (distinct == 0 || current != previous)
+                        ++distinct;
+                    ids[row] = distinct;
+                    previous = current;
+                }
+            },
+            sorted);
+        std::vector<std::size_t> counts(distinct + 1), tree(distinct + 1);
+        const bool dense = method == 3;
+        std::size_t present = 0, lo = 0, hi = 0;
+        const auto change = [&](std::size_t row, bool add) {
+            if (validity && !(*validity)[position(row)])
+                return;
+            const auto id = ids[row];
+            if (add) {
+                ++present;
+                if (++counts[id] != 1 && dense)
+                    return;
+            } else {
+                --present;
+                if (--counts[id] != 0 && dense)
+                    return;
+            }
+            for (auto j = id; j <= distinct; j += j & -j) {
+                if (add)
+                    ++tree[j];
+                else
+                    --tree[j];
+            }
+        };
+        for (std::size_t i = 0; i < length; ++i) {
+            const auto [start, end] = bounds(i, length);
+            while (lo < std::min(start, hi))
+                change(lo++, false);
+            hi = std::max(hi, start);
+            lo = start;
+            while (hi < end)
+                change(hi++, true);
+            const auto row = position(i);
+            if (present < frame.minimum || (validity && !(*validity)[row])) {
+                dest[row] = {};
+                mark_null(row);
+                continue;
+            }
+            const auto id = ids[i];
+            std::size_t rank = 1;
+            for (auto j = id - 1; j; j &= j - 1)
+                rank += tree[j];
+            if constexpr (std::is_same_v<Out, double>)
+                dest[row] = static_cast<double>(rank) + 0.5 * static_cast<double>(counts[id] - 1);
+            else
+                dest[row] = static_cast<Out>(method == 2 ? rank + counts[id] - 1 : rank);
+        }
+    };
+    visit_windows(n, frame, partitions, dest, valid, scan);
     return {.column = std::move(out), .validity = std::move(valid)};
 }
 
@@ -235,10 +323,13 @@ auto polars_rolling_column(const ir::CallExpr& call, const Table& input,
     const auto* size = literal(base);
     const auto* min = literal(base + 1);
     const auto* mode = literal(base + 2);
-    const auto* single = literal(base + 3);
-    if (!entry || !size || !min || !mode || !single || *size < 0 || *min < 0 ||
+    const bool average_rank = call.callee.starts_with("__ibex_rolling_avg_rank");
+    const bool rank = average_rank || call.callee.starts_with("__ibex_rolling_rank");
+    const auto* option = literal(base + 3);
+    if (!entry || !size || !min || !mode || !option || *size < 0 || *min < 0 ||
         (!indexed && *min > *size) || (indexed && *size == 0) || *mode < 0 ||
-        *mode > (indexed ? 3 : 1) || (*single != 0 && *single != 1))
+        *mode > (indexed ? 3 : 1) || (*option < 0 || *option > (rank ? 3 : 1)) ||
+        (rank && (average_rank != (*option == 0) || (indexed && (*mode & 2) == 0))))
         return std::unexpected("invalid rolling column or frame parameters");
     Frame frame{.size = static_cast<std::size_t>(*size),
                 .minimum = static_cast<std::size_t>(*min),
@@ -265,9 +356,30 @@ auto polars_rolling_column(const ir::CallExpr& call, const Table& input,
         if (key->validity)
             frame.index_validity = &*key->validity;
     }
+    if (rank) {
+        const auto evaluate = [&](auto key) {
+            if (average_rank)
+                return rolling_rank<double>(input.rows(), key, entry->validity, frame, partitions,
+                                            *option);
+            return rolling_rank<std::int64_t>(input.rows(), key, entry->validity, frame, partitions,
+                                              *option);
+        };
+        if (const auto* col = std::get_if<Column<double>>(&*entry->column))
+            return evaluate(
+                [v = value_reader(*col)](std::size_t i) { return double_to_sortable_u64(v[i]); });
+        if (const auto* col = std::get_if<Column<std::int64_t>>(&*entry->column))
+            return evaluate([v = value_reader(*col)](std::size_t i) {
+                return static_cast<std::uint64_t>(v[i]) ^ (std::uint64_t{1} << 63);
+            });
+        if (const auto* col = std::get_if<Column<Date>>(&*entry->column))
+            return evaluate([v = value_reader(*col)](std::size_t i) {
+                return static_cast<std::uint32_t>(v[i].days) ^ (std::uint32_t{1} << 31);
+            });
+        return std::unexpected("unsupported rolling rank input type");
+    }
     const bool mean = call.callee.starts_with("__ibex_rolling_mean");
     if (const auto* col = std::get_if<Column<double>>(&*entry->column)) {
-        if (*single != 0) {
+        if (*option != 0) {
             if (mean)
                 return roll<FloatingTotal<double>, float, true>(*col, entry->validity, frame,
                                                                 partitions);

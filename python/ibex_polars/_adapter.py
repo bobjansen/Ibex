@@ -183,14 +183,26 @@ class Adapter:
             return Expr("cast", (child, pa.int64()))
         return child
 
+    def _rolling_rank(self, dtype, child, parameters):
+        method, _seed = parameters
+        methods = ("average", "min", "max", "dense")
+        if method not in methods:
+            raise NotImplementedError(f"unsupported rolling rank method {method}")
+        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.Date) and not is_temporal(dtype):
+            raise NotImplementedError(f"unsupported rolling rank input {dtype}")
+        if child._aggregate or not child._row_reference:
+            raise NotImplementedError("rolling rank requires a row expression")
+        op = "polars_rolling_avg_rank" if method == "average" else "polars_rolling_rank"
+        return op, methods.index(method)
+
     def _rolling_by_function(self, value):
         operation, duration, minimum, closed, parameters = value.function_data
         months, weeks, days, nanos, integer, negative = duration
         name = str(operation).removeprefix("RollingFunctionBy.").lower()
-        if name not in ("sumby", "meanby") or parameters or negative or months:
+        if name not in ("sumby", "meanby", "rankby") or (parameters and name != "rankby") or negative or months:
             raise NotImplementedError("unsupported indexed rolling operation or calendar interval")
         dtype, index_type = (self.visitor.get_dtype(child) for child in value.input)
-        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean):
+        if name != "rankby" and dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean):
             raise NotImplementedError(f"unsupported rolling value type {dtype}")
         if index_type.base_type() == pl.Datetime and not integer:
             if (days or weeks) and index_type.time_zone not in (None, "UTC"):
@@ -211,6 +223,11 @@ class Adapter:
         if any(child._aggregate or not child._row_reference for child in args):
             raise NotImplementedError("indexed rolling requires row expressions")
         closed_bits = {"none": 0, "left": 1, "right": 2, "both": 3}[closed]
+        if name == "rankby":
+            if closed not in ("right", "both"):
+                raise NotImplementedError("rolling_rank_by requires right or both closure")
+            op, method = self._rolling_rank(dtype, args[0], parameters)
+            return Expr(op + "_by", (*args, nanos, minimum, closed_bits, method))
         op = "polars_rolling_sum_by" if name == "sumby" else "polars_rolling_mean_by"
         return Expr(op, (*args, nanos, minimum, closed_bits, int(dtype == pl.Float32)))
 
@@ -221,9 +238,13 @@ class Adapter:
             raise NotImplementedError("unsupported rolling options")
         operation, size, minimum, weights, center, parameters = value.function_data
         name = str(operation).removeprefix("RollingFunction.").lower()
-        if weights is not None or parameters or not 0 <= minimum <= size or size > 2**63 - 1:
+        if weights is not None or (parameters and name != "rank") or not 0 <= minimum <= size or size > 2**63 - 1:
             raise NotImplementedError("unsupported rolling options")
         dtype = self.visitor.get_dtype(value.input[0])
+        if name == "rank":
+            child = self._rolling_operand(value.input[0], dtype)
+            op, method = self._rolling_rank(dtype, child, parameters)
+            return Expr(op, (child, size, minimum, int(center), method))
         if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64) and not (
                 dtype == pl.Boolean and name in ("sum", "mean")):
             raise NotImplementedError(f"unsupported rolling {name} input {dtype}")
@@ -697,10 +718,10 @@ class Adapter:
                             child = ibex.col(input_column(clean))
                             result = Expr("case", (missing, Expr("null", ()), result))
                         function = Expr("cumsum", (child,))
-                    elif function._op in ("polars_rolling_sum", "polars_rolling_mean"):
+                    elif function._op in ("polars_rolling_sum", "polars_rolling_mean", "polars_rolling_rank", "polars_rolling_avg_rank"):
                         child, *params = function._args
                         function = Expr(function._op, (ibex.col(input_column(child)), *params))
-                    elif function._op in ("polars_rolling_sum_by", "polars_rolling_mean_by"):
+                    elif function._op in ("polars_rolling_sum_by", "polars_rolling_mean_by", "polars_rolling_rank_by", "polars_rolling_avg_rank_by"):
                         child, index, *params = function._args
                         function = Expr(function._op, (ibex.col(input_column(child)), ibex.col(input_column(index)), *params))
                     elif function._op == "window_rolling":

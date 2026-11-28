@@ -230,6 +230,8 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
         }
         // Functions that always return Float64.
         if (call->callee == "sqrt" || call->callee == "log" || call->callee == "exp" ||
+            call->callee == "__ibex_rolling_avg_rank" ||
+            call->callee == "__ibex_rolling_avg_rank_by" ||
             call->callee == "__ibex_rolling_mean_by" || call->callee == "__ibex_rolling_mean" ||
             call->callee == "rolling_mean" || call->callee == "rolling_median" ||
             call->callee == "rolling_std" || call->callee == "rolling_ewma" ||
@@ -237,7 +239,8 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
             call->callee == "rolling_kurtosis") {
             return ColumnType::Float64;
         }
-        if (call->callee == "rolling_count") {
+        if (call->callee == "__ibex_rolling_rank" || call->callee == "__ibex_rolling_rank_by" ||
+            call->callee == "rolling_count") {
             return ColumnType::Int64;
         }
         if (call->callee == "length" || call->callee == "byte_length") {

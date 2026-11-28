@@ -1879,6 +1879,10 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             .min_args = 5,
             .max_args = 5,
             .infer = [](std::string_view name, const std::vector<ExprType>& args) -> IT {
+                if (name.starts_with("__ibex_rolling_rank"))
+                    return ExprType::Int;
+                if (name.starts_with("__ibex_rolling_avg_rank"))
+                    return ExprType::Double;
                 return name.starts_with("__ibex_rolling_mean") ? ExprType::Double : args.front();
             },
             .exec = TransformExec{.column_eval =
@@ -1887,10 +1891,14 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                           return polars_rolling_column(call, input);
                                       }},
         };
+        m.emplace("__ibex_rolling_rank", polars_rolling);
+        m.emplace("__ibex_rolling_avg_rank", polars_rolling);
         m.emplace("__ibex_rolling_sum", polars_rolling);
         m.emplace("__ibex_rolling_mean", polars_rolling);
         auto indexed_rolling = polars_rolling;
         indexed_rolling.min_args = indexed_rolling.max_args = 6;
+        m.emplace("__ibex_rolling_rank_by", indexed_rolling);
+        m.emplace("__ibex_rolling_avg_rank_by", indexed_rolling);
         m.emplace("__ibex_rolling_sum_by", indexed_rolling);
         m.emplace("__ibex_rolling_mean_by", indexed_rolling);
 

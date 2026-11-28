@@ -5,7 +5,9 @@
 
 namespace ibex::runtime {
 inline auto is_polars_rolling(std::string_view name) -> bool {
-    return name == "__ibex_rolling_sum" || name == "__ibex_rolling_mean" ||
+    return name == "__ibex_rolling_rank" || name == "__ibex_rolling_rank_by" ||
+           name == "__ibex_rolling_avg_rank" || name == "__ibex_rolling_avg_rank_by" ||
+           name == "__ibex_rolling_sum" || name == "__ibex_rolling_mean" ||
            name == "__ibex_rolling_sum_by" || name == "__ibex_rolling_mean_by";
 }
 

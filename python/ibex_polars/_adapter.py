@@ -201,7 +201,7 @@ class Adapter:
             expr = ibex.lit(value.value)
         elif kind == "BinaryExpr":
             operators = {"Plus": "+", "Minus": "-", "Multiply": "*", "TrueDivide": "/", "Divide": "/",
-                         "Eq": "==", "NotEq": "!=", "Lt": "<", "LtEq": "<=", "Gt": ">", "GtEq": ">=",
+                         "EqValidity": "==", "NotEqValidity": "!=", "Eq": "==", "NotEq": "!=", "Lt": "<", "LtEq": "<=", "Gt": ">", "GtEq": ">=",
                          "And": "&&", "LogicalAnd": "&&", "Or": "||", "LogicalOr": "||"}
             name = str(value.op).split(".")[-1]
             if name not in operators:
@@ -217,7 +217,14 @@ class Adapter:
                     raise NotImplementedError("comparison between naive and zoned timestamps is unsupported")
             if operator in ("==", "!=", "<", "<=", ">", ">="):
                 operator = "polars_" + operator
-            expr = Expr(operator, (self.expression(value.left), self.expression(value.right)))
+            left, right = self.expression(value.left), self.expression(value.right)
+            expr = Expr(operator, (left, right))
+            if name in ("EqValidity", "NotEqValidity"):
+                left_null = Expr("is_null", (left,))
+                right_null = Expr("is_null", (right,))
+                both_missing = right_null if name == "EqValidity" else ~right_null
+                expr = Expr("case", (left_null, both_missing,
+                                     Expr("case", (right_null, ibex.lit(name == "NotEqValidity"), expr))))
         elif kind == "Ternary":
             expr = Expr("case", (self.expression(value.predicate), self.expression(value.truthy),
                                  self.expression(value.falsy)))

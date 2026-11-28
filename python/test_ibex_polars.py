@@ -38,6 +38,13 @@ class EngineTests(unittest.TestCase):
         assert_frame_equal(actual, expected, rel_tol=1e-12, abs_tol=1e-9)
         return actual
 
+    def test_null_aware_equality(self):
+        frame = pl.DataFrame({"a": [None, None, 1., 1., float("nan"), -0.],
+                              "b": [None, 1., None, 2., float("nan"), 0.]}).lazy()
+        a, b = pl.col("a"), pl.col("b")
+        self.equal(frame.select(equal=a.eq_missing(b), different=a.ne_missing(b)))
+        self.equal(frame.filter(a.eq_missing(b)))
+
     def test_sum_that_is_null_when_a_group_has_no_values(self):
         # Polars documents `when(x.count() > 0).then(x.sum())` for a sum that
         # is null rather than zero on an empty group, and folds it into one

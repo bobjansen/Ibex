@@ -38,6 +38,18 @@ class EngineTests(unittest.TestCase):
         assert_frame_equal(actual, expected, rel_tol=1e-12, abs_tol=1e-9)
         return actual
 
+    def test_partitioned_window_reductions(self):
+        data = pl.DataFrame({"g": ["a", None, "a", None, "b"], "h": [1, 2, 1, 1, 2],
+                             "x": [2., 5., None, 3., None], "_ibex_window_0": range(5)})
+        x = pl.col("x")
+        for frame in (data.lazy(), data.clear().lazy()):
+            self.equal(frame.select("g", total=x.sum().over("g"), centered=x - x.mean().over("g"),
+                                    n=pl.len().over(["g", "h"]), present=x.count().over("h")))
+            self.equal(frame.with_columns(g=x.first().over("g"), x=x.last().over("g")))
+            self.equal(frame.filter(x == x.max().over("g")))
+        source = self.engine.explain(data.lazy().select(a=x.min().over("g"), b=x.max().over("g")))
+        self.assertEqual(source.count("by { `g` }"), 1)
+
     def test_vertical_concat_and_shared_branches(self):
         first = pl.LazyFrame({"x": [1, None], "s": ["a", "b"]})
         second = pl.LazyFrame({"x": [2, 3], "s": ["c", None]})

@@ -173,6 +173,7 @@ class Adapter:
         self.root = None
         self.nodes = {}
         self.expressions = {}
+        self.has_windows = False
         self.frame_length_columns = {}
         self.sort_pruning_predicates = set()
 
@@ -224,6 +225,19 @@ class Adapter:
                 both_missing = right_null if name == "EqValidity" else ~right_null
                 expr = Expr("case", (left_null, both_missing,
                                      Expr("case", (right_null, ibex.lit(name == "NotEqValidity"), expr))))
+        elif kind == "Window":
+            if getattr(value.options, "kind", None) not in ("groups_to_rows", "join") or value.order_by is not None:
+                raise NotImplementedError("window ordering and alternative mappings are unsupported")
+            keys = [self.expression(key) for key in value.partition_by]
+            if not keys or any(key._op != "col" for key in keys):
+                raise NotImplementedError("window partitions require column keys")
+            function = self.expression(value.function)
+            if value.options.kind == "join" and (not function._aggregate or function._row_reference):
+                raise NotImplementedError("list-valued window joins are unsupported")
+            if not function._aggregate and not function._row_reference:
+                raise NotImplementedError("scalar literal windows require a frame-sized broadcast")
+            self.has_windows = True
+            expr = Expr("window", (function, tuple(key._name for key in keys)))
         elif kind == "Ternary":
             expr = Expr("case", (self.expression(value.predicate), self.expression(value.truthy),
                                  self.expression(value.falsy)))
@@ -531,6 +545,31 @@ class Adapter:
             raise NotImplementedError("join cardinality validation is not supported by this visitor adapter")
         self.checked_join_validation = True
 
+    def _window_fields(self, frame, fields, output_names):
+        if not self.has_windows:
+            return frame, fields
+        occupied = set(self.visitor.get_schema()) | set(output_names)
+        partitions = {}
+        columns = {}
+
+        def rewrite(expr):
+            if expr._op == "window":
+                if id(expr) not in columns:
+                    function, keys = expr._args
+                    name = f"_ibex_window_{len(columns)}"
+                    while name in occupied:
+                        name += "_"
+                    occupied.add(name)
+                    columns[id(expr)] = ibex.col(name)
+                    partitions.setdefault(keys, []).append(function.alias(name))
+                return columns[id(expr)]
+            return Expr(expr._op, tuple(rewrite(arg) if isinstance(arg, Expr) else arg for arg in expr._args))
+
+        fields = [rewrite(expr) for expr in fields]
+        for keys, values in partitions.items():
+            frame = frame._append("window", (keys, tuple(values)))
+        return frame, fields
+
     def _aggregate_projection(self, frame, fields, *, keys=None, maintain_order=False):
         def needs_projection(expr):
             if expr._op in ("polars_round", "square", "abs", "sqrt", "exp", "floor", "ceil",
@@ -623,6 +662,7 @@ class Adapter:
                 frame = self.frame(marker.input)
                 self.visitor.set_node(marker.input)
                 expressions = tuple(self.named(expr) for expr in marker.exprs if expr.node not in hidden)
+                frame, expressions = self._window_fields(frame, expressions, schema)
                 frame = self._hstack(frame, expressions, [name for name in marker_schema if name != height], node.input)
             else:
                 frame = self.frame(node.input)
@@ -1093,6 +1133,12 @@ class Adapter:
             self.visitor.set_node(node.input)
             if kind == "Filter":
                 predicate = self.expression(node.predicate.node)
+                if self.has_windows:
+                    expanded, (predicate,) = self._window_fields(frame, [predicate], schema)
+                    if expanded is not frame:
+                        frame = expanded.filter(predicate).select(list(schema))
+                        self.nodes[node_id] = frame
+                        return frame
                 pushed = self._filter_below_prefix_slice(node.input, predicate)
                 frame = pushed if pushed is not None else frame.filter(predicate)
             elif kind == "SimpleProjection":
@@ -1108,9 +1154,11 @@ class Adapter:
                     frame = frame.select(child.alias(node.expr[0].output_name)).unique(
                         maintain_order=value.function_data[1])
                 else:
-                    frame = self._aggregate_projection(frame, [self.named(expr) for expr in node.expr])
+                    frame, fields = self._window_fields(frame, [self.named(expr) for expr in node.expr], schema)
+                    frame = self._aggregate_projection(frame, fields)
             elif kind == "HStack":
                 expressions = tuple(self.named(expr) for expr in node.exprs)
+                frame, expressions = self._window_fields(frame, expressions, schema)
                 frame = self._hstack(frame, expressions, list(schema), node_id)
             elif kind == "GroupBy":
                 if node.apply or any(getattr(node.options, name) is not None for name in ("dynamic", "rolling")):

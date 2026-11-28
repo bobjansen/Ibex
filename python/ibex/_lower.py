@@ -397,6 +397,11 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             if not fields:
                 fields.append("_ibex_join_height = 0")
             source += f"[select {{ {', '.join(fields)} }}]"
+        elif operation == "window":
+            keys, fields = expressions
+            assignments = ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in fields)
+            partition = ", ".join(_identifier(key) for key in keys)
+            source += f"[update {{ {assignments} }}, by {{ {partition} }}]"
         elif operation == "aggregate":
             keys, aggregates = expressions
             # Keep the complete aggregate in one native operator. The lowerer
@@ -792,6 +797,8 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "is_null":
             dtype(args[0])
             return pa.bool_()
+        if op == "window":
+            raise NotImplementedError("nested windows and windows in this context are unsupported")
         if op == "wrap_integer":
             if dtype(args[0]) != pa.int64():
                 raise TypeError("integer wrapping requires an integral native expression")
@@ -840,7 +847,7 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
             step_types.append(type_map)
             schemas.append(dict(columns))
             continue
-        if operation == "aggregate":
+        if operation in ("aggregate", "window"):
             keys, expressions = expressions
             key_types = [dtype(Expr("col", (name,))) for name in keys]
         elif operation == "union":

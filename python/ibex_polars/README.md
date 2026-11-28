@@ -176,7 +176,9 @@ Supported resident
 types are Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, Float32, Float64, Boolean,
 String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric
-coercion to Float64 and null predicates are supported. Windows, UDFs,
+coercion to Float64 and null predicates are supported. Scalar window reductions with column partition keys use a grouped native update.
+Expressions sharing partition keys run in one update and preserve input row order.
+UDFs,
 computed grouping/sort keys, aggregate broadcasting in projections/updates other than row counts, expression top-k
 operations, general inequality joins, other filtered aggregates, remote/multiple files, Enum, other numeric widths and nondefault scan
 policies are outside this slice. An already-sliced resident source is valid.

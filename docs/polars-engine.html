@@ -236,6 +236,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
       <article class="card">
         <h3>Supported</h3>
         <ul>
+          <li>Partitioned scalar reductions such as <code>mean().over("group")</code> in projections, updates, and filters.</li>
           <li>Vertical concatenation via <code>pl.concat</code> and <code>pl.union</code> lowers to native <code>rbind</code>.</li>
           <li>Resident <code>DataFrame</code>s and single local Parquet files.</li>
           <li><code>filter</code>, <code>select</code>, <code>with_columns</code>, arithmetic, comparisons, Boolean logic, <code>is_between</code>, <code>is_in</code>, <code>when/then/otherwise</code>, null checks and casts. Null-aware comparisons support <code>eq_missing</code> and <code>ne_missing</code>.</li>
@@ -251,7 +252,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
         <h3>Not yet</h3>
         <ul>
           <li>Quantiles, <code>var</code>, <code>std</code> with another ddof, Spearman <code>corr</code>, and powers other than a float squared; list-valued results (<code>agg(pl.col(x).head(n))</code> without <code>explode</code>), and <code>explode</code> other than of a per-group head or top_k.</li>
-          <li>Window expressions (<code>over</code>), computed group or sort keys, Python UDFs.</li>
+          <li>Time-based rolling windows, dynamic groups, computed group or sort keys, Python UDFs.</li>
           <li>As-of and general non-equi joins, nondefault join validation.</li>
           <li>General regular expressions; multiple or remote files; struct and list columns.</li>
           <li>Background and async execution, lazy sinks (<code>lazy=True</code>), and sinks other than <code>sink_parquet</code>.</li>

@@ -128,6 +128,18 @@ class EngineTests(unittest.TestCase):
                              m=x.rolling_mean(6, min_samples=6, center=True).over("g"))
         assert_frame_equal(query.collect(engine=self.engine), query.collect(engine="streaming"), check_exact=True)
 
+    @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
+    def test_computed_rolling_values_across_parquet_row_groups(self):
+        data = pl.DataFrame({"x": [1., 3., None, 7., 4., 2.] * 1000, "g": [1, 2] * 3000})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rolling.parquet"
+            data.write_parquet(path, row_group_size=149)
+            value = pl.col("x") * 2 + 3
+            query = pl.scan_parquet(path).select(
+                total=value.rolling_sum(303, min_samples=128),
+                mean=value.rolling_mean(305, min_samples=24, center=True).over("g"))
+            self.equal(query)
+
     def test_rolling_float_extrema(self):
         frame = pl.LazyFrame({"x": [1., float("nan"), None, -3., float("inf"), -0., 0.]})
         for op in (pl.col("x").rolling_min, pl.col("x").rolling_max):

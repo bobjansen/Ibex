@@ -188,10 +188,12 @@ class Adapter:
         if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64):
             raise NotImplementedError(f"unsupported rolling {name} input {dtype}")
         child = self.expression(value.input[0])
-        if child._op != "col":
-            raise NotImplementedError("rolling windows require a column")
         if name in ("sum", "mean"):
+            if child._aggregate or not child._row_reference:
+                raise NotImplementedError("rolling sums and means require a row expression")
             return Expr("polars_rolling_" + name, (child, size, minimum, int(center), int(dtype == pl.Float32)))
+        if child._op != "col":
+            raise NotImplementedError("rolling extrema require a column")
         if name not in ("min", "max") or center or not minimum:
             raise NotImplementedError("unsupported rolling operation or frame")
         return Expr("window_rolling", (child, "rolling_" + name, size, minimum))
@@ -655,6 +657,9 @@ class Adapter:
                             child = ibex.col(input_column(clean))
                             result = Expr("case", (missing, Expr("null", ()), result))
                         function = Expr("cumsum", (child,))
+                    elif function._op in ("polars_rolling_sum", "polars_rolling_mean"):
+                        child, *params = function._args
+                        function = Expr(function._op, (ibex.col(input_column(child)), *params))
                     elif function._op == "window_rolling":
                         child, op, size, minimum = function._args
                         function = Expr(op, (child, size))

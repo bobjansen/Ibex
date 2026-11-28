@@ -189,9 +189,20 @@ non-null observations count toward the minimum. Input NaNs and infinities age
 out as the frame advances. Numeric extrema support trailing frames and positive
 `min_samples`. All four operations work globally or per partition.
 
+`rolling_rank` ranks the current row in its trailing or centered frame.
+`rolling_rank_by` ranks it against every observation in the index interval,
+including peers with the same index. Supported index types and durations
+match indexed rolling sums. The interval must be closed on the right
+(`closed="right"` or `"both"`). Both functions support the engine's numeric,
+Boolean, Date, Datetime and Duration columns, and work per partition with
+`.over(...)`. A null value or index produces a null rank for that row.
+Average ties produce Float64. Min, max, dense and random ties produce the
+Polars index dtype. Pass `seed` for reproducible random ties.
+
 To compare rolling performance on a resident frame of one million rows, run
 the following commands from the repository root. Each query checks the Ibex
-result against Polars streaming, then reports median collection time in milliseconds.
+result against Polars streaming, then reports median collection time in milliseconds. Add `--rank` to measure
+128-row average ranks, 4,096-row dense ranks, and 60-second average ranks.
 
 ```sh
 PYTHONPATH=build-release/python:python IBEX_CORES=1 POLARS_MAX_THREADS=1 .venv/bin/python python/bench_polars_rolling.py

@@ -188,3 +188,9 @@ The harness bookkeeping tests run with:
 ```bash
 PYTHONPATH=build-release/python:python .venv/bin/python python/test_polars_conformance.py
 ```
+
+
+For the two upstream unseeded rolling-rank cases, the recorder compares the
+input and the min/max tie ranks exactly. It checks each random rank against
+those bounds and compares schemas and null positions. Seeded draws have exact
+parity checks in `python/test_ibex_polars.py`.

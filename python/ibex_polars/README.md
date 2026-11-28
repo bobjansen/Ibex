@@ -173,7 +173,7 @@ such as `pl.col("revenue") == pl.col("revenue").max()`. All reductions in a
 filter read its current input, before any predicate is applied; a later filter
 reduces its own input. The complete query still executes in one native call.
 Supported resident
-types are Int8, Int16, Int32, Int64, UInt8, UInt16, Float32, Float64, Boolean,
+types are Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, Float32, Float64, Boolean,
 String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric
 coercion to Float64 and null predicates are supported. Windows, UDFs,
@@ -198,13 +198,11 @@ Polars planner declares a narrow integer result, using its signed or unsigned
 range. Wrapping happens before later comparisons, casts, divisions and
 reductions, and results recover the declared Polars dtype at export. Sums of
 Int8, Int16, UInt8 and UInt16 promote to Int64 and do not wrap at the input
-width; Int32 sums retain Int32 wrapping. Other mixed expressions also follow
+width. Int32 and UInt32 sums wrap at 32 bits. Other mixed expressions also follow
 the planner's result dtype. Safe widening casts and explicit integral casts
 with `wrap_numerical=True` are supported. Checked or null-producing casts that
-could overflow their destination range remain unsupported. UInt32 and UInt64
-inputs remain unsupported, for both resident tables and Parquet scans.
-UInt32 scalar literals are accepted for comparisons with count results; their
-values fit Int64 without introducing a native UInt32 input variant.
+could overflow their destination range remain unsupported. UInt32 values widen to Int64 for resident tables and Parquet scans.
+UInt64 inputs remain unsupported.
 
 Float32 inputs similarly widen once to Float64 for execution, including
 Parquet input. All arithmetic and reductions use Float64 intermediates; only

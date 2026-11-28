@@ -28,11 +28,10 @@ from ._temporal import NANOS_PER_UNIT, TEMPORAL_TYPES, is_temporal, literal_tick
 VISITOR_VERSION = (16, 0)
 POLARS_VERSION = "2.1.0"
 
-# These logical integer types all fit native Int64 storage. UInt32/UInt64
-# intentionally remain outside this subset.
+# These logical integer types all fit native Int64 storage. UInt64 needs a wider representation.
 _INTEGER_LAYOUTS = {
     pl.Int8: (8, True), pl.Int16: (16, True), pl.Int32: (32, True),
-    pl.Int64: (64, True), pl.UInt8: (8, False), pl.UInt16: (16, False),
+    pl.Int64: (64, True), pl.UInt8: (8, False), pl.UInt16: (16, False), pl.UInt32: (32, False),
 }
 _JOIN_NODE = re.compile(r'\{"Join"\s*:\s*\{')
 _JOIN_VALIDATION = re.compile(r'"validation"\s*:\s*"(ManyToMany|ManyToOne|OneToMany|OneToOne)"')
@@ -196,7 +195,7 @@ class Adapter:
                 expr = ibex.lit(literal_ticks(value.value, value.dtype))
                 self.expressions[key] = expr
                 return expr
-            if value.dtype not in (*_INTEGER_LAYOUTS, pl.UInt32, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date):
+            if value.dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date):
                 raise NotImplementedError(f"unsupported literal type {value.dtype}")
             expr = ibex.lit(value.value)
         elif kind == "BinaryExpr":
@@ -271,6 +270,9 @@ class Adapter:
             elif value.options not in (None, False):
                 raise NotImplementedError(f"unsupported {value.name} aggregate options")
             expr = Expr(operation, (self.expression(value.arguments[0]),))
+            if input_type == pl.Boolean and operation in ("sum", "nullable_sum"):
+                self.expressions[key] = expr
+                return expr
         elif kind == "Len":
             expr = ibex.len()
         elif kind == "Cast":
@@ -494,6 +496,7 @@ class Adapter:
         # Keep narrow integers as logical types only. Each expression boundary
         # must wrap before a later comparison, division, cast or reduction.
         if kind in ("BinaryExpr", "Agg", "Function") and expr._op not in (
+            "count", "column_len", "n_unique", "filtered_n_unique",
             "polars_==", "polars_!=", "polars_<", "polars_<=", "polars_>", "polars_>=", "&&", "||", "!", "is_null"
         ) and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
             expr = _wrap_integer(expr, self.visitor.get_dtype(node))
@@ -697,7 +700,7 @@ class Adapter:
     def _literal_count(self, node):
         value = self.visitor.view_expression(node)
         if (type(value).__name__ != "Literal" or type(value.value) is not int
-                or value.dtype not in (*_INTEGER_LAYOUTS, pl.UInt32) or value.value < 0):
+                or value.dtype not in _INTEGER_LAYOUTS or value.value < 0):
             raise NotImplementedError("per-group row counts must be non-negative integer literals")
         return value.value
 

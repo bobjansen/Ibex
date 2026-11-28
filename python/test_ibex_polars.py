@@ -912,15 +912,23 @@ class EngineTests(unittest.TestCase):
                 self.equal(frame)
                 self.equal(frame.select(value=pl.col("x") - 1))
                 self.equal(frame.select(total=pl.col("x").sum()))
-            for dtype in (pl.UInt32, pl.UInt64):
-                data = pl.DataFrame({"x": pl.Series([0, 1, None], dtype=dtype)})
-                path = Path(directory) / f"{dtype}.parquet"
-                data.write_parquet(path)
-                for query in (data.lazy(), pl.scan_parquet(path)):
-                    with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
-                        with self.assertRaises(NotImplementedError):
-                            query.collect(engine=self.engine)
-                        execute.assert_not_called()
+            data = pl.DataFrame({"u": pl.Series([0, 2**31, 2**32 - 1, None], dtype=pl.UInt32)})
+            path = Path(directory) / "u32.parquet"
+            data.write_parquet(path)
+            u = pl.col("u")
+            for frame in (data.lazy(), pl.scan_parquet(path)):
+                self.equal(frame)
+                self.equal(frame.select(u + 1, product=u * u, difference=u - 1))
+                self.equal(frame.select(total=u.sum(), count=u.count()))
+            dtype = pl.UInt64
+            data = pl.DataFrame({"x": pl.Series([0, 1, None], dtype=dtype)})
+            path = Path(directory) / f"{dtype}.parquet"
+            data.write_parquet(path)
+            for query in (data.lazy(), pl.scan_parquet(path)):
+                with patch.object(ibex_pyarrow, "execute_pipeline_stream") as execute:
+                    with self.assertRaises(NotImplementedError):
+                        query.collect(engine=self.engine)
+                    execute.assert_not_called()
 
     @unittest.skipIf(os.environ.get("IBEX_TEST_PARQUET") == "0", "Parquet backend disabled")
     def test_int32_parquet_predicate_and_output_types(self):

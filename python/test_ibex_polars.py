@@ -119,6 +119,15 @@ class EngineTests(unittest.TestCase):
                         assert_frame_equal(query.collect(engine=self.engine), query.collect(engine="streaming"),
                                            check_exact=True)
 
+    def test_interleaved_rolling_groups_write_nulls_to_original_rows(self):
+        size = 180_000
+        frame = pl.DataFrame({"row": range(size)}).with_columns(
+            g=pl.col("row") % 97, x=pl.when(pl.col("row") % 11 != 0).then(pl.col("row") * 0.25)).lazy()
+        x = pl.col("x")
+        query = frame.select(s=x.rolling_sum(9, min_samples=9).over("g"),
+                             m=x.rolling_mean(6, min_samples=6, center=True).over("g"))
+        assert_frame_equal(query.collect(engine=self.engine), query.collect(engine="streaming"), check_exact=True)
+
     def test_rolling_float_extrema(self):
         frame = pl.LazyFrame({"x": [1., float("nan"), None, -3., float("inf"), -0., 0.]})
         for op in (pl.col("x").rolling_min, pl.col("x").rolling_max):

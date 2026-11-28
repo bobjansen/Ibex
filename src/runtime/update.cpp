@@ -47,6 +47,7 @@
 #include "interpreter_internal.hpp"
 #include "kernel_update.hpp"
 #include "numeric_math.hpp"
+#include "polars_rolling.hpp"
 #include "runtime_internal.hpp"
 #include "welford.hpp"
 
@@ -3155,7 +3156,8 @@ auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::
     if (call == nullptr || !call->named_args.empty()) {
         return false;
     }
-    if (call->callee == "lag" || call->callee == "lead" || call->callee == "cumsum" ||
+    if (call->callee == "__ibex_rolling_sum" || call->callee == "__ibex_rolling_mean" ||
+        call->callee == "lag" || call->callee == "lead" || call->callee == "cumsum" ||
         call->callee == "cumprod" || call->callee == "fill_forward" ||
         call->callee == "fill_backward") {
         return true;
@@ -5788,6 +5790,26 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
     const GroupedRows& group_rows = grouped.rows;
     const auto row_gid = grouped.row_gid(rows);
 
+    if (fields.size() == 1) {
+        const auto& field = fields.front();
+        const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
+        if (call &&
+            (call->callee == "__ibex_rolling_sum" || call->callee == "__ibex_rolling_mean")) {
+            RollingPartitions partitions{{group_rows.flat.get(), rows},
+                                         group_rows.offsets,
+                                         grouped_reduction_worker_count(exec, group_count, rows)};
+            auto result = polars_rolling_column(*call, input, partitions);
+            if (!result)
+                return std::unexpected(result.error());
+            if (result->validity)
+                input.add_column(field.alias, std::move(result->column),
+                                 std::move(*result->validity));
+            else
+                input.add_column(field.alias, std::move(result->column));
+            apply_table_properties(input, derive_grouped_update_properties(input, fields));
+            return input;
+        }
+    }
     if (auto ordered = try_native_grouped_ordered_field(input, fields, group_rows, row_gid, exec);
         !ordered) {
         return std::unexpected(ordered.error());

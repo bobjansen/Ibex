@@ -2,7 +2,10 @@
 // Copyright (C) 2026 Bob Jansen
 #include "polars_rolling.hpp"
 
+#include <ibex/runtime/worker_pool.hpp>
+
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -66,8 +69,8 @@ struct Frame {
 };
 
 template <class Total, typename Logical, bool Mean, typename T>
-auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, Frame frame)
-    -> ComputedColumn {
+auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, Frame frame,
+          RollingPartitions partitions) -> ComputedColumn {
     using Out = std::conditional_t<std::is_integral_v<Logical>, std::int64_t, double>;
     const auto n = col.size();
     Column<Out> out;
@@ -82,41 +85,81 @@ auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, F
     const auto values = value_reader(col);
     const auto right = frame.centered ? (frame.size + 1) / 2 : 1;
     const auto left = frame.size - right;
-    Total total;
-    std::size_t lo = 0, hi = 0, present = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto start = i > left ? i - left : 0;
-        const auto end = i + std::min(right, n - i);
-        if (start == hi) {
-            total = {};
-            present = 0;
-            lo = start;
-        }
-        while (lo < start) {
-            if (!validity || (*validity)[lo]) {
-                total.template change<false>(static_cast<Logical>(values[lo]));
-                --present;
+    const auto scan = [&](std::size_t length, auto position, auto mark_null) {
+        Total total;
+        std::size_t lo = 0, hi = 0, present = 0;
+        for (std::size_t i = 0; i < length; ++i) {
+            const auto start = i > left ? i - left : 0;
+            const auto end = i + std::min(right, length - i);
+            if (start == hi) {
+                total = {};
+                present = 0;
+                lo = start;
             }
-            ++lo;
-        }
-        while (hi < end) {
-            if (!validity || (*validity)[hi]) {
-                total.template change<true>(static_cast<Logical>(values[hi]));
-                ++present;
+            while (lo < start) {
+                if (!validity || (*validity)[position(lo)]) {
+                    total.template change<false>(static_cast<Logical>(values[position(lo)]));
+                    --present;
+                }
+                ++lo;
             }
-            ++hi;
+            while (hi < end) {
+                if (!validity || (*validity)[position(hi)]) {
+                    total.template change<true>(static_cast<Logical>(values[position(hi)]));
+                    ++present;
+                }
+                ++hi;
+            }
+            if (present < frame.minimum || (Mean && !present)) {
+                mark_null(position(i));
+                dest[position(i)] = {};
+            } else {
+                const auto sum = static_cast<Logical>(total.value());
+                if constexpr (Mean)
+                    dest[position(i)] = sum / static_cast<Logical>(present);
+                else
+                    dest[position(i)] = sum;
+            }
         }
-        if (present < frame.minimum || (Mean && !present)) {
-            if (!valid)
-                valid.emplace(n, true);
-            valid->set(i, false);
-            dest[i] = {};
+    };
+    if (partitions.offsets.empty()) {
+        scan(
+            n, [](std::size_t i) { return i; },
+            [&](std::size_t i) {
+                if (!valid)
+                    valid.emplace(n, true);
+                valid->set(i, false);
+            });
+    } else {
+        // Each partition owns its output positions. Mark nulls in separate bytes
+        // since adjacent rows from different partitions may share a bitmap word.
+        std::vector<std::uint8_t> invalid(n, 0);
+        const auto groups = partitions.offsets.size() - 1;
+        const auto group = [&](std::size_t g) {
+            auto indices = partitions.rows.subspan(
+                partitions.offsets[g], partitions.offsets[g + 1] - partitions.offsets[g]);
+            scan(
+                indices.size(), [&](std::size_t i) { return indices[i]; },
+                [&](std::size_t i) { invalid[i] = 1; });
+        };
+        if (partitions.workers < 2) {
+            for (std::size_t g = 0; g < groups; ++g)
+                group(g);
         } else {
-            const auto sum = static_cast<Logical>(total.value());
-            if constexpr (Mean)
-                dest[i] = sum / static_cast<Logical>(present);
-            else
-                dest[i] = sum;
+            std::atomic<std::size_t> next{0};
+            auto batch = process_worker_pool().submit(partitions.workers, [&](std::size_t) {
+                for (auto g = next.fetch_add(1, std::memory_order_relaxed); g < groups;
+                     g = next.fetch_add(1, std::memory_order_relaxed))
+                    group(g);
+            });
+            batch.wait();
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (invalid[i]) {
+                if (!valid)
+                    valid.emplace(n, true);
+                valid->set(i, false);
+            }
         }
     }
     return {.column = std::move(out), .validity = std::move(valid)};
@@ -124,7 +167,8 @@ auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, F
 
 }  // namespace
 
-auto polars_rolling_column(const ir::CallExpr& call, const Table& input)
+auto polars_rolling_column(const ir::CallExpr& call, const Table& input,
+                           RollingPartitions partitions)
     -> std::expected<ComputedColumn, std::string> {
     if (call.args.size() != 5)
         return std::unexpected("rolling requires five arguments");
@@ -147,17 +191,21 @@ auto polars_rolling_column(const ir::CallExpr& call, const Table& input)
     if (const auto* col = std::get_if<Column<double>>(&*entry->column)) {
         if (*single != 0) {
             if (mean)
-                return roll<FloatingTotal<double>, float, true>(*col, entry->validity, frame);
-            return roll<FloatingTotal<float>, float, false>(*col, entry->validity, frame);
+                return roll<FloatingTotal<double>, float, true>(*col, entry->validity, frame,
+                                                                partitions);
+            return roll<FloatingTotal<float>, float, false>(*col, entry->validity, frame,
+                                                            partitions);
         }
         if (mean)
-            return roll<FloatingTotal<double>, double, true>(*col, entry->validity, frame);
-        return roll<FloatingTotal<double>, double, false>(*col, entry->validity, frame);
+            return roll<FloatingTotal<double>, double, true>(*col, entry->validity, frame,
+                                                             partitions);
+        return roll<FloatingTotal<double>, double, false>(*col, entry->validity, frame, partitions);
     }
     if (const auto* col = std::get_if<Column<std::int64_t>>(&*entry->column)) {
         if (mean)
-            return roll<FloatingTotal<double>, double, true>(*col, entry->validity, frame);
-        return roll<IntegerTotal, std::int64_t, false>(*col, entry->validity, frame);
+            return roll<FloatingTotal<double>, double, true>(*col, entry->validity, frame,
+                                                             partitions);
+        return roll<IntegerTotal, std::int64_t, false>(*col, entry->validity, frame, partitions);
     }
     return std::unexpected("unsupported rolling input type");
 }

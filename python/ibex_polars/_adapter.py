@@ -177,7 +177,35 @@ class Adapter:
         self.frame_length_columns = {}
         self.sort_pruning_predicates = set()
 
+    def _rolling_by_function(self, value):
+        operation, duration, minimum, closed, parameters = value.function_data
+        months, weeks, days, nanos, integer, negative = duration
+        name = str(operation).removeprefix("RollingFunctionBy.").lower()
+        if name not in ("sumby", "meanby") or parameters or negative or months:
+            raise NotImplementedError("unsupported indexed rolling operation or calendar interval")
+        dtype, index_type = (self.visitor.get_dtype(child) for child in value.input)
+        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64):
+            raise NotImplementedError(f"unsupported rolling value type {dtype}")
+        if index_type.base_type() == pl.Datetime and not integer:
+            if (days or weeks) and index_type.time_zone not in (None, "UTC"):
+                raise NotImplementedError("calendar intervals on zoned timestamps require calendar arithmetic")
+            nanos += (7 * weeks + days) * 86_400_000_000_000
+            if nanos % NANOS_PER_UNIT[index_type.time_unit]:
+                raise NotImplementedError("window duration must be representable in the index unit")
+        elif not (integer and index_type in (pl.Int32, pl.Int64, pl.UInt32)):
+            raise NotImplementedError(f"unsupported rolling index {index_type} for this interval")
+        if not 0 < nanos <= 2**63 - 1:
+            raise NotImplementedError("rolling interval must fit positive Int64 ticks")
+        args = tuple(self.expression(child) for child in value.input)
+        if any(child._aggregate or not child._row_reference for child in args):
+            raise NotImplementedError("indexed rolling requires row expressions")
+        closed_bits = {"none": 0, "left": 1, "right": 2, "both": 3}[closed]
+        op = "polars_rolling_sum_by" if name == "sumby" else "polars_rolling_mean_by"
+        return Expr(op, (*args, nanos, minimum, closed_bits, int(dtype == pl.Float32)))
+
     def _rolling_function(self, value):
+        if str(value.function_data[0]).startswith("RollingFunctionBy."):
+            return self._rolling_by_function(value)
         if len(value.function_data) != 6 or len(value.input) != 1:
             raise NotImplementedError("unsupported rolling options")
         operation, size, minimum, weights, center, parameters = value.function_data
@@ -259,7 +287,7 @@ class Adapter:
                     raise NotImplementedError("window ordering requires a column key")
                 ordering = (order._name, value.order_by_descending, value.order_by_nulls_last)
             call = self.visitor.view_expression(value.function)
-            if type(call).__name__ == "Function" and str(call.function_data[0]).startswith("RollingFunction."):
+            if type(call).__name__ == "Function" and str(call.function_data[0]).startswith(("RollingFunction.", "RollingFunctionBy.")):
                 function = self._rolling_function(call)
             elif type(call).__name__ == "Function" and call.function_data in (("cum_sum", False), ("cum_max", False)):
                 input_type = self.visitor.get_dtype(call.input[0])
@@ -294,7 +322,7 @@ class Adapter:
                 raise NotImplementedError("list-valued window joins are unsupported")
             self.has_windows = True
             expr = Expr("window", (function, tuple(keys), ordering))
-            if function._op in ("window_cumsum", "window_rolling", "polars_rolling_sum") and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
+            if function._op in ("window_cumsum", "window_rolling", "polars_rolling_sum", "polars_rolling_sum_by") and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
                 expr = _wrap_integer(expr, self.visitor.get_dtype(node))
         elif kind == "Ternary":
             expr = Expr("case", (self.expression(value.predicate), self.expression(value.truthy),
@@ -375,7 +403,7 @@ class Adapter:
                 raise NotImplementedError(f"unsupported cast to {value.dtype} with options {value.options}")
         elif kind == "Function":
             name = str(value.function_data[0]).split(".")[-1]
-            if str(value.function_data[0]).startswith("RollingFunction."):
+            if str(value.function_data[0]).startswith(("RollingFunction.", "RollingFunctionBy.")):
                 function = self._rolling_function(value)
                 self.has_windows = True
                 expr = Expr("window", (function, (), None))
@@ -660,6 +688,9 @@ class Adapter:
                     elif function._op in ("polars_rolling_sum", "polars_rolling_mean"):
                         child, *params = function._args
                         function = Expr(function._op, (ibex.col(input_column(child)), *params))
+                    elif function._op in ("polars_rolling_sum_by", "polars_rolling_mean_by"):
+                        child, index, *params = function._args
+                        function = Expr(function._op, (ibex.col(input_column(child)), ibex.col(input_column(index)), *params))
                     elif function._op == "window_rolling":
                         child, op, size, minimum = function._args
                         function = Expr(op, (child, size))

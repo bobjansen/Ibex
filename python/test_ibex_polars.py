@@ -140,6 +140,23 @@ class EngineTests(unittest.TestCase):
                 mean=value.rolling_mean(305, min_samples=24, center=True).over("g"))
             self.equal(query)
 
+    def test_indexed_rolling_sums_and_means(self):
+        x = pl.col("x")
+        data = dict(g=[1, 2, 1, 1, 1, 2, 2, 1, 2],
+                    i=[3, 1, 3, None, 1, 4, 1, 8, 9],
+                    x=[None, 5., 3., 19., float("inf"), -3., -0., float("nan"), 4.])
+        for dtype, span in ((pl.Int64, "3i"), (pl.Datetime("ns"), "3ns"),
+                            (pl.Datetime("ms", "Europe/Amsterdam"), "3ms")):
+            frame = pl.LazyFrame(data, schema_overrides={"i": dtype})
+            for closed in ("none", "both", "left", "right"):
+                for minimum in (0, 1, 3):
+                    opts = dict(by="i", window_size=span, closed=closed, min_samples=minimum)
+                    total, mean = x.rolling_sum_by(**opts), x.rolling_mean_by(**opts)
+                    q = frame.select(s=total, m=mean, gs=total.over("g"), gm=mean.over("g"))
+                    with self.subTest(dtype=dtype, closed=closed, minimum=minimum):
+                        assert_frame_equal(q.collect(engine=self.engine), q.collect(engine="streaming"),
+                                           check_exact=True)
+
     def test_rolling_float_extrema(self):
         frame = pl.LazyFrame({"x": [1., float("nan"), None, -3., float("inf"), -0., 0.]})
         for op in (pl.col("x").rolling_min, pl.col("x").rolling_max):

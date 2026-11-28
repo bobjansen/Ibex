@@ -1879,7 +1879,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             .min_args = 5,
             .max_args = 5,
             .infer = [](std::string_view name, const std::vector<ExprType>& args) -> IT {
-                return name == "__ibex_rolling_mean" ? ExprType::Double : args.front();
+                return name.starts_with("__ibex_rolling_mean") ? ExprType::Double : args.front();
             },
             .exec = TransformExec{.column_eval =
                                       [](const ir::CallExpr& call, const Table& input, std::size_t,
@@ -1889,6 +1889,10 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         };
         m.emplace("__ibex_rolling_sum", polars_rolling);
         m.emplace("__ibex_rolling_mean", polars_rolling);
+        auto indexed_rolling = polars_rolling;
+        indexed_rolling.min_args = indexed_rolling.max_args = 6;
+        m.emplace("__ibex_rolling_sum_by", indexed_rolling);
+        m.emplace("__ibex_rolling_mean_by", indexed_rolling);
 
         // window_start() / window_end(): the nominal bounds of the enclosing
         // `window` clause's window for each row (grid boundaries when aligned,

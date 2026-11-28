@@ -4,6 +4,11 @@
 #include "interpreter_internal.hpp"
 
 namespace ibex::runtime {
+inline auto is_polars_rolling(std::string_view name) -> bool {
+    return name == "__ibex_rolling_sum" || name == "__ibex_rolling_mean" ||
+           name == "__ibex_rolling_sum_by" || name == "__ibex_rolling_mean_by";
+}
+
 struct RollingPartitions {
     std::span<const std::size_t> rows;
     std::span<const std::size_t> offsets;

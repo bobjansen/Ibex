@@ -3156,9 +3156,8 @@ auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::
     if (call == nullptr || !call->named_args.empty()) {
         return false;
     }
-    if (call->callee == "__ibex_rolling_sum" || call->callee == "__ibex_rolling_mean" ||
-        call->callee == "lag" || call->callee == "lead" || call->callee == "cumsum" ||
-        call->callee == "cumprod" || call->callee == "fill_forward" ||
+    if (is_polars_rolling(call->callee) || call->callee == "lag" || call->callee == "lead" ||
+        call->callee == "cumsum" || call->callee == "cumprod" || call->callee == "fill_forward" ||
         call->callee == "fill_backward") {
         return true;
     }
@@ -5793,8 +5792,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
     if (fields.size() == 1) {
         const auto& field = fields.front();
         const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
-        if (call &&
-            (call->callee == "__ibex_rolling_sum" || call->callee == "__ibex_rolling_mean")) {
+        if (call && is_polars_rolling(call->callee)) {
             RollingPartitions partitions{{group_rows.flat.get(), rows},
                                          group_rows.offsets,
                                          grouped_reduction_worker_count(exec, group_count, rows)};

@@ -66,6 +66,9 @@ struct IntegerTotal {
 struct Frame {
     std::size_t size, minimum;
     bool centered;
+    const Column<std::int64_t>* index;
+    const ValidityBitmap* index_validity;
+    bool closed_left, closed_right;
 };
 
 template <class Total, typename Logical, bool Mean, typename T>
@@ -85,16 +88,15 @@ auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, F
     const auto values = value_reader(col);
     const auto right = frame.centered ? (frame.size + 1) / 2 : 1;
     const auto left = frame.size - right;
-    const auto scan = [&](std::size_t length, auto position, auto mark_null) {
+    const auto scan = [&](std::size_t length, auto position, auto mark_null, auto bounds) {
         Total total;
         std::size_t lo = 0, hi = 0, present = 0;
         for (std::size_t i = 0; i < length; ++i) {
-            const auto start = i > left ? i - left : 0;
-            const auto end = i + std::min(right, length - i);
-            if (start == hi) {
+            const auto [start, end] = bounds(i, length);
+            if (start >= hi) {
                 total = {};
                 present = 0;
-                lo = start;
+                lo = hi = start;
             }
             while (lo < start) {
                 if (!validity || (*validity)[position(lo)]) {
@@ -122,8 +124,58 @@ auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, F
             }
         }
     };
+    const auto scan_partition = [&](std::size_t length, auto position, auto mark_null) {
+        if (!frame.index) {
+            scan(length, position, mark_null, [&](std::size_t i, std::size_t len) {
+                return std::pair{i > left ? i - left : 0, i + std::min(right, len - i)};
+            });
+            return;
+        }
+        const auto ticks = value_reader(*frame.index);
+        // Advance both bounds over sorted times. Peers at the same time get
+        // the same frame, even when they follow the current row.
+        const auto ordered = [&](std::size_t len, auto row) {
+            std::size_t start = 0, end = 0;
+            scan(len, row, mark_null, [&](std::size_t i, std::size_t) {
+                const auto now = ticks[row(i)];
+                while (end < len &&
+                       (ticks[row(end)] < now || (frame.closed_right && ticks[row(end)] == now)))
+                    ++end;
+                while (start < end) {
+                    // Unsigned subtraction is the exact nonnegative distance
+                    // even when the two signed timestamps straddle zero.
+                    const auto age = static_cast<std::uint64_t>(now) -
+                                     static_cast<std::uint64_t>(ticks[row(start)]);
+                    if (age < frame.size || (frame.closed_left && age == frame.size))
+                        break;
+                    ++start;
+                }
+                return std::pair{start, end};
+            });
+        };
+        bool sorted = !frame.index_validity;
+        for (std::size_t i = 1; sorted && i < length; ++i)
+            sorted = ticks[position(i - 1)] <= ticks[position(i)];
+        if (sorted) {
+            ordered(length, position);
+        } else {
+            std::vector<std::size_t> rows;
+            rows.reserve(length);
+            for (std::size_t i = 0; i < length; ++i) {
+                const auto row = position(i);
+                if (frame.index_validity && !(*frame.index_validity)[row]) {
+                    dest[row] = {};
+                    mark_null(row);
+                } else
+                    rows.push_back(row);
+            }
+            std::stable_sort(rows.begin(), rows.end(),
+                             [&](auto a, auto b) { return ticks[a] < ticks[b]; });
+            ordered(rows.size(), [&](std::size_t i) { return rows[i]; });
+        }
+    };
     if (partitions.offsets.empty()) {
-        scan(
+        scan_partition(
             n, [](std::size_t i) { return i; },
             [&](std::size_t i) {
                 if (!valid)
@@ -138,7 +190,7 @@ auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, F
         const auto group = [&](std::size_t g) {
             auto indices = partitions.rows.subspan(
                 partitions.offsets[g], partitions.offsets[g + 1] - partitions.offsets[g]);
-            scan(
+            scan_partition(
                 indices.size(), [&](std::size_t i) { return indices[i]; },
                 [&](std::size_t i) { invalid[i] = 1; });
         };
@@ -170,24 +222,40 @@ auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, F
 auto polars_rolling_column(const ir::CallExpr& call, const Table& input,
                            RollingPartitions partitions)
     -> std::expected<ComputedColumn, std::string> {
-    if (call.args.size() != 5)
-        return std::unexpected("rolling requires five arguments");
+    const bool indexed = call.callee.ends_with("_by");
+    if (call.args.size() != (indexed ? 6U : 5U))
+        return std::unexpected("invalid rolling arguments");
     const auto* ref = ir::as_column_ref(*call.args[0]);
     const auto* entry = ref ? input.find_entry(ref->name) : nullptr;
     const auto literal = [&](std::size_t i) -> const std::int64_t* {
         const auto* lit = std::get_if<ir::Literal>(&call.args[i]->node);
         return lit ? std::get_if<std::int64_t>(&lit->value) : nullptr;
     };
-    const auto* size = literal(1);
-    const auto* min = literal(2);
-    const auto* centered = literal(3);
-    const auto* single = literal(4);
-    if (!entry || !size || !min || !centered || !single || *size < 0 || *min < 0 || *min > *size ||
-        (*centered != 0 && *centered != 1) || (*single != 0 && *single != 1))
+    const std::size_t base = indexed ? 2 : 1;
+    const auto* size = literal(base);
+    const auto* min = literal(base + 1);
+    const auto* mode = literal(base + 2);
+    const auto* single = literal(base + 3);
+    if (!entry || !size || !min || !mode || !single || *size < 0 || *min < 0 ||
+        (!indexed && *min > *size) || (indexed && *size == 0) || *mode < 0 ||
+        *mode > (indexed ? 3 : 1) || (*single != 0 && *single != 1))
         return std::unexpected("invalid rolling column or frame parameters");
-    const Frame frame{static_cast<std::size_t>(*size), static_cast<std::size_t>(*min),
-                      *centered != 0};
-    const bool mean = call.callee == "__ibex_rolling_mean";
+    Frame frame{.size = static_cast<std::size_t>(*size),
+                .minimum = static_cast<std::size_t>(*min),
+                .centered = !indexed && *mode != 0,
+                .index = nullptr,
+                .index_validity = nullptr,
+                .closed_left = (*mode & 1) != 0,
+                .closed_right = (*mode & 2) != 0};
+    if (indexed) {
+        const auto* by = ir::as_column_ref(*call.args[1]);
+        const auto* key = by ? input.find_entry(by->name) : nullptr;
+        if (!key || !(frame.index = std::get_if<Column<std::int64_t>>(&*key->column)))
+            return std::unexpected("rolling index requires Int64 storage");
+        if (key->validity)
+            frame.index_validity = &*key->validity;
+    }
+    const bool mean = call.callee.starts_with("__ibex_rolling_mean");
     if (const auto* col = std::get_if<Column<double>>(&*entry->column)) {
         if (*single != 0) {
             if (mean)

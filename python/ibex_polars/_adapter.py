@@ -372,7 +372,7 @@ class Adapter:
             if str(value.function_data[0]).startswith("RollingFunction."):
                 function = self._rolling_function(value)
                 self.has_windows = True
-                expr = Expr("window", (function, (ibex.lit(1),), None))
+                expr = Expr("window", (function, (), None))
                 if self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
                     expr = _wrap_integer(expr, self.visitor.get_dtype(node))
                 self.expressions[key] = expr

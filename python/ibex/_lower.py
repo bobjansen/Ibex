@@ -418,7 +418,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
                            f"[order {{ {_identifier(order)} {null_order}, {row} asc }}]")
             assignments = ", ".join(f"{_identifier(expr._name)} = {render(expr)}" for expr in fields)
             partition = ", ".join(_identifier(key) for key in keys)
-            source += f"[update {{ {assignments} }}, by {{ {partition} }}]"
+            by = f", by {{ {partition} }}" if keys else ""
+            source += f"[update {{ {assignments} }}{by}]"
             if ordering is not None:
                 columns = ", ".join(_identifier(name) for name in schemas[index])
                 source += f"[order {{ {row} asc }}][select {{ {columns} }}]"

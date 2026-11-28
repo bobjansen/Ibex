@@ -84,6 +84,8 @@ def _null_literal(dtype):
         placeholder = 0
     elif dtype in (pl.Float32, pl.Float64):
         placeholder = 0.0
+    elif dtype == pl.Time:
+        placeholder = 0
     elif dtype == pl.Boolean:
         placeholder = False
     elif dtype == pl.String:
@@ -415,6 +417,8 @@ class Adapter:
             original = self.visitor.get_dtype(value.expr)
             if original == pl.Null:
                 expr = _null_literal(value.dtype)
+            elif original == pl.Time and value.dtype in (pl.Time, pl.Int64):
+                expr = self.expression(value.expr)
             elif is_temporal(original) or is_temporal(value.dtype):
                 if original.base_type() != value.dtype.base_type():
                     raise NotImplementedError("casts between temporal and non-temporal types are unsupported")
@@ -1064,7 +1068,7 @@ class Adapter:
             height = pl.DataFrame._from_pydf(node.df).height
             table = pa.table({"_ibex_height": pa.nulls(height, type=pa.int64())})
         for index, field in enumerate(table.schema):
-            if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type):
+            if pa.types.is_timestamp(field.type) or pa.types.is_duration(field.type) or pa.types.is_time(field.type):
                 table = table.set_column(index, field.name, prepare_column(table.column(index)))
             elif field.type in _WIDENED_NUMERIC_TYPES and field.type != pa.int32():
                 table = table.set_column(index, field.name, table.column(index).cast(_WIDENED_NUMERIC_TYPES[field.type]))

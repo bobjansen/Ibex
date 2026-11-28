@@ -171,7 +171,7 @@ class EngineTests(unittest.TestCase):
     def test_rolling_ranks(self):
         values = [3, 1, 3, None, 2, 1, 3, None, 4, 2, 4, 1]
         for dtype in (pl.Int64, pl.Float32, pl.Float64, pl.UInt8, pl.Boolean,
-                      pl.Date, pl.Datetime("ns"), pl.Duration("us")):
+                      pl.Date, pl.Time, pl.Datetime("ns"), pl.Duration("us")):
             x = pl.Series(values).cast(dtype)
             if dtype.is_float():
                 x = pl.Series([0., -0., float("inf"), None, float("nan"), -1.,

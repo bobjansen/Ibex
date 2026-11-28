@@ -43,6 +43,17 @@ class TemporalTests(unittest.TestCase):
         native = ibex_pyarrow.execute_pipeline("input;", tables={"input": bindings["_ibex_input"]})
         self.assertEqual(native.schema.field("x").type, pa.int64())
 
+    def test_time_of_day(self):
+        ticks = [0, 1, 2, 43_200_000_000_001, 86_399_999_999_999, None]
+        frame = pl.LazyFrame({"x": pl.Series(ticks, dtype=pl.Time),
+                              "y": pl.Series(ticks[::-1], dtype=pl.Time)})
+        self.equal(frame)
+        self.equal(frame.select(pl.col("x").cast(pl.Int64)))
+        self.equal(frame.filter(pl.col("x") < pl.col("y")).sort("x", descending=True))
+        self.equal(frame.select(lo=pl.col("x").min(), hi=pl.col("x").max()))
+        self.equal(frame.group_by("x", maintain_order=True).agg(pl.len()))
+        self.equal(frame.with_columns(pl.lit(None).cast(pl.Time).alias("x")))
+
     def test_timestamps_all_units_and_timezones(self):
         for unit in ("ms", "us", "ns"):
             for zone in (None, "UTC", "Europe/Amsterdam"):

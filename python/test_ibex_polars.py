@@ -191,6 +191,16 @@ class EngineTests(unittest.TestCase):
                     with self.subTest(dtype=dtype, method=method, expr=expr):
                         self.equal(frame.select(a=expr, b=expr.over("g")))
 
+    def test_boolean_all_over_rolling_rank_bounds(self):
+        frame = pl.LazyFrame({"x": [1, 2, None, 1]})
+        x = pl.col("x")
+        ranked = frame.with_columns(rank=x.rolling_rank(2, min_samples=1))
+        predicate = (pl.col("rank") >= 1) & (pl.col("rank") <= 2)
+        self.equal(ranked.select(predicate.all()))
+        for values in ([], [None], [True, None], [False, None], [True, True]):
+            data = pl.LazyFrame({"x": pl.Series(values, dtype=pl.Boolean)})
+            self.equal(data.select(default=x.all(), kleene=x.all(ignore_nulls=False)))
+
     def test_rolling_rank_by_requires_right_endpoint(self):
         frame = pl.LazyFrame({"x": [1, 2], "t": [2, 3]})
         for closed in ("none", "left"):

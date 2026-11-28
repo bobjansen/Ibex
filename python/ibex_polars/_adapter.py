@@ -447,6 +447,19 @@ class Adapter:
                     expr = _wrap_integer(expr, self.visitor.get_dtype(node))
                 self.expressions[key] = expr
                 return expr
+            if str(value.function_data[0]) == "BooleanFunction.All":
+                child = self.expression(value.input[0])
+                if self.visitor.get_dtype(value.input[0]) != pl.Boolean:
+                    raise NotImplementedError("all requires a Boolean operand")
+                # Empty/all-null inputs contain no false observations.
+                all_true = Expr("sum", (~child,)) == 0
+                if value.function_data[1]:
+                    expr = all_true
+                else:
+                    has_null = Expr("sum", (Expr("is_null", (child,)),)) > 0
+                    expr = Expr("case", (all_true & has_null, _null_literal(pl.Boolean), all_true))
+                self.expressions[key] = expr
+                return expr
             if name == "repeat":
                 if len(value.input) != 2 or len(value.function_data) != 1:
                     raise NotImplementedError("unsupported repeat options")
@@ -766,7 +779,7 @@ class Adapter:
     def _aggregate_projection(self, frame, fields, *, keys=None, maintain_order=False):
         def needs_projection(expr):
             if expr._op in ("polars_round", "square", "abs", "sqrt", "exp", "floor", "ceil",
-                            "string_length", "byte_length", "is_nan"):
+                            "string_length", "byte_length", "is_nan", "==", ">"):
                 return expr._aggregate
             return any(needs_projection(arg) for arg in expr._args if isinstance(arg, Expr))
         if not any(expr._aggregate and needs_projection(expr) for expr in fields):

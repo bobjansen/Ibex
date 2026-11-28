@@ -68,6 +68,13 @@ class EngineTests(unittest.TestCase):
                                 ordered=x.cum_sum().over(pl.col("g") + 1, order_by="k")))
         self.equal(frame.head(0).with_columns(running=x.cum_sum().over("g")))
 
+    def test_shift_over_a_partition(self):
+        frame = pl.LazyFrame({"g": [0, 1, 0, 1, 0], "x": [1., None, None, 2., 3.]})
+        for offset in (0, 1, -1, 2, -20):
+            shift = pl.col("x").shift(offset)
+            self.equal(frame.select(shift.over("g"), ordered=shift.over("g", order_by="x")))
+            self.equal(frame.head(0).select(shift.over("g")))
+
     def test_vertical_concat_and_shared_branches(self):
         first = pl.LazyFrame({"x": [1, None], "s": ["a", "b"]})
         second = pl.LazyFrame({"x": [2, 3], "s": ["c", None]})

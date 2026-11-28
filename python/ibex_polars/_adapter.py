@@ -246,6 +246,14 @@ class Adapter:
                 if child._op != "col":
                     raise NotImplementedError("cumulative sums require a column")
                 function = Expr("window_cumsum", (child, input_type == pl.Float64))
+            elif type(call).__name__ == "Function" and call.function_data == ("shift",) and len(call.input) == 2:
+                child = self.expression(call.input[0])
+                offset = self.visitor.view_expression(call.input[1])
+                if (child._op != "col" or self.visitor.get_dtype(call.input[0]) not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64)
+                        or type(offset).__name__ != "Literal" or type(offset.value) is not int
+                        or abs(offset.value) >= 2**63):
+                    raise NotImplementedError("window shift requires a numeric column and literal offset")
+                function = Expr("window_shift", (child, offset.value))
             else:
                 function = self.expression(value.function)
             if value.options.kind == "join" and (not function._aggregate or function._row_reference):
@@ -603,6 +611,17 @@ class Adapter:
                         clean = Expr("case", (missing, ibex.lit(0.0 if floating else 0), child))
                         function = Expr("cumsum", (ibex.col(input_column(clean)),))
                         result = Expr("case", (missing, Expr("null", ()), result))
+                    elif function._op == "window_shift":
+                        child, offset = function._args
+                        direction = "lag" if offset >= 0 else "lead"
+                        missing = Expr("is_null", (child,))
+                        flag = Expr("case", (missing, ibex.lit(1), ibex.lit(0)))
+                        flag_column = ibex.col(input_column(flag))
+                        flag_name = fresh()
+                        values = partitions.setdefault((partition, ordering), [])
+                        values.append(Expr(direction, (flag_column, abs(offset))).alias(flag_name))
+                        function = Expr(direction, (child, abs(offset)))
+                        result = Expr("case", (ibex.col(flag_name) == 1, Expr("null", ()), result))
                     columns[id(expr)] = result
                     partitions.setdefault((partition, ordering), []).append(function.alias(name))
                 return columns[id(expr)]

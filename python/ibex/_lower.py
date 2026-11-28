@@ -158,6 +158,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return f"length({render(args[0])})"
         if op in ("abs", "sqrt", "exp", "floor", "ceil", "byte_length"):
             return f"{op}({render(args[0])})"
+        if op in ("lag", "lead"):
+            return f"{op}({render(args[0])}, {args[1]})"
         if op == "cumsum":
             return f"cumsum({render(args[0])})"
         if op == "year":
@@ -811,7 +813,7 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "is_null":
             dtype(args[0])
             return pa.bool_()
-        if op == "cumsum":
+        if op in ("cumsum", "lag", "lead"):
             return dtype(args[0])
         if op == "window":
             raise NotImplementedError("nested windows and windows in this context are unsupported")

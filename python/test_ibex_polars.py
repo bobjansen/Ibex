@@ -45,6 +45,15 @@ class EngineTests(unittest.TestCase):
         self.equal(frame.select(equal=a.eq_missing(b), different=a.ne_missing(b)))
         self.equal(frame.filter(a.eq_missing(b)))
 
+    def test_unary_functions_and_utf8_lengths(self):
+        frame = pl.DataFrame({"x": [-1.5, -0.0, None, float("nan"), float("inf")],
+                              "s": ["é猫", "", None, "a", "🙂"]}).lazy()
+        x, s = pl.col("x"), pl.col("s")
+        self.equal(frame.select(x.abs(), root=x.sqrt(), exponential=x.exp(), down=x.floor(),
+                                up=x.ceil(), nan=x.is_nan(), valid=x.is_not_nan(),
+                                chars=s.str.len_chars(), bytes=s.str.len_bytes()))
+        self.equal(frame.select(x.mean().sqrt(), total=x.abs().sum()))
+
     def test_sum_that_is_null_when_a_group_has_no_values(self):
         # Polars documents `when(x.count() > 0).then(x.sum())` for a sum that
         # is null rather than zero on an empty group, and folds it into one

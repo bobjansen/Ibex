@@ -156,6 +156,8 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             return "substring(" + ", ".join(render(arg) for arg in args) + ")"
         if op == "string_length":
             return f"length({render(args[0])})"
+        if op in ("abs", "sqrt", "exp", "floor", "ceil", "byte_length"):
+            return f"{op}({render(args[0])})"
         if op == "year":
             return f"year({render(args[0])})"
         if op == "is_nan":
@@ -755,10 +757,14 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
                     dtype(arg) != pa.int64() for arg in args[1:]):
                 raise TypeError("substring requires a string and integer offset/length")
             return pa.large_string()
-        if op == "string_length":
+        if op in ("string_length", "byte_length"):
             if dtype(args[0]) not in (pa.string(), pa.large_string()):
                 raise TypeError("string length requires a string operand")
             return pa.int64()
+        if op in ("abs", "sqrt", "exp", "floor", "ceil"):
+            if dtype(args[0]) != pa.float64():
+                raise TypeError(f"{op} requires a floating-point operand")
+            return pa.float64()
         if op == "polars_round":
             if dtype(args[0]) != pa.float64():
                 raise TypeError("floating rounding requires a floating-point operand")

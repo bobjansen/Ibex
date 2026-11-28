@@ -238,6 +238,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
         <ul>
           <li>Resident <code>DataFrame</code>s and single local Parquet files.</li>
           <li><code>filter</code>, <code>select</code>, <code>with_columns</code>, arithmetic, comparisons, Boolean logic, <code>is_between</code>, <code>is_in</code>, <code>when/then/otherwise</code>, null checks and casts. Null-aware comparisons support <code>eq_missing</code> and <code>ne_missing</code>.</li>
+          <li>Float64 <code>abs</code>, <code>sqrt</code>, <code>exp</code>, <code>floor</code> and <code>ceil</code>, floating-point NaN checks, and string lengths in Unicode characters or UTF-8 bytes.</li>
           <li>Column-key <code>group_by</code> with <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>len</code>, <code>n_unique</code>, <code>first</code>/<code>last</code>, <code>median</code>, <code>std</code> (ddof 1), Pearson <code>corr</code> and its square, including the null-on-empty sum <code>pl.when(x.count() &gt; 0).then(x.sum())</code>.</li>
           <li>Equality joins (<code>inner</code>, <code>left</code>, <code>right</code>, <code>full</code>, <code>semi</code>, <code>anti</code>), cross joins, composite keys and suffixes.</li>
           <li>Per-group rows: <code>group_by(...).head(n)</code>, and <code>agg(pl.col(x).top_k(k)).explode(...)</code> on a numeric column.</li>

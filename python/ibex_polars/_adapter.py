@@ -468,6 +468,17 @@ class Adapter:
                         or self.visitor.get_dtype(value.input[0]) != pl.Float64):
                     raise NotImplementedError("pow is supported only as a Float64 squared")
                 expr = Expr("square", (args[0],))
+            elif name in ("abs", "sqrt", "exp", "floor", "ceil") and len(args) == 1 and len(value.function_data) == 1:
+                if self.visitor.get_dtype(value.input[0]) != pl.Float64:
+                    raise NotImplementedError(f"{name} currently requires Float64")
+                expr = Expr(name, args)
+            elif name in ("LenChars", "LenBytes") and len(args) == 1:
+                expr = Expr("string_length" if name == "LenChars" else "byte_length", args)
+            elif name in ("IsNan", "IsNotNan") and len(args) == 1:
+                if self.visitor.get_dtype(value.input[0]) not in (pl.Float32, pl.Float64):
+                    raise NotImplementedError(f"{name} currently requires floating-point input")
+                predicate = Expr("is_nan", args)
+                expr = predicate if name == "IsNan" else ~predicate
             elif name == "Not" and len(args) == 1:
                 expr = ~args[0]
             elif name == "IsNull" and len(args) == 1:
@@ -517,24 +528,24 @@ class Adapter:
             raise NotImplementedError("join cardinality validation is not supported by this visitor adapter")
         self.checked_join_validation = True
 
-    def _aggregate_rounding(self, frame, fields, *, keys=None, maintain_order=False):
-        def contains_round(expr):
-            # Row expressions over a reduction's result: rounding, squaring.
-            return expr._op in ("polars_round", "square") or any(
-                contains_round(arg) for arg in expr._args if isinstance(arg, Expr))
-        if not any(expr._aggregate and contains_round(expr) for expr in fields):
+    def _aggregate_projection(self, frame, fields, *, keys=None, maintain_order=False):
+        def needs_projection(expr):
+            if expr._op in ("polars_round", "square", "abs", "sqrt", "exp", "floor", "ceil",
+                            "string_length", "byte_length", "is_nan"):
+                return expr._aggregate
+            return any(needs_projection(arg) for arg in expr._args if isinstance(arg, Expr))
+        if not any(expr._aggregate and needs_projection(expr) for expr in fields):
             return (frame.select(fields) if keys is None else
                     frame.group_by(*keys, maintain_order=maintain_order).agg(fields))
         if any(not expr._aggregate or expr._row_reference for expr in fields):
-            raise NotImplementedError("rounded aggregate projections require scalar reductions")
+            raise NotImplementedError("aggregate projections require scalar reductions")
         if keys is not None and any(expr._name in keys for expr in fields):
             raise ValueError("aggregate output name conflicts with a grouping key")
-        # Guarded rounding is a row expression. Materialize its reductions
-        # first, then round the aggregate rows in the same native query plan.
+        # Evaluate row functions over materialized reductions in the same native plan.
         occupied = set(self.visitor.get_schema()) | {expr._name for expr in fields}
         reductions = []
         def rewrite(expr):
-            if expr._aggregate and not contains_round(expr):
+            if expr._aggregate and not needs_projection(expr):
                 name = f"_ibex_round_aggregate_{len(reductions)}"
                 while name in occupied:
                     name += "_"
@@ -1089,7 +1100,7 @@ class Adapter:
                     frame = frame.select(child.alias(node.expr[0].output_name)).unique(
                         maintain_order=value.function_data[1])
                 else:
-                    frame = self._aggregate_rounding(frame, [self.named(expr) for expr in node.expr])
+                    frame = self._aggregate_projection(frame, [self.named(expr) for expr in node.expr])
             elif kind == "HStack":
                 expressions = tuple(self.named(expr) for expr in node.exprs)
                 frame = self._hstack(frame, expressions, list(schema), node_id)
@@ -1105,7 +1116,7 @@ class Adapter:
                     # NaN in one group and -0.0 with 0.0, as Polars does, and
                     # each group keeps its first row's key value.
                     keys.append(expr._name)
-                frame = self._aggregate_rounding(
+                frame = self._aggregate_projection(
                     frame, [self.named(expr) for expr in node.aggs],
                     keys=keys, maintain_order=node.maintain_order)
                 if node.options.slice is not None:

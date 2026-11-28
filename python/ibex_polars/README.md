@@ -182,10 +182,22 @@ partition and ordering keys share a grouped native update. A single-column
 `order_by` supports descending order and null placement, with ties broken in
 input order. Results return to their original row positions. Numeric columns
 support forward cumulative sums (integer and Float64) and literal-offset shifts.
-Ranks support average, min, max, dense and ordinal ties. Unweighted fixed-size sums and means support integer, Float32, and Float64
-columns, trailing or centered frames, and `min_samples` from zero to the window
-size. Nulls do not count toward the minimum. Input NaNs and infinities age out as the frame advances. Numeric extrema support trailing frames and positive
+Ranks support average, min, max, dense and ordinal ties. Unweighted fixed-size
+sums and means support Boolean, integer, Float32 and Float64 columns, trailing
+or centered frames, and `min_samples` from zero to the window size. Only
+non-null observations count toward the minimum. Input NaNs and infinities age
+out as the frame advances. Numeric extrema support trailing frames and positive
 `min_samples`. All four operations work globally or per partition.
+
+To compare rolling performance on a resident frame of one million rows, run
+the following commands from the repository root. Each query checks the Ibex
+result against Polars streaming, then reports median collection time in milliseconds.
+
+```sh
+PYTHONPATH=build-release/python:python IBEX_CORES=1 POLARS_MAX_THREADS=1 .venv/bin/python python/bench_polars_rolling.py
+PYTHONPATH=build-release/python:python .venv/bin/python python/bench_polars_rolling.py
+```
+
 UDFs,
 computed grouping/sort keys, aggregate broadcasting in projections/updates other than row counts, expression top-k
 operations, general inequality joins, other filtered aggregates, remote/multiple files, Enum, other numeric widths and nondefault scan
@@ -215,9 +227,9 @@ could overflow their destination range remain unsupported. UInt32 values widen t
 UInt64 inputs remain unsupported.
 
 Float32 inputs similarly widen once to Float64 for execution, including
-Parquet input. All arithmetic and reductions use Float64 intermediates; only
-declared Float32 output columns are downcast at the public result boundary.
-There is no emulation of intermediate Float32 rounding. This is an intentional
+Parquet input. Ordinary arithmetic and reductions use Float64 intermediates and downcast
+declared Float32 columns at the public result boundary. Rolling sums and means
+use the rounding of their respective Polars kernels. This is an intentional
 compatibility difference: cancellation, intermediate overflow/underflow, and
 predicates can differ from Polars even when the final dtype is Float32. For
 example, a Float32 input `x = 2**24` followed by `y = x + 1` and `y - x` yields

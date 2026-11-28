@@ -200,10 +200,14 @@ class EngineTests(unittest.TestCase):
         n = 131093
         rows = pl.int_range(0, n, eager=True)
         frame = pl.DataFrame({"i": rows}).with_columns(
-            x=pl.when(pl.col("i") % 131 != 0).then((pl.col("i") * 107) % 701)).lazy()
+            x=pl.when(pl.col("i") % 131 != 0).then((pl.col("i") * 107) % 701),
+            t=pl.col("i") // 19).lazy()
         for width, center, method in ((128, False, "average"), (129, True, "max"),
                                       (4096, True, "dense")):
             expr = pl.col("x").rolling_rank(width, method, center=center, min_samples=width // 2)
+            self.equal(frame.select(expr))
+        for interval in ("60i", "10000i"):
+            expr = pl.col("x").rolling_rank_by("t", interval, "dense", closed="both")
             self.equal(frame.select(expr))
 
     def test_rolling_rank_random_ties(self):

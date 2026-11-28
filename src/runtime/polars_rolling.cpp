@@ -73,6 +73,23 @@ struct Frame {
     bool closed_left, closed_right;
 };
 
+// Both times are signed, but their nonnegative difference can span UInt64.
+bool before_left_edge(Frame frame, std::int64_t earlier, std::int64_t now) {
+    const auto age = static_cast<std::uint64_t>(now) - static_cast<std::uint64_t>(earlier);
+    return age > frame.size || (age == frame.size && !frame.closed_left);
+}
+
+template <class Tick>
+auto index_bounds(Frame frame, Tick tick, std::size_t i, std::size_t len, std::size_t& start,
+                  std::size_t& end) {
+    const auto now = tick(i);
+    while (end < len && (tick(end) < now || (frame.closed_right && tick(end) == now)))
+        ++end;
+    while (start < end && before_left_edge(frame, tick(start), now))
+        ++start;
+    return std::pair{start, end};
+}
+
 template <class Out, class Scan>
 void visit_windows(std::size_t n, Frame frame, RollingPartitions partitions, Out* dest,
                    std::optional<ValidityBitmap>& valid, const Scan& scan) {
@@ -91,20 +108,8 @@ void visit_windows(std::size_t n, Frame frame, RollingPartitions partitions, Out
         const auto ordered = [&](std::size_t len, auto row) {
             std::size_t start = 0, end = 0;
             scan(len, row, mark_null, [&](std::size_t i, std::size_t) {
-                const auto now = ticks[row(i)];
-                while (end < len &&
-                       (ticks[row(end)] < now || (frame.closed_right && ticks[row(end)] == now)))
-                    ++end;
-                while (start < end) {
-                    // Unsigned subtraction is the exact nonnegative distance
-                    // even when the two signed timestamps straddle zero.
-                    const auto age = static_cast<std::uint64_t>(now) -
-                                     static_cast<std::uint64_t>(ticks[row(start)]);
-                    if (age < frame.size || (frame.closed_left && age == frame.size))
-                        break;
-                    ++start;
-                }
-                return std::pair{start, end};
+                return index_bounds(
+                    frame, [&](auto j) { return ticks[row(j)]; }, i, len, start, end);
             });
         };
         bool sorted = !frame.index_validity;
@@ -349,23 +354,59 @@ auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& v
     // the neighboring observations needed at each boundary, and emit each row
     // once. Bounding the overlap prevents large windows from multiplying work.
     constexpr std::size_t block_size = 32 * 1024;
-    if (!frame.index && partitions.offsets.empty() && method != 4 && n > block_size &&
-        frame.size <= block_size) {
+    const bool can_split = partitions.offsets.empty() && method != 4 && n > block_size;
+    const auto blocks = n ? (n - 1) / block_size + 1 : 0;
+    const auto ticks = frame.index ? value_reader(*frame.index) : IntegerView{};
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    if (can_split && frame.index && !frame.index_validity && partitions.workers > 1 &&
+        std::is_sorted(ticks, ticks + n)) {
+        // Binary searches identify the observations needed on either side of
+        // the block, including all timestamp peers of its last output row.
+        for (std::size_t first = 0; first < n; first += block_size) {
+            const auto last = first + std::min(n - first, block_size);
+            const auto begin = static_cast<std::size_t>(
+                std::partition_point(
+                    ticks, ticks + first,
+                    [&](auto t) { return before_left_edge(frame, t, ticks[first]); }) -
+                ticks);
+            const auto end = static_cast<std::size_t>(
+                std::upper_bound(ticks + last, ticks + n, ticks[last - 1]) - ticks);
+            if ((first - begin) + (end - last) > block_size) {
+                spans.clear();
+                break;
+            }
+            spans.emplace_back(begin, end);
+        }
+    }
+    if (can_split && ((!frame.index && frame.size <= block_size) || !spans.empty())) {
         const auto right = frame.centered ? (frame.size - 1) / 2 : 0;
         const auto left = frame.size - right - 1;
-        const auto blocks = (n - 1) / block_size + 1;
         std::vector<std::uint8_t> invalid(n);
         const auto block = [&](std::size_t b) {
             const auto first = b * block_size;
             const auto last = first + std::min(n - first, block_size);
-            const auto begin = first - std::min(left, first);
-            const auto end = last + std::min(right, n - last);
-            scan(
-                end - begin, [&](auto i) { return begin + i; }, [&](auto row) { invalid[row] = 1; },
-                [&](std::size_t i, std::size_t len) {
-                    return std::pair{i - std::min(i, left), i + std::min(right + 1, len - i)};
-                },
-                first - begin, last - begin);
+            const auto [begin, end] = frame.index ? spans[b]
+                                                  : std::pair{first - std::min(left, first),
+                                                              last + std::min(right, n - last)};
+            const auto row = [&](auto i) { return begin + i; };
+            const auto mark_null = [&](auto pos) { invalid[pos] = 1; };
+            if (frame.index) {
+                std::size_t lo = 0, hi = 0;
+                scan(
+                    end - begin, row, mark_null,
+                    [&](std::size_t i, std::size_t len) {
+                        return index_bounds(
+                            frame, [&](auto j) { return ticks[row(j)]; }, i, len, lo, hi);
+                    },
+                    first - begin, last - begin);
+            } else {
+                scan(
+                    end - begin, row, mark_null,
+                    [&](std::size_t i, std::size_t len) {
+                        return std::pair{i - std::min(i, left), i + std::min(right + 1, len - i)};
+                    },
+                    first - begin, last - begin);
+            }
         };
         const auto workers = std::min(blocks, partitions.workers);
         if (workers > 1) {

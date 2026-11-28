@@ -1889,7 +1889,8 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                       [](const ir::CallExpr& call, const Table& input, std::size_t,
                                          const ColumnEvalCtx& ctx) {
                                           RollingPartitions partitions{};
-                                          if (ctx.exec && call.callee.ends_with("rank"))
+                                          if (ctx.exec && (call.callee.ends_with("rank") ||
+                                                           call.callee.ends_with("rank_by")))
                                               partitions.workers = group_barrier_worker_count(
                                                   *ctx.exec, input.rows());
                                           return polars_rolling_column(call, input, partitions);

@@ -188,6 +188,16 @@ class EngineTests(unittest.TestCase):
                     with self.subTest(dtype=dtype, method=method, expr=expr):
                         self.equal(frame.select(a=expr, b=expr.over("g")))
 
+    def test_large_rolling_rank_block_boundaries(self):
+        n = 131093
+        rows = pl.int_range(0, n, eager=True)
+        frame = pl.DataFrame({"i": rows}).with_columns(
+            x=pl.when(pl.col("i") % 131 != 0).then((pl.col("i") * 107) % 701)).lazy()
+        for width, center, method in ((128, False, "average"), (129, True, "max"),
+                                      (4096, True, "dense")):
+            expr = pl.col("x").rolling_rank(width, method, center=center, min_samples=width // 2)
+            self.equal(frame.select(expr))
+
     def test_rolling_rank_random_ties(self):
         for last in (1, None):
             frame = pl.LazyFrame({"x": [1] * 23 + [last], "g": [1, 2] * 12,

@@ -245,12 +245,15 @@ auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& v
                   Frame frame, RollingPartitions partitions, std::int64_t method,
                   std::optional<std::uint64_t> seed) -> ComputedColumn {
     Column<Out> out;
+    if (!frame.size) {
+        out.resize(n);
+        return {.column = std::move(out), .validity = ValidityBitmap(n, false)};
+    }
     out.resize_for_overwrite(n);
     auto* dest = out.data();
     std::optional<ValidityBitmap> valid;
-    if (!frame.size)
-        return {.column = std::move(out), .validity = ValidityBitmap(n, false)};
-    const auto scan = [&](std::size_t length, auto position, auto mark_null, auto bounds) {
+    const auto scan = [&](std::size_t length, auto position, auto mark_null, auto bounds,
+                          std::size_t first, std::size_t last) {
         std::optional<zorro::Xoshiro256pp> rng;
         bool advance_rng = false;
         if (method == 4) {
@@ -309,7 +312,7 @@ auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& v
                     --tree[j];
             }
         };
-        for (std::size_t i = 0; i < length; ++i) {
+        for (std::size_t i = first; i < last; ++i) {
             const auto [start, end] = bounds(i, length);
             while (lo < std::min(start, hi))
                 change(lo++, false);
@@ -338,7 +341,51 @@ auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& v
                 dest[row] = static_cast<Out>(method == 2 ? rank + counts[id] - 1 : rank);
         }
     };
-    visit_windows(n, frame, partitions, dest, valid, scan);
+    // Split deterministic row windows into independent output blocks. Include
+    // the neighboring observations needed at each boundary, and emit each row
+    // once. Bounding the overlap prevents large windows from multiplying work.
+    constexpr std::size_t block_size = 32 * 1024;
+    if (!frame.index && partitions.offsets.empty() && method != 4 && n > block_size &&
+        frame.size <= block_size) {
+        const auto right = frame.centered ? (frame.size - 1) / 2 : 0;
+        const auto left = frame.size - right - 1;
+        const auto blocks = (n - 1) / block_size + 1;
+        std::vector<std::uint8_t> invalid(n);
+        const auto block = [&](std::size_t b) {
+            const auto first = b * block_size;
+            const auto last = first + std::min(n - first, block_size);
+            const auto begin = first - std::min(left, first);
+            const auto end = last + std::min(right, n - last);
+            scan(
+                end - begin, [&](auto i) { return begin + i; }, [&](auto row) { invalid[row] = 1; },
+                [&](std::size_t i, std::size_t len) {
+                    return std::pair{i - std::min(i, left), i + std::min(right + 1, len - i)};
+                },
+                first - begin, last - begin);
+        };
+        const auto workers = std::min(blocks, partitions.workers);
+        if (workers > 1) {
+            auto batch = process_worker_pool().submit(workers, [&](std::size_t worker) {
+                for (auto b = worker; b < blocks; b += workers)
+                    block(b);
+            });
+            batch.wait();
+        } else {
+            for (std::size_t b = 0; b < blocks; ++b)
+                block(b);
+        }
+        for (std::size_t i = 0; i < n; ++i)
+            if (invalid[i]) {
+                if (!valid)
+                    valid.emplace(n, true);
+                valid->set(i, false);
+            }
+    } else {
+        visit_windows(n, frame, partitions, dest, valid,
+                      [&](auto length, auto position, auto mark_null, auto bounds) {
+                          scan(length, position, mark_null, bounds, 0, length);
+                      });
+    }
     return {.column = std::move(out), .validity = std::move(valid)};
 }
 

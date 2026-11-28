@@ -1887,8 +1887,12 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             },
             .exec = TransformExec{.column_eval =
                                       [](const ir::CallExpr& call, const Table& input, std::size_t,
-                                         const ColumnEvalCtx&) {
-                                          return polars_rolling_column(call, input);
+                                         const ColumnEvalCtx& ctx) {
+                                          RollingPartitions partitions{};
+                                          if (ctx.exec && call.callee.ends_with("rank"))
+                                              partitions.workers = group_barrier_worker_count(
+                                                  *ctx.exec, input.rows());
+                                          return polars_rolling_column(call, input, partitions);
                                       }},
         };
         auto rank = polars_rolling;

@@ -247,11 +247,21 @@ auto polars_rolling_column(const ir::CallExpr& call, const Table& input,
                 .index_validity = nullptr,
                 .closed_left = (*mode & 1) != 0,
                 .closed_right = (*mode & 2) != 0};
+    Column<std::int64_t> date_days;
     if (indexed) {
         const auto* by = ir::as_column_ref(*call.args[1]);
         const auto* key = by ? input.find_entry(by->name) : nullptr;
-        if (!key || !(frame.index = std::get_if<Column<std::int64_t>>(&*key->column)))
-            return std::unexpected("rolling index requires Int64 storage");
+        if (!key)
+            return std::unexpected("rolling index requires a column");
+        if (const auto* dates = std::get_if<Column<Date>>(&*key->column)) {
+            const auto values = value_reader(*dates);
+            date_days.resize_for_overwrite(dates->size());
+            for (std::size_t i = 0; i < dates->size(); ++i)
+                date_days[i] = values[i].days;
+            frame.index = &date_days;
+        } else if (!(frame.index = std::get_if<Column<std::int64_t>>(&*key->column))) {
+            return std::unexpected("rolling index requires Int64 or Date storage");
+        }
         if (key->validity)
             frame.index_validity = &*key->validity;
     }

@@ -145,7 +145,7 @@ class EngineTests(unittest.TestCase):
         data = dict(g=[1, 2, 1, 1, 1, 2, 2, 1, 2],
                     i=[3, 1, 3, None, 1, 4, 1, 8, 9],
                     x=[None, 5., 3., 19., float("inf"), -3., -0., float("nan"), 4.])
-        for dtype, span in ((pl.Int64, "3i"), (pl.Datetime("ns"), "3ns"),
+        for dtype, span in ((pl.Int64, "3i"), (pl.Date, "3d"), (pl.Datetime("ns"), "3ns"),
                             (pl.Datetime("ms", "Europe/Amsterdam"), "3ms")):
             frame = pl.LazyFrame(data, schema_overrides={"i": dtype})
             for closed in ("none", "both", "left", "right"):

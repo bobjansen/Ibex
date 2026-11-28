@@ -192,6 +192,11 @@ class Adapter:
             nanos += (7 * weeks + days) * 86_400_000_000_000
             if nanos % NANOS_PER_UNIT[index_type.time_unit]:
                 raise NotImplementedError("window duration must be representable in the index unit")
+        elif index_type == pl.Date and not integer:
+            day_ticks, remainder = divmod(nanos, 86_400_000_000_000)
+            if remainder:
+                raise NotImplementedError("Date rolling intervals must be whole days")
+            nanos = 7 * weeks + days + day_ticks
         elif not (integer and index_type in (pl.Int32, pl.Int64, pl.UInt32)):
             raise NotImplementedError(f"unsupported rolling index {index_type} for this interval")
         if not 0 < nanos <= 2**63 - 1:

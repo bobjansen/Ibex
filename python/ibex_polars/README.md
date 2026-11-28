@@ -232,7 +232,7 @@ the signed Int64 nanosecond range are explicitly unsupported (approximately
 1677–2262 for timestamps, or ±292 years for durations). Nulls and nanosecond
 column precision are preserved without Python datetime conversion.
 
-Indexed rolling sums and means support Datetime indices with fixed elapsed-time intervals and integer indices with integer intervals. All four interval closures work, including on unsorted input, duplicate indices and within partitions. Calendar months and calendar days/weeks in timezones other than UTC remain unsupported.
+Indexed rolling sums and means support Datetime indices with fixed elapsed-time intervals, Date indices with whole-day intervals, and Int32, UInt32 or Int64 indices with integer intervals. All four interval closures work, including on unsorted input, duplicate indices and within partitions. Calendar months and calendar days/weeks in timezones other than UTC remain unsupported.
 
 The temporal subset covers projection/aliases, null checks, comparisons,
 filters, sorting, grouping/row counts, min/max, and duration sums. Casts to finer

@@ -176,8 +176,13 @@ Supported resident
 types are Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, Float32, Float64, Boolean,
 String, Date and Categorical. Resident Datetime and Duration columns are also
 supported as described below. Numeric
-coercion to Float64 and null predicates are supported. Scalar window reductions with column partition keys use a grouped native update.
-Expressions sharing partition keys run in one update and preserve input row order.
+coercion to Float64 and null predicates are supported. Scalar reductions inside `.over(...)` broadcast to the input rows in projections,
+updates, and filters. Partition keys can be row expressions. Windows with matching
+partition and ordering keys share a grouped native update. A single-column
+`order_by` supports descending order and null placement, with ties broken in
+input order. Results return to their original row positions. Numeric columns
+support forward cumulative sums (integer and Float64) and literal-offset shifts.
+Ranks support average, min, max, dense and ordinal ties.
 UDFs,
 computed grouping/sort keys, aggregate broadcasting in projections/updates other than row counts, expression top-k
 operations, general inequality joins, other filtered aggregates, remote/multiple files, Enum, other numeric widths and nondefault scan

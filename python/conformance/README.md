@@ -3,11 +3,11 @@
 This optional harness runs **unmodified upstream tests and assertions** from
 [Polars 2.1.0](https://github.com/pola-rs/polars/tree/7f902bd3ffd27ff82d14278a09a295ff2f7aed92/py-polars/tests).
 `upstream.json` pins the release commit, the content digest of the complete
-Python test tree and its pytest configuration, eight initial test modules,
+Python test tree and its pytest configuration, ten test modules,
 and query comparisons that must keep passing. Nothing is vendored or rewritten.
 
-The initial modules cover projection, updates, comparisons, filtering, sorting,
-grouping, vertical reductions, and arithmetic. This is a compatibility target,
+The selected modules cover projection, updates, comparisons, filtering, sorting,
+grouping, vertical reductions, arithmetic, and window expressions. This is a compatibility target,
 not a claim that all these operations or dtypes are implemented.
 
 ## Run

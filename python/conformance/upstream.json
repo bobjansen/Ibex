@@ -12,7 +12,9 @@
     "tests/unit/operations/test_sort.py",
     "tests/unit/operations/test_group_by.py",
     "tests/unit/operations/aggregation/test_vertical.py",
-    "tests/unit/operations/arithmetic/test_arithmetic.py"
+    "tests/unit/operations/arithmetic/test_arithmetic.py",
+    "tests/unit/operations/test_window.py",
+    "tests/unit/operations/test_over.py"
   ],
   "required_pass_queries": {
     "tests/unit/operations/test_select.py::test_select_by_col_list": [
@@ -1007,6 +1009,74 @@
       1
     ],
     "tests/unit/operations/test_group_by.py::test_unique_head_tail_26429[10]": [
+      1
+    ],
+    "tests/unit/operations/test_window.py::test_window_10417": [
+      1
+    ],
+    "tests/unit/operations/test_window.py::test_mapping_strategy_scalar_matrix[expr0-group_to_rows-result0]": [
+      1
+    ],
+    "tests/unit/operations/test_window.py::test_mapping_strategy_scalar_matrix[expr6-group_to_rows-result6]": [
+      1
+    ],
+    "tests/unit/operations/test_window.py::test_mapping_strategy_scalar_matrix[expr7-join-result7]": [
+      1
+    ],
+    "tests/unit/operations/test_window.py::test_mapping_strategy_scalar_matrix[expr12-group_to_rows-result12]": [
+      1
+    ],
+    "tests/unit/operations/test_window.py::test_mapping_strategy_scalar_matrix[expr15-group_to_rows-result15]": [
+      1
+    ],
+    "tests/unit/operations/test_window.py::test_clear_cache_on_stacked_filters_24806": [
+      1
+    ],
+    "tests/unit/operations/test_window.py::test_over_literal_cum_sum_26800": [
+      1,
+      2
+    ],
+    "tests/unit/operations/test_over.py::test_implode_explode_list_over_24616[col0]": [
+      2,
+      4
+    ],
+    "tests/unit/operations/test_over.py::test_nulls_last_over_24989": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr0-expected0-0-in-memory]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr0-expected0-0-streaming]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr0-expected0-2-in-memory]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr0-expected0-2-streaming]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr1-expected1-0-in-memory]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr1-expected1-0-streaming]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr1-expected1-2-in-memory]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr1-expected1-2-streaming]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr2-expected2-0-in-memory]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr2-expected2-0-streaming]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr2-expected2-2-in-memory]": [
+      1
+    ],
+    "tests/unit/operations/test_over.py::test_over_literal_dtype[expr2-expected2-2-streaming]": [
       1
     ]
   },

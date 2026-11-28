@@ -596,6 +596,27 @@ auto window_bound_column(const Table& table, ir::Duration duration, bool aligned
     return std::unexpected(std::string(fn) + ": time index must be a Timestamp or Date column");
 }
 
+// A null-free Float64 time window can skip NaN bookkeeping after a contiguous
+// precheck. Preserve the native accumulator's add-before-remove order.
+template <bool Mean>
+bool clean_trailing_total(const double* values, const std::int64_t* times, std::size_t rows,
+                          std::int64_t duration, double* output) {
+    if (std::any_of(values, values + rows, [](double x) { return std::isnan(x); }))
+        return false;
+    double total = 0.0;
+    std::size_t first = 0;
+    for (std::size_t i = 0; i < rows; ++i) {
+        total += values[i];
+        while (first < i && times[first] <= times[i] - duration)
+            total -= values[first++];
+        if constexpr (Mean)
+            output[i] = total / static_cast<double>(i - first + 1);
+        else
+            output[i] = total;
+    }
+    return true;
+}
+
 // RESOLVED for `rolling_sum`, OPEN for `rolling_std` (2026-08-02).
 //
 // Both were ~20% slower than before Arrow buffer adoption with unchanged kernel
@@ -745,9 +766,15 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 } else {
                     const auto values = value_reader(col);
                     Column<double> result;
-                    result.resize(rows);
+                    result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     if (sv == nullptr) {
+                        if constexpr (std::is_same_v<T, double>) {
+                            if (!is_count && !aligned_dur &&
+                                clean_trailing_total<true>(values, time_vals, rows, dur_val,
+                                                           result_values))
+                                return ComputedColumn{std::move(result), std::nullopt};
+                        }
                         double sum = 0.0;
                         std::size_t val_cnt = 0;
                         std::size_t nan_cnt = 0;
@@ -987,21 +1014,9 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             return times[l] <= times[r] - dur;
                         };
                         if constexpr (std::is_same_v<T, double>) {
-                            // A contiguous precheck keeps NaN bookkeeping out of the
-                            // serial accumulator loop. Preserve add-before-remove order.
-                            if (!has_nulls &&
-                                std::none_of(col_values, col_values + rows,
-                                             [](double value) { return std::isnan(value); })) {
-                                double total = 0.0;
-                                std::size_t lo = 0;
-                                for (std::size_t i = 0; i < rows; ++i) {
-                                    total += col_values[i];
-                                    while (lo < i && pred(lo, i))
-                                        total -= col_values[lo++];
-                                    result_values[i] = total;
-                                }
+                            if (!has_nulls && clean_trailing_total<false>(col_values, times, rows,
+                                                                          dur, result_values))
                                 return ComputedColumn{std::move(result), std::nullopt};
-                            }
                         }
                         if (has_nulls) {
                             run_rows(pred, std::true_type{});

@@ -6016,6 +6016,13 @@ class Writer {
                 return {
                     build_values<Date>(group, index, builder, [](Date val) { return val.days; })};
             }
+            case arrow::Type::TIME64: {
+                if (static_cast<const arrow::Time64Type&>(*type).unit() != arrow::TimeUnit::NANO)
+                    throw std::invalid_argument(
+                        "parquet::write: Time64 output requires nanoseconds");
+                arrow::Time64Builder builder(type, arrow::default_memory_pool());
+                return {build_values<std::int64_t>(group, index, builder, std::identity{})};
+            }
             case arrow::Type::TIMESTAMP: {
                 const auto unit = static_cast<const arrow::TimestampType&>(*type).unit();
                 const int64_t divisor = unit == arrow::TimeUnit::NANO    ? 1

@@ -147,6 +147,18 @@ class TemporalTests(unittest.TestCase):
                                        grouped=x.rolling_rank(24, min_samples=1).over("g")))
                 self.equal(frame.group_by("g", maintain_order=True).agg(lo=x.min(), hi=x.max()))
 
+    @unittest.skipUnless(hasattr(ibex_pyarrow, "execute_pipeline_parquet"), "native writer disabled")
+    def test_native_clock_sink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "clock.parquet"
+            data = pl.DataFrame({"x": pl.Series([86_399_999_999_999, 1, None, 0], dtype=pl.Time)})
+            with patch.object(ibex_pyarrow, "execute_pipeline_parquet",
+                              wraps=ibex_pyarrow.execute_pipeline_parquet) as native:
+                data.lazy().sink_parquet(path, engine=IbexEngine(), row_group_size=2)
+                native.assert_called_once()
+            self.assertEqual(pq.read_schema(path).field("x").type, pa.time64("ns"))
+            assert_frame_equal(data, pl.read_parquet(path))
+
     def test_temporal_parquet_is_explicitly_unsupported(self):
         with tempfile.TemporaryDirectory() as directory:
             for dtype in (pa.timestamp("us"), pa.duration("us")):

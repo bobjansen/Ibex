@@ -949,6 +949,11 @@ class Adapter:
             # ordering proofs and general algorithms remain available.
             frame = self.frame(node.input)
             self.frame_length_columns[node_id] = self.frame_length_columns.get(node.input, set())
+        elif kind == "Union":
+            first, *others = node.inputs
+            frame = self.frame(first)._append("union", tuple(self.frame(child) for child in others))
+            if node.slice is not None:
+                frame = frame.slice(*node.slice)
         elif kind == "Cache":
             # Cache nodes can have different visitor node IDs while sharing
             # one Polars cache identity. Preserve that identity until lowering.
@@ -1160,9 +1165,14 @@ class Adapter:
                 if key not in prepared_sources:
                     prepared_sources[key] = ibex.DataFrame(source[1]).lazy()._source
                 source = prepared_sources[key]
-            steps = tuple((operation, (prepare_inputs(args[0]), *args[1:])) if operation == "join"
-                          else (operation, args) for operation, args in current._steps)
-            return ibex.LazyFrame(source, steps)
+            steps = []
+            for operation, args in current._steps:
+                if operation == "join":
+                    args = (prepare_inputs(args[0]), *args[1:])
+                elif operation == "union":
+                    args = tuple(prepare_inputs(branch) for branch in args)
+                steps.append((operation, args))
+            return ibex.LazyFrame(source, tuple(steps))
         frame = prepare_inputs(frame)
         result_schema = {}
         source, bindings, scalars = lower(frame, validate=True, result_schema=result_schema, widen_numeric_inputs=True)

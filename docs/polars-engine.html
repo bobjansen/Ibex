@@ -236,6 +236,7 @@ pl.Config.<span class="fn-name">set_engine_affinity</span>(<span class="str">"au
       <article class="card">
         <h3>Supported</h3>
         <ul>
+          <li>Vertical concatenation via <code>pl.concat</code> and <code>pl.union</code> lowers to native <code>rbind</code>.</li>
           <li>Resident <code>DataFrame</code>s and single local Parquet files.</li>
           <li><code>filter</code>, <code>select</code>, <code>with_columns</code>, arithmetic, comparisons, Boolean logic, <code>is_between</code>, <code>is_in</code>, <code>when/then/otherwise</code>, null checks and casts. Null-aware comparisons support <code>eq_missing</code> and <code>ne_missing</code>.</li>
           <li>Float64 <code>abs</code>, <code>sqrt</code>, <code>exp</code>, <code>floor</code> and <code>ceil</code>, floating-point NaN checks, and string lengths in Unicode characters or UTF-8 bytes.</li>

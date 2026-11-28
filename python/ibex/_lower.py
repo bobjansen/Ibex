@@ -287,6 +287,18 @@ def lower(frame, *, validate=False, result_schema=None, widen_numeric_inputs=Fal
             predicate = " && ".join(f"({render(expr)})" for expr in expressions)
             filter_scalars.clear()
             source += "[filter " + predicate + "]"
+        elif operation == "union":
+            sources = [source]
+            for branch in expressions:
+                namespace = f"union_{state.get('next_union', 0)}_"
+                state["next_union"] = state.get("next_union", 0) + 1
+                (branch_prefix, branch_source), _, _ = lower(
+                    branch, validate=validate, widen_numeric_inputs=widen_numeric_inputs,
+                    _state=state, _namespace=namespace, _return_parts=True)
+                prefix += branch_prefix
+                sources.append(branch_source)
+            if len(sources) > 1:
+                source = f"rbind({', '.join(sources)})"
         elif operation == "join":
             other, left_on, right_on, how, suffix, nulls_equal, coalesce, maintain_order, left_visible, right_visible = expressions
             join_id = state["next_join"]
@@ -831,6 +843,14 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if operation == "aggregate":
             keys, expressions = expressions
             key_types = [dtype(Expr("col", (name,))) for name in keys]
+        elif operation == "union":
+            for branch in expressions:
+                other = _validate_types(branch, widen_numeric_inputs=widen_numeric_inputs)[1][-1]
+                if list(columns.items()) != list(other.items()):
+                    raise NotImplementedError("union inputs require matching native schemas")
+            step_types.append(type_map)
+            schemas.append(dict(columns))
+            continue
         elif operation in ("slice", "python_slice", "cache"):
             step_types.append(type_map)
             schemas.append(dict(columns))

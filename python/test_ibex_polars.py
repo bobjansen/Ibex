@@ -38,6 +38,15 @@ class EngineTests(unittest.TestCase):
         assert_frame_equal(actual, expected, rel_tol=1e-12, abs_tol=1e-9)
         return actual
 
+    def test_vertical_concat_and_shared_branches(self):
+        first = pl.LazyFrame({"x": [1, None], "s": ["a", "b"]})
+        second = pl.LazyFrame({"x": [2, 3], "s": ["c", None]})
+        union = pl.concat([first, second, first])
+        self.equal(union)
+        self.equal(union.slice(1, 4))
+        self.equal(union.filter(pl.col("x") > 1).select(pl.col("x").sum()))
+        self.equal(pl.concat([first.head(0), second]))
+
     def test_null_aware_equality(self):
         frame = pl.DataFrame({"a": [None, None, 1., 1., float("nan"), -0.],
                               "b": [None, 1., None, 2., float("nan"), 0.]}).lazy()

@@ -789,6 +789,8 @@ def _validate_types(frame, *, widen_numeric_inputs=False):
         if op == "cast":
             original = dtype(args[0])
             target = args[1]
+            if target == pa.int64() and original == pa.bool_():
+                return target
             if target != pa.float64() or original not in numeric:
                 raise NotImplementedError("only numeric casts to Float64 are supported by this adapter")
             return target

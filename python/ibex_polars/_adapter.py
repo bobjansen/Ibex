@@ -177,6 +177,12 @@ class Adapter:
         self.frame_length_columns = {}
         self.sort_pruning_predicates = set()
 
+    def _rolling_operand(self, node, dtype):
+        child = self.expression(node)
+        if dtype == pl.Boolean:
+            return Expr("cast", (child, pa.int64()))
+        return child
+
     def _rolling_by_function(self, value):
         operation, duration, minimum, closed, parameters = value.function_data
         months, weeks, days, nanos, integer, negative = duration
@@ -184,7 +190,7 @@ class Adapter:
         if name not in ("sumby", "meanby") or parameters or negative or months:
             raise NotImplementedError("unsupported indexed rolling operation or calendar interval")
         dtype, index_type = (self.visitor.get_dtype(child) for child in value.input)
-        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64):
+        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean):
             raise NotImplementedError(f"unsupported rolling value type {dtype}")
         if index_type.base_type() == pl.Datetime and not integer:
             if (days or weeks) and index_type.time_zone not in (None, "UTC"):
@@ -201,7 +207,7 @@ class Adapter:
             raise NotImplementedError(f"unsupported rolling index {index_type} for this interval")
         if not 0 < nanos <= 2**63 - 1:
             raise NotImplementedError("rolling interval must fit positive Int64 ticks")
-        args = tuple(self.expression(child) for child in value.input)
+        args = (self._rolling_operand(value.input[0], dtype), self.expression(value.input[1]))
         if any(child._aggregate or not child._row_reference for child in args):
             raise NotImplementedError("indexed rolling requires row expressions")
         closed_bits = {"none": 0, "left": 1, "right": 2, "both": 3}[closed]
@@ -218,9 +224,10 @@ class Adapter:
         if weights is not None or parameters or not 0 <= minimum <= size or size > 2**63 - 1:
             raise NotImplementedError("unsupported rolling options")
         dtype = self.visitor.get_dtype(value.input[0])
-        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64):
+        if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64) and not (
+                dtype == pl.Boolean and name in ("sum", "mean")):
             raise NotImplementedError(f"unsupported rolling {name} input {dtype}")
-        child = self.expression(value.input[0])
+        child = self._rolling_operand(value.input[0], dtype)
         if name in ("sum", "mean"):
             if child._aggregate or not child._row_reference:
                 raise NotImplementedError("rolling sums and means require a row expression")

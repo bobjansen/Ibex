@@ -157,6 +157,14 @@ class EngineTests(unittest.TestCase):
                         assert_frame_equal(q.collect(engine=self.engine), q.collect(engine="streaming"),
                                            check_exact=True)
 
+    def test_boolean_rolling_sums_and_means(self):
+        frame = pl.LazyFrame({"x": [True, None, False, True, True, None],
+                              "i": [0, 3, 1, 1, 2, 5], "g": [0, 0, 1, 0, 1, 1]})
+        x = pl.col("x")
+        for expr in (x.rolling_sum(3, min_samples=1), x.rolling_mean(2, center=True),
+                     x.rolling_sum_by("i", "2i"), x.rolling_mean_by("i", "2i")):
+            self.equal(frame.select(global_result=expr, grouped_result=expr.over("g")))
+
     def test_rolling_float_extrema(self):
         frame = pl.LazyFrame({"x": [1., float("nan"), None, -3., float("inf"), -0., 0.]})
         for op in (pl.col("x").rolling_min, pl.col("x").rolling_max):

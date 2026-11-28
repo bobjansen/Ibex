@@ -229,21 +229,33 @@ class Adapter:
             if getattr(value.options, "kind", None) not in ("groups_to_rows", "join"):
                 raise NotImplementedError("unsupported window mapping")
             keys = [self.expression(key) for key in value.partition_by]
-            if not keys or any(key._op != "col" for key in keys):
-                raise NotImplementedError("window partitions require column keys")
+            if not keys or any(key._aggregate for key in keys):
+                raise NotImplementedError("window partitions require row expressions")
             ordering = None
             if value.order_by is not None:
                 order = self.expression(value.order_by)
                 if order._op != "col":
                     raise NotImplementedError("window ordering requires a column key")
                 ordering = (order._name, value.order_by_descending, value.order_by_nulls_last)
-            function = self.expression(value.function)
+            call = self.visitor.view_expression(value.function)
+            if type(call).__name__ == "Function" and call.function_data == ("cum_sum", False):
+                input_type = self.visitor.get_dtype(call.input[0])
+                if input_type not in (*_INTEGER_LAYOUTS, pl.Float64):
+                    raise NotImplementedError("cumulative sums require integer or Float64 inputs")
+                child = self.expression(call.input[0])
+                if child._op != "col":
+                    raise NotImplementedError("cumulative sums require a column")
+                function = Expr("window_cumsum", (child, input_type == pl.Float64))
+            else:
+                function = self.expression(value.function)
             if value.options.kind == "join" and (not function._aggregate or function._row_reference):
                 raise NotImplementedError("list-valued window joins are unsupported")
             if not function._aggregate and not function._row_reference:
                 raise NotImplementedError("scalar literal windows require a frame-sized broadcast")
             self.has_windows = True
-            expr = Expr("window", (function, tuple(key._name for key in keys), ordering))
+            expr = Expr("window", (function, tuple(keys), ordering))
+            if function._op == "window_cumsum" and self.visitor.get_dtype(node) in _INTEGER_LAYOUTS:
+                expr = _wrap_integer(expr, self.visitor.get_dtype(node))
         elif kind == "Ternary":
             expr = Expr("case", (self.expression(value.predicate), self.expression(value.truthy),
                                  self.expression(value.falsy)))
@@ -558,20 +570,47 @@ class Adapter:
         partitions = {}
         columns = {}
 
+        inputs = []
+        prepared = {}
+        def fresh():
+            name = f"_ibex_window_{len(columns) + len(inputs)}"
+            while name in occupied:
+                name += "_"
+            occupied.add(name)
+            return name
+
+        def input_column(expr):
+            if expr._op == "col":
+                return expr._name
+            if id(expr) not in prepared:
+                name = fresh()
+                inputs.append(expr.alias(name))
+                prepared[id(expr)] = name
+            return prepared[id(expr)]
+
         def rewrite(expr):
             if expr._op == "window":
                 if id(expr) not in columns:
                     function, keys, ordering = expr._args
-                    name = f"_ibex_window_{len(columns)}"
-                    while name in occupied:
-                        name += "_"
-                    occupied.add(name)
-                    columns[id(expr)] = ibex.col(name)
-                    partitions.setdefault((keys, ordering), []).append(function.alias(name))
+                    partition = tuple(input_column(key) for key in keys)
+                    name = fresh()
+                    result = ibex.col(name)
+                    if function._op == "window_cumsum":
+                        child, floating = function._args
+                        # A null contributes zero to the running total but
+                        # stays null in the output at its original position.
+                        missing = Expr("is_null", (child,))
+                        clean = Expr("case", (missing, ibex.lit(0.0 if floating else 0), child))
+                        function = Expr("cumsum", (ibex.col(input_column(clean)),))
+                        result = Expr("case", (missing, Expr("null", ()), result))
+                    columns[id(expr)] = result
+                    partitions.setdefault((partition, ordering), []).append(function.alias(name))
                 return columns[id(expr)]
             return Expr(expr._op, tuple(rewrite(arg) if isinstance(arg, Expr) else arg for arg in expr._args))
 
         fields = [rewrite(expr) for expr in fields]
+        if inputs:
+            frame = frame._append("hstack", tuple(inputs))
         for (keys, ordering), values in partitions.items():
             frame = frame._append("window", (keys, tuple(values), ordering))
         return frame, fields

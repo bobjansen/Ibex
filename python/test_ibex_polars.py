@@ -60,6 +60,14 @@ class EngineTests(unittest.TestCase):
         self.equal(frame.select(a=pl.col("v").first().over("g", order_by="k"),
                                 b=pl.col("v").first().over("g", order_by="v", descending=True)))
 
+    def test_window_cumulative_sums(self):
+        frame = pl.LazyFrame({"g": [0, 1, 0, 1, 0], "k": [2, 3, None, 2, 1],
+                              "x": pl.Series([2**31 - 1, None, 1, None, 3], dtype=pl.Int32)})
+        x = pl.col("x")
+        self.equal(frame.select(x.cum_sum().over("g"), global_sum=x.cum_sum().over(order_by="k"),
+                                ordered=x.cum_sum().over(pl.col("g") + 1, order_by="k")))
+        self.equal(frame.head(0).with_columns(running=x.cum_sum().over("g")))
+
     def test_vertical_concat_and_shared_branches(self):
         first = pl.LazyFrame({"x": [1, None], "s": ["a", "b"]})
         second = pl.LazyFrame({"x": [2, 3], "s": ["c", None]})

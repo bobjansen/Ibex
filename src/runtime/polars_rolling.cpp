@@ -9,7 +9,9 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <random>
 #include <type_traits>
+#include <zorro.hpp>
 
 #include "runtime_internal.hpp"
 
@@ -223,12 +225,25 @@ auto roll(const Column<T>& col, const std::optional<ValidityBitmap>& validity, F
     return {.column = std::move(out), .validity = std::move(valid)};
 }
 
+// rand 0.10 draws a usize range that fits UInt32 from the high word of
+// Xoshiro256++. The extra word corrects overflow at the rounding boundary.
+auto random_tie_offset(zorro::Xoshiro256pp rng, std::uint32_t count) -> std::uint32_t {
+    const auto product = (rng() >> 32) * count;
+    const auto low = static_cast<std::uint32_t>(product);
+    auto result = static_cast<std::uint32_t>(product >> 32);
+    if (low > 0U - count) {
+        const auto extra = ((rng() >> 32) * count) >> 32;
+        result += (extra + low) >> 32;
+    }
+    return result;
+}
+
 // Compress the partition once. A Fenwick tree counts the observations below
 // each key in the current frame. Dense rank stores one count per distinct key.
 template <typename Out, typename Key>
 auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& validity,
-                  Frame frame, RollingPartitions partitions, std::int64_t method)
-    -> ComputedColumn {
+                  Frame frame, RollingPartitions partitions, std::int64_t method,
+                  std::optional<std::uint64_t> seed) -> ComputedColumn {
     Column<Out> out;
     out.resize_for_overwrite(n);
     auto* dest = out.data();
@@ -236,6 +251,23 @@ auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& v
     if (!frame.size)
         return {.column = std::move(out), .validity = ValidityBitmap(n, false)};
     const auto scan = [&](std::size_t length, auto position, auto mark_null, auto bounds) {
+        std::optional<zorro::Xoshiro256pp> rng;
+        bool advance_rng = false;
+        if (method == 4) {
+            rng.emplace(seed ? *seed : std::random_device{}());
+            advance_rng = true;
+            if (validity) {
+                for (std::size_t i = 0; i < length; ++i)
+                    if (!(*validity)[position(i)]) {
+                        advance_rng = false;
+                        break;
+                    }
+            }
+            // The pinned Polars null-free kernel advances at construction and
+            // at each eligible frame. Its nullable kernel samples the initial state.
+            if (advance_rng)
+                (*rng)();
+        }
         std::vector<std::uint64_t> keys(length);
         for (std::size_t i = 0; i < length; ++i)
             keys[i] = key(position(i));
@@ -285,6 +317,8 @@ auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& v
             lo = start;
             while (hi < end)
                 change(hi++, true);
+            if (advance_rng && end - start >= frame.minimum)
+                (*rng)();
             const auto row = position(i);
             if (present < frame.minimum || (validity && !(*validity)[row])) {
                 dest[row] = {};
@@ -297,6 +331,9 @@ auto rolling_rank(std::size_t n, Key key, const std::optional<ValidityBitmap>& v
                 rank += tree[j];
             if constexpr (std::is_same_v<Out, double>)
                 dest[row] = static_cast<double>(rank) + 0.5 * static_cast<double>(counts[id] - 1);
+            else if (rng)
+                dest[row] = static_cast<Out>(
+                    rank + random_tie_offset(*rng, static_cast<std::uint32_t>(counts[id])));
             else
                 dest[row] = static_cast<Out>(method == 2 ? rank + counts[id] - 1 : rank);
         }
@@ -311,7 +348,9 @@ auto polars_rolling_column(const ir::CallExpr& call, const Table& input,
                            RollingPartitions partitions)
     -> std::expected<ComputedColumn, std::string> {
     const bool indexed = call.callee.ends_with("_by");
-    if (call.args.size() != (indexed ? 6U : 5U))
+    const auto required = indexed ? 6U : 5U;
+    const bool seeded = call.args.size() == required + 2;
+    if (!seeded && call.args.size() != required)
         return std::unexpected("invalid rolling arguments");
     const auto* ref = ir::as_column_ref(*call.args[0]);
     const auto* entry = ref ? input.find_entry(ref->name) : nullptr;
@@ -328,9 +367,19 @@ auto polars_rolling_column(const ir::CallExpr& call, const Table& input,
     const auto* option = literal(base + 3);
     if (!entry || !size || !min || !mode || !option || *size < 0 || *min < 0 ||
         (!indexed && *min > *size) || (indexed && *size == 0) || *mode < 0 ||
-        *mode > (indexed ? 3 : 1) || (*option < 0 || *option > (rank ? 3 : 1)) ||
+        *mode > (indexed ? 3 : 1) || (*option < 0 || *option > (rank ? 4 : 1)) ||
         (rank && (average_rank != (*option == 0) || (indexed && (*mode & 2) == 0))))
         return std::unexpected("invalid rolling column or frame parameters");
+    std::optional<std::uint64_t> seed;
+    if (seeded) {
+        const auto* high = literal(required);
+        const auto* low = literal(required + 1);
+        constexpr auto max_word = std::numeric_limits<std::uint32_t>::max();
+        if (!rank || *option != 4 || !high || !low || *high < 0 || *low < 0 || *high > max_word ||
+            *low > max_word)
+            return std::unexpected("invalid rolling rank seed");
+        seed = (static_cast<std::uint64_t>(*high) << 32) | static_cast<std::uint64_t>(*low);
+    }
     Frame frame{.size = static_cast<std::size_t>(*size),
                 .minimum = static_cast<std::size_t>(*min),
                 .centered = !indexed && *mode != 0,
@@ -360,9 +409,9 @@ auto polars_rolling_column(const ir::CallExpr& call, const Table& input,
         const auto evaluate = [&](auto key) {
             if (average_rank)
                 return rolling_rank<double>(input.rows(), key, entry->validity, frame, partitions,
-                                            *option);
+                                            *option, seed);
             return rolling_rank<std::int64_t>(input.rows(), key, entry->validity, frame, partitions,
-                                              *option);
+                                              *option, seed);
         };
         if (const auto* col = std::get_if<Column<double>>(&*entry->column))
             return evaluate(

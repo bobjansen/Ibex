@@ -188,6 +188,24 @@ class EngineTests(unittest.TestCase):
                     with self.subTest(dtype=dtype, method=method, expr=expr):
                         self.equal(frame.select(a=expr, b=expr.over("g")))
 
+    def test_rolling_rank_random_ties(self):
+        for last in (1, None):
+            frame = pl.LazyFrame({"x": [1] * 23 + [last], "g": [1, 2] * 12,
+                                  "i": [None, 1, 1, 0, 2, 3] * 4})
+            x = pl.col("x")
+            for seed in (0, 2**64 - 1):
+                for expr in (x.rolling_rank(5, "random", seed=seed, min_samples=3, center=True),
+                             x.rolling_rank_by("i", "2i", "random", seed=seed, closed="both")):
+                    self.equal(frame.select(a=expr, b=expr.over("g")))
+            bounds = frame.select(*[x.rolling_rank(5, m, min_samples=1).alias(m)
+                                    for m in ("min", "random", "max")]).collect(engine=self.engine)
+            for low, draw, high in bounds.iter_rows():
+                if low is None:
+                    self.assertIsNone(draw)
+                else:
+                    self.assertLessEqual(low, draw)
+                    self.assertLessEqual(draw, high)
+
     def test_rolling_float_extrema(self):
         frame = pl.LazyFrame({"x": [1., float("nan"), None, -3., float("inf"), -0., 0.]})
         for op in (pl.col("x").rolling_min, pl.col("x").rolling_max):

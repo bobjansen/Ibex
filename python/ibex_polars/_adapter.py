@@ -184,8 +184,8 @@ class Adapter:
         return child
 
     def _rolling_rank(self, dtype, child, parameters):
-        method, _seed = parameters
-        methods = ("average", "min", "max", "dense")
+        method, seed = parameters
+        methods = ("average", "min", "max", "dense", "random")
         if method not in methods:
             raise NotImplementedError(f"unsupported rolling rank method {method}")
         if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64, pl.Boolean, pl.Date) and not is_temporal(dtype):
@@ -193,7 +193,8 @@ class Adapter:
         if child._aggregate or not child._row_reference:
             raise NotImplementedError("rolling rank requires a row expression")
         op = "polars_rolling_avg_rank" if method == "average" else "polars_rolling_rank"
-        return op, methods.index(method)
+        seed_words = (seed >> 32, seed & 0xffffffff) if method == "random" and seed is not None else ()
+        return op, (methods.index(method), *seed_words)
 
     def _rolling_by_function(self, value):
         operation, duration, minimum, closed, parameters = value.function_data
@@ -227,7 +228,7 @@ class Adapter:
             if closed not in ("right", "both"):
                 raise NotImplementedError("rolling_rank_by requires right or both closure")
             op, method = self._rolling_rank(dtype, args[0], parameters)
-            return Expr(op + "_by", (*args, nanos, minimum, closed_bits, method))
+            return Expr(op + "_by", (*args, nanos, minimum, closed_bits, *method))
         op = "polars_rolling_sum_by" if name == "sumby" else "polars_rolling_mean_by"
         return Expr(op, (*args, nanos, minimum, closed_bits, int(dtype == pl.Float32)))
 
@@ -244,7 +245,7 @@ class Adapter:
         if name == "rank":
             child = self._rolling_operand(value.input[0], dtype)
             op, method = self._rolling_rank(dtype, child, parameters)
-            return Expr(op, (child, size, minimum, int(center), method))
+            return Expr(op, (child, size, minimum, int(center), *method))
         if dtype not in (*_INTEGER_LAYOUTS, pl.Float32, pl.Float64) and not (
                 dtype == pl.Boolean and name in ("sum", "mean")):
             raise NotImplementedError(f"unsupported rolling {name} input {dtype}")

@@ -1891,13 +1891,17 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                           return polars_rolling_column(call, input);
                                       }},
         };
-        m.emplace("__ibex_rolling_rank", polars_rolling);
+        auto rank = polars_rolling;
+        rank.max_args += 2;
+        m.emplace("__ibex_rolling_rank", rank);
         m.emplace("__ibex_rolling_avg_rank", polars_rolling);
         m.emplace("__ibex_rolling_sum", polars_rolling);
         m.emplace("__ibex_rolling_mean", polars_rolling);
         auto indexed_rolling = polars_rolling;
         indexed_rolling.min_args = indexed_rolling.max_args = 6;
-        m.emplace("__ibex_rolling_rank_by", indexed_rolling);
+        auto indexed_rank = indexed_rolling;
+        indexed_rank.max_args += 2;
+        m.emplace("__ibex_rolling_rank_by", indexed_rank);
         m.emplace("__ibex_rolling_avg_rank_by", indexed_rolling);
         m.emplace("__ibex_rolling_sum_by", indexed_rolling);
         m.emplace("__ibex_rolling_mean_by", indexed_rolling);
